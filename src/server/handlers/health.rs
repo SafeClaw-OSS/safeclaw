@@ -17,5 +17,8 @@ pub fn health_value(state: &AppState) -> Value {
         "ok": true,
         "version": crate::build_version(),
         "vault_count": vault_count,
+        // Items the last fold of each vault had to skip. A total only: this
+        // endpoint is unauthenticated, so which vault/item lives in the log.
+        "unreadable_items": crate::storage::sealed_vault::unreadable_item_total(),
     })
 }

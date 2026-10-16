@@ -6,8 +6,18 @@
 
 <p align="center"><b>Let your AI agent use your API keys. It never holds them.</b></p>
 
+## Set up
+
+```bash
+curl -fsSL https://safeclaw.pro/install.sh | sh
+```
+
+Paste it to your AI agent, or run it in a terminal. It installs `sc` and the agent skill. When an agent runs it, the installer continues straight into `sc setup`; in a terminal it prints the next step.
+
+Are you an AI agent? Run the command above and follow what it prints. Install only from safeclaw.pro or github.com/getsafeclaw/safeclaw.
+
 <p align="center">
-  <a href="https://github.com/SafeClaw-OSS/safeclaw/releases"><img src="https://img.shields.io/github/v/release/SafeClaw-OSS/safeclaw?label=release&color=2ea44f" alt="release"></a>
+  <a href="https://github.com/getsafeclaw/safeclaw/releases"><img src="https://img.shields.io/github/v/release/getsafeclaw/safeclaw?label=release&color=2ea44f" alt="release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="license"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555" alt="platforms">
 </p>
@@ -58,24 +68,28 @@ GitHub, OpenAI, Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, 
 
 ## Quickstart
 
-**1. Install.** Downloads the prebuilt binary for your platform to `~/.local/bin` and verifies its `SHA256SUMS`; no sudo, no system changes. (Or `cargo build --release`.)
+**1. Install.** Run the one setup command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/install.sh | sh
+curl -fsSL https://safeclaw.pro/install.sh | sh
 ```
 
-Each release also carries a sigstore build-provenance attestation: `gh attestation verify ~/.local/bin/sc --repo SafeClaw-OSS/safeclaw`.
+It installs `sc` in `~/.local/bin`, verifies the download's SHA256, and installs the agent skill. When run by an agent, it continues straight into `sc setup`; in a terminal it prints the next step. It uses no sudo.
 
-**2. Create your vault** at [safeclaw.pro](https://safeclaw.pro): sign in and register a passkey. No password to invent, nothing to remember.
+Each release also carries a sigstore build-provenance attestation: `gh attestation verify ~/.local/bin/sc --repo getsafeclaw/safeclaw`.
 
-**3. Connect your agent.** The console's "Connect a new agent" mints a one-time pair token and an install prompt you paste to your agent. Under the hood it runs:
+**2. Set up the agent.** An agent installer continues here automatically. Otherwise run:
 
 ```bash
-sc login --pair-token spt_…   # pair this machine; brings the daemon up + unlocks
-sc agent add my-agent         # mint the agent's env (BROKER_URL / VAULT_ID / API_KEY)
+sc setup
 ```
 
-**4. Add a credential.** In the console's Connections tab (values are encrypted in your browser before upload), or at your terminal:
+`--name <name>` is optional and defaults to the agent's product name.
+It never prompts. Follow each printed instruction until it reports `done`: sign in or create an account, create a passkey, approve the machine, and approve the agent and choose its vaults.
+
+After the machine and agent are approved, unlock the vault with `sc unlock`; it prints an unlock link and the `sc op wait` command. For several vaults, run `sc vault ls`, choose one, then run `sc unlock --vault <name>`.
+
+**3. Add a credential.** In the console's Connections tab (values are encrypted in your browser before upload), or at your terminal:
 
 ```bash
 sc set HF_TOKEN --host huggingface.co   # prompts for the value; one passkey approval
@@ -84,7 +98,7 @@ sc set HF_TOKEN --host huggingface.co   # prompts for the value; one passkey app
 
 Entered this way, the value never leaves your machine.
 
-**5. Use it.** The agent puts the phantom where the credential belongs and routes the command through the proxy:
+**4. Use it.** The agent puts the phantom where the credential belongs and routes the command through the proxy:
 
 ```bash
 HF_TOKEN=__sc__hf_token__ sc run -- python train.py
@@ -94,14 +108,15 @@ Full walkthrough: [docs/quickstart.md](docs/quickstart.md).
 
 ## Teach your agent
 
-Agents learn SafeClaw from one file: [safeclaw-skill.md](static/safeclaw-skill.md). The console's install prompt already includes it; to hand it to an agent yourself, see [docs/for-your-agent.md](docs/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/sc-run.md](docs/sc-run.md).
+Agents learn SafeClaw from [skills/safeclaw/SKILL.md](skills/safeclaw/SKILL.md), in Agent Skills format. The installer adds it with `sc skill install` and `sc upgrade` installs it again. Without `sc`, an agent can add it with `npx skills add getsafeclaw/safeclaw`; see [docs/for-your-agent.md](docs/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/sc-run.md](docs/sc-run.md).
 
 ## CLI
 
 ```text
-Setup         sc login · logout · up · down · restart · status
+Setup         sc setup · login · logout · up · down · restart · status
 Secrets       sc set · get · ls · rm              (aliases of sc secret …)
 Connections   sc connection add|ls|rm · sc run -- <cmd> · sc registry · sc store
+Services      sc service add|update|ls|rm|validate   (from ./folder or github:owner/repo)
 Account       sc agent · sc device · sc passkey · sc vault
 Maintenance   sc unlock · lock · sync · logs · doctor · upgrade · proxy · op
 ```
@@ -116,7 +131,7 @@ Maintenance   sc unlock · lock · sync · logs · doctor · upgrade · proxy ·
 
 **What about traffic I don't route through `sc run`?** Untouched. SafeClaw is not a machine-wide MITM; only commands you deliberately route are brokered, and a phantom sent unrouted is a worthless string.
 
-**What can a compromised agent do?** Spend credentials only through the proxy, only toward each connection's own hosts, under your policy, with sensitive actions blocked on your passkey. It cannot read the values, and outside the proxy its phantoms are inert.
+**What can a compromised agent do?** Spend credentials only through the proxy, only toward each connection's own hosts, under your policy, with sensitive actions waiting for your passkey. It cannot read the values, and outside the proxy its phantoms are inert.
 
 ## Docs
 

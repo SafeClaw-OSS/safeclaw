@@ -57,11 +57,14 @@ pub fn is_hop_by_hop(name_lc: &str) -> bool {
 pub fn register_pending_use(
     state: &Arc<AppState>,
     vault_id: &str,
-    op: Operation,
+    mut op: Operation,
     policy_context: Option<crate::approval::PolicyContext>,
     ip: IpAddr,
     agent_prefix: Option<String>,
 ) -> Result<(String, String, u64)> {
+    // The consequence tier rides the signed op like every other mint (a
+    // time-window use is "warn", a one-shot one "neutral").
+    crate::protocol::consent::stamp_tone(&mut op);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -72,20 +75,22 @@ pub fn register_pending_use(
         store.issue(ip).ok_or(AppError::TooManyRequests)?
     };
 
-    let (op_id, expires_at) = {
+    let (op_id, expires_at, supersedes) = {
         let mut store = state.approvals.lock().unwrap();
         // Op-agent binding (team §C1): the triggering agent's prefix lands on
         // the record so every consumption surface can enforce "only the agent
-        // this was approved FOR can use it".
-        let id = store.create_bound(
+        // this was approved FOR can use it". A `use` op also joins its intent
+        // chain here (design/approvals-inbox.md D1): live byte-identical
+        // retries are marked superseded by this one — display only, they stay
+        // approvable — in the same store mutation as the create.
+        let c = store.create_chained(
             vault_id.to_string(),
             op.clone(),
             r.clone(),
             policy_context,
             agent_prefix.clone(),
         );
-        let exp = store.get(&id).map(|rec| rec.expires_at_unix).unwrap_or(0);
-        (id, exp)
+        (c.id, c.expires_at_unix, c.supersedes)
     };
 
     if let Ok(audit_store) = state.audits.for_vault(vault_id) {
@@ -104,6 +109,7 @@ pub fn register_pending_use(
         r.clone(),
         expires_at,
         agent_prefix,
+        supersedes,
     );
 
     state.emit_event(ApprovalEvent {
@@ -235,6 +241,11 @@ pub async fn resolve_auth_value(
         ))
     })?;
     let style = state.services.oauth_style(&oauth);
+    let token_auth = state.services.token_auth(&oauth);
+    // The def's refresh_params are static (the validator refused
+    // placeholders: there is no consent state at refresh time).
+    let extra = crate::auth::oauth2::render_extra_params(&oauth.refresh_params, None)
+        .map_err(AppError::Internal)?;
 
     let (access_token, expires_at, rotated_refresh) = crate::auth::oauth2::perform_refresh(
         token_url,
@@ -242,6 +253,8 @@ pub async fn resolve_auth_value(
         client_secret.as_deref(),
         refresh_token_str,
         style,
+        token_auth,
+        &extra,
     )
     .await
     .map_err(|e| {
@@ -277,14 +290,29 @@ pub async fn resolve_auth_value(
     // miss. We hold the write lock; the persist helper must NOT re-acquire it.
     let cache_key = match rotated_refresh.as_deref() {
         Some(new_rt) if new_rt.as_bytes() != raw => {
-            crate::auth::connect::persist_rotated_refresh_locked(
+            match crate::auth::connect::persist_rotated_refresh_locked(
                 state,
                 vault_id,
                 conn_id,
                 &oauth.refresh_token,
                 new_rt,
             )
-            .await;
+            .await
+            {
+                // Landed: sent to the cloud once this lock drops.
+                Ok(()) => crate::auth::connect::spawn_push(state, vault_id),
+                // Not stored: the session still uses the new token, which is
+                // stored again on the next sync; the user is told.
+                Err(why) => crate::auth::connect::rotation_not_stored(
+                    state,
+                    vault_id,
+                    conn_id,
+                    &oauth.refresh_token,
+                    raw,
+                    new_rt,
+                    &why,
+                ),
+            }
             sha256_hex(new_rt.as_bytes())
         }
         // §5: no rotation → cache under the SAME key the lookup uses, so a

@@ -1,14 +1,15 @@
 pub mod approve;
+pub mod connection_add;
 pub mod events;
 pub mod health;
 pub mod metadata;
 pub mod nudge;
 pub mod op;
 pub mod op_payload;
-pub mod pending_passkey;
 pub mod proxy;
 pub mod registry;
 pub mod secret_keys;
 pub mod secret_set_local;
+pub mod service_ops;
 pub mod skill;
 pub mod usage;

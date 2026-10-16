@@ -33,9 +33,54 @@ pub enum ScCode {
     /// authorize (Agents tab), not a credential change, so it must NEVER read as
     /// "bad key" (that sends the user debugging the wrong thing).
     AgentNotAuthorized,
+    /// A cryptographically-valid agent AIK that this machine's paired account
+    /// does not have: set up (`sc agent add`) under another SafeClaw account,
+    /// or removed from this one (the daemon can't tell which). Checked
+    /// before any vault-level check, so it never reads as `agent_not_authorized`
+    /// ("not turned on for this vault"), whose fix is a Console toggle; the fix
+    /// here is `sc agent add` on this machine.
+    AgentNotInAccount,
     AmbiguousPhantom,
     ApprovalNeeded,
     ApprovalRegister,
+    /// A batch-approve grant failed BATCH verification (bounds, unknown
+    /// sibling op, root mismatch, r/o inequality) — design/batch-approve.md.
+    /// RECOVERABLE by re-approving per-op: the relay client re-registers the
+    /// op instead of rejecting it, so this must stay a distinct code (the
+    /// client switches on it, never on message text).
+    BatchVerifyFailed,
+    /// A grant signed by a passkey that may not approve THIS op: on a shared
+    /// vault only the requester (the member whose daemon raised it) or a vault
+    /// admin may approve. RECOVERABLE: the op stays pending and the relay
+    /// client re-registers it so the requester or an admin can still approve
+    /// (the client switches on this code, never on message text).
+    ApproverNotAuthorized,
+    /// A grant carrying an unlock secret (`wk_*` / `wrapping_key`) instead of
+    /// the vault key + identity signature (grant v3). The approver's root and
+    /// `W_c` never leave their browser, so the daemon refuses the form outright
+    /// (fail closed). RECOVERABLE: the op stays pending.
+    WkRefusedV2,
+    /// A grant v3 identity signature (`id` / `id_sig`) that is missing,
+    /// malformed, does not verify under `id`'s key, or names someone other
+    /// than the person the approving passkey belongs to. RECOVERABLE: the op
+    /// stays pending (a relay must not resolve an op with a forged signer).
+    GrantIdInvalid,
+    /// This device has no valid owner-signed admit over its `dev_ ‖ sc_pk`
+    /// (pairing did not complete, or the server served an admit that does
+    /// not verify). Fix: pair again with `sc login`.
+    DeviceNotAdmitted,
+    /// The account principal ledger does not hash to a validly owner-signed
+    /// head (a forged or truncated tail). The daemon keeps its prior decision.
+    LedgerHeadInvalid,
+    /// The account owner revoked this device (a verified revoke in the
+    /// head-checked ledger, contract C6/C5). The daemon latches it.
+    LedgerDeviceRevoked,
+    /// A verified agent AIK whose `ag_` the account ledger does not admit (never
+    /// approved, or revoked): refused on every vault, whatever its table lists.
+    AgentNotAdmitted,
+    /// No verified ledger pull for 7 days (the lease): vaults are locked until
+    /// one succeeds. Data stays on disk.
+    LedgerStale,
     BrokerBodyLimit,
     EgressUnreachable,
     ExposesUnsupported,
@@ -53,6 +98,7 @@ pub enum ScCode {
     NoVault,
     OauthMint,
     PhantomPlainHttp,
+    PhantomUnresolved,
     PolicyDenied,
     RefreshForbidden,
     SecretEncoding,
@@ -106,6 +152,13 @@ impl ScCode {
                 "none",
                 "auth",
             ),
+            AgentNotInAccount => (
+                403,
+                "agent_not_in_account",
+                "Agent not registered to this account",
+                "configure",
+                "auth",
+            ),
             AmbiguousPhantom => (
                 400,
                 "ambiguous_phantom",
@@ -119,6 +172,69 @@ impl ScCode {
                 "Approval needed",
                 "approve",
                 "policy",
+            ),
+            BatchVerifyFailed => (
+                409,
+                "batch_verify_failed",
+                "Batch approval could not be verified",
+                "retry",
+                "request",
+            ),
+            ApproverNotAuthorized => (
+                403,
+                "approver_not_authorized",
+                "Only the requester or a vault admin can approve this",
+                "none",
+                "auth",
+            ),
+            WkRefusedV2 => (
+                400,
+                "wk_refused_v2",
+                "Approval must deliver the vault key, not an unlock secret",
+                "none",
+                "request",
+            ),
+            GrantIdInvalid => (
+                403,
+                "grant_id_invalid",
+                "Approval signature could not be verified",
+                "none",
+                "auth",
+            ),
+            DeviceNotAdmitted => (
+                403,
+                "device_not_admitted",
+                "This device needs to be paired again",
+                "configure",
+                "auth",
+            ),
+            LedgerHeadInvalid => (
+                403,
+                "ledger_head_invalid",
+                "Device list signature could not be verified",
+                "none",
+                "auth",
+            ),
+            LedgerDeviceRevoked => (
+                403,
+                "ledger_device_revoked",
+                "This device was removed from the account",
+                "configure",
+                "auth",
+            ),
+            AgentNotAdmitted => (
+                403,
+                "agent_not_admitted",
+                "Agent not admitted to this account",
+                "configure",
+                "auth",
+            ),
+            LedgerStale => (
+                423,
+                "ledger_stale",
+                "Locked: account unreachable for 7 days",
+                "retry",
+                "environment",
             ),
             ApprovalRegister => (
                 503,
@@ -186,7 +302,14 @@ impl ScCode {
                 "fix_request",
                 "request",
             ),
-            PolicyDenied => (403, "policy_denied", "Denied by policy", "none", "policy"),
+            PhantomUnresolved => (
+                424,
+                "phantom_unresolved",
+                "Phantom could not be resolved",
+                "fix_request",
+                "request",
+            ),
+            PolicyDenied => (403, "policy_denied", "Blocked by policy", "none", "policy"),
             RefreshForbidden => (
                 403,
                 "refresh_forbidden",
@@ -253,6 +376,24 @@ impl ScCode {
 /// consistent state and relays one consistent fix.
 pub const VAULT_LOCKED_MSG: &str = "vault locked. Run `sc unlock`, then retry";
 
+/// The ONE remediation line for [`ScCode::DeviceNotAdmitted`] (the console
+/// says the same sentence).
+pub const DEVICE_NOT_ADMITTED_MSG: &str =
+    "This device needs to be paired again: run `sc login`.";
+
+/// The ONE remediation line for [`ScCode::AgentNotAdmitted`].
+pub const AGENT_NOT_ADMITTED_MSG: &str = "This agent isn't admitted to the SafeClaw account this machine is signed in to (never approved, or removed). Run `sc agent add` to set it up again.";
+
+/// The ONE remediation line for [`ScCode::LedgerStale`].
+pub const LEDGER_STALE_MSG: &str = "locked: SafeClaw could not reach your account for 7 days. Check this machine's network; vaults unlock again once it reconnects (`sc up`).";
+
+/// The ONE remediation line for [`ScCode::LedgerDeviceRevoked`].
+pub const LEDGER_DEVICE_REVOKED_MSG: &str = "This device was removed from your SafeClaw account. Run `sc login` to pair it again.";
+
+/// The remediation line for [`ScCode::AgentNotInAccount`] (raised by the cloud
+/// op relay; the daemon answers [`ScCode::AgentNotAdmitted`]).
+pub const AGENT_NOT_IN_ACCOUNT_MSG: &str = "This agent isn't registered to the SafeClaw account this machine is signed in to. Run `sc agent add` to set it up.";
+
 /// RFC 9457 `application/problem+json` body for a code + detail message.
 /// Extension members: `code` / `action` / `cause` (see [`ScCode::row`]),
 /// plus legacy `error` / `message` dual-emitted for one transition window
@@ -285,6 +426,26 @@ pub enum AppError {
     VaultLocked,
     TooManyRequests,
     Internal(String),
+    /// Batch-approve verification failure (recoverable; see
+    /// `ScCode::BatchVerifyFailed`). Never use for per-op apply failures.
+    BatchVerify(String),
+    /// The grant's signer may not approve this op (see
+    /// `ScCode::ApproverNotAuthorized`). The op stays pending.
+    ApproverNotAuthorized(String),
+    /// A grant delivered an unlock secret instead of the vault key (see
+    /// `ScCode::WkRefusedV2`). The op stays pending.
+    WkRefused(String),
+    /// A grant's identity signature failed (see `ScCode::GrantIdInvalid`).
+    /// The op stays pending.
+    GrantIdInvalid(String),
+    /// This device has no valid admit (see `ScCode::DeviceNotAdmitted`).
+    DeviceNotAdmitted,
+    /// The ledger lease ran out (see `ScCode::LedgerStale`).
+    LedgerStale,
+    /// This device was revoked (see `ScCode::LedgerDeviceRevoked`).
+    LedgerDeviceRevoked,
+    /// The agent is not admitted by the ledger (see `ScCode::AgentNotAdmitted`).
+    AgentNotAdmitted,
 }
 
 impl AppError {
@@ -300,6 +461,23 @@ impl AppError {
             AppError::Conflict(msg) => (ScCode::Conflict, msg.clone()),
             AppError::VaultLocked => (ScCode::VaultLocked, VAULT_LOCKED_MSG.to_string()),
             AppError::TooManyRequests => (ScCode::RateLimited, "Rate limit exceeded".to_string()),
+            AppError::BatchVerify(msg) => (ScCode::BatchVerifyFailed, msg.clone()),
+            AppError::ApproverNotAuthorized(msg) => (ScCode::ApproverNotAuthorized, msg.clone()),
+            AppError::WkRefused(msg) => (ScCode::WkRefusedV2, msg.clone()),
+            AppError::GrantIdInvalid(msg) => (ScCode::GrantIdInvalid, msg.clone()),
+            AppError::DeviceNotAdmitted => (
+                ScCode::DeviceNotAdmitted,
+                DEVICE_NOT_ADMITTED_MSG.to_string(),
+            ),
+            AppError::LedgerStale => (ScCode::LedgerStale, LEDGER_STALE_MSG.to_string()),
+            AppError::LedgerDeviceRevoked => (
+                ScCode::LedgerDeviceRevoked,
+                LEDGER_DEVICE_REVOKED_MSG.to_string(),
+            ),
+            AppError::AgentNotAdmitted => (
+                ScCode::AgentNotAdmitted,
+                AGENT_NOT_ADMITTED_MSG.to_string(),
+            ),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
                 (ScCode::Internal, "Internal server error".to_string())
@@ -342,6 +520,14 @@ impl std::fmt::Display for AppError {
             AppError::VaultLocked => write!(f, "Vault locked"),
             AppError::TooManyRequests => write!(f, "Rate limit exceeded"),
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            AppError::BatchVerify(msg) => write!(f, "Batch verification failed: {}", msg),
+            AppError::ApproverNotAuthorized(msg) => write!(f, "Approver not authorized: {}", msg),
+            AppError::WkRefused(msg) => write!(f, "Grant refused: {}", msg),
+            AppError::GrantIdInvalid(msg) => write!(f, "Approval signature invalid: {}", msg),
+            AppError::DeviceNotAdmitted => write!(f, "{}", DEVICE_NOT_ADMITTED_MSG),
+            AppError::LedgerStale => write!(f, "{}", LEDGER_STALE_MSG),
+            AppError::LedgerDeviceRevoked => write!(f, "{}", LEDGER_DEVICE_REVOKED_MSG),
+            AppError::AgentNotAdmitted => write!(f, "{}", AGENT_NOT_ADMITTED_MSG),
         }
     }
 }
@@ -389,9 +575,19 @@ mod tests {
             CaUnavailable,
             AgentKey,
             AgentNotAuthorized,
+            AgentNotInAccount,
             AmbiguousPhantom,
             ApprovalNeeded,
             ApprovalRegister,
+            BatchVerifyFailed,
+            ApproverNotAuthorized,
+            WkRefusedV2,
+            GrantIdInvalid,
+            DeviceNotAdmitted,
+            LedgerHeadInvalid,
+            LedgerDeviceRevoked,
+            AgentNotAdmitted,
+            LedgerStale,
             BrokerBodyLimit,
             EgressUnreachable,
             ExposesUnsupported,
@@ -401,6 +597,7 @@ mod tests {
             NoVault,
             OauthMint,
             PhantomPlainHttp,
+            PhantomUnresolved,
             PolicyDenied,
             RefreshForbidden,
             SecretEncoding,
@@ -413,7 +610,8 @@ mod tests {
             let (status, code, title, action, cause) = c.row();
             assert!((400..=599).contains(&status), "{code}: status {status}");
             assert!(
-                code.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_'),
+                code.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
                 "{code}: not snake_case"
             );
             assert!(!title.is_empty());
@@ -444,6 +642,21 @@ mod tests {
                 "{code}: unknown cause {cause}"
             );
         }
+    }
+
+    /// The not-admitted refusal is its own code with the `sc agent add` fix,
+    /// never the vault-level `agent_not_authorized`.
+    #[test]
+    fn agent_not_admitted_row() {
+        let (code, detail) = AppError::AgentNotAdmitted.code();
+        assert_eq!(code.as_str(), "agent_not_admitted");
+        assert_eq!(code.status(), 403);
+        assert_eq!(code.row().3, "configure");
+        assert!(detail.contains("`sc agent add`"));
+        assert!(!detail.contains('\n') && !detail.contains('\u{2014}'), "one line, no em dash");
+        let (code, detail) = AppError::LedgerStale.code();
+        assert_eq!((code.as_str(), code.status()), ("ledger_stale", 423));
+        assert!(detail.starts_with("locked: SafeClaw could not reach your account for 7 days"));
     }
 
     /// problem_body carries both the 9457 members and the legacy dual-emit.

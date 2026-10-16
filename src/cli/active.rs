@@ -51,7 +51,7 @@ pub struct CliConfig {
     pub cloud_backend: Option<String>,
     /// Cloud FRONTEND origin (where the human taps their passkey: the web
     /// approval page at `{frontend_origin}/grant/{op_id}`). Returned by the
-    /// pair-token exchange as `console_url`. Distinct from `cloud_backend`
+    /// pairing approval as `console_url`. Distinct from `cloud_backend`
     /// (the API host, typically `api.<frontend>`). Set by `sc login`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_origin: Option<String>,
@@ -104,19 +104,13 @@ pub struct CliConfig {
     /// Absent on an older backend / pre-UIK account (the ledger loop then doesn't run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_uik: Option<String>,
-    /// §15 principal-ledger enforcement switch: DEFAULT OFF — a verified revoke of
-    /// THIS device only locks+wipes when this is "on". `SAFECLAW_PRINCIPAL_ENFORCE`
-    /// overrides (and survives an old binary's config save). Flipped on at the P6
-    /// cutover. See [`crate::principal_ledger::principal_enforce_enabled`].
+    /// The account owner's UIK signing key (raw 32 bytes, base64url), pinned at
+    /// pairing from the signer of the VERIFIED owner-signed admit of this device
+    /// (grant-v3 C1), never from a server label. Verifies a grant's `id_sig`
+    /// when the approver is the paired account. Read only when it self-certifies
+    /// against `account_uik` ([`account_uik_pub`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub principal_enforce: Option<String>,
-    /// §15 leg-A require-signed-tombstone switch: DEFAULT OFF — an unsigned
-    /// `status:"deleted"` still drops local state (legacy). When "on", the daemon drops
-    /// only on an owner-signed tombstone that verifies against the vault fold-owner set.
-    /// `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE` overrides. Flipped on at the P6 cutover. See
-    /// [`crate::principal_ledger::require_signed_tombstone`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub require_signed_tombstone: Option<String>,
+    pub account_uik_pub: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -415,15 +409,74 @@ pub fn put_cloud_coords(
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string());
     // §15: persist the paired account UUID (reference) + the owner-UIK us_ (the
-    // real, self-certifying principal-ledger anchor). Keep prior values if this
-    // pairing response omits them (older backend / pre-UIK account).
-    if let Some(a) = account_id.filter(|s| !s.is_empty()) {
-        cfg.account_id = Some(a.to_string());
+    // real, self-certifying principal-ledger anchor).
+    let (id, uik) = merge_account(
+        cfg.account_id.as_deref(),
+        cfg.account_uik.as_deref(),
+        account_id,
+        account_uik,
+    );
+    if uik != cfg.account_uik {
+        cfg.account_uik_pub = None; // a pinned key belongs to the previous account
     }
-    if let Some(u) = account_uik.filter(|s| !s.is_empty()) {
-        cfg.account_uik = Some(u.to_string());
-    }
+    cfg.account_id = id;
+    cfg.account_uik = uik;
     save(&cfg)
+}
+
+fn nonempty(s: Option<&str>) -> Option<&str> {
+    s.filter(|s| !s.is_empty())
+}
+
+/// Is the account in a pairing response (`new_id` / `new_uik`) a DIFFERENT
+/// account from the one this machine is paired to (`prior_*`)? Only a positive
+/// mismatch on a field both sides carry counts: an unpaired machine, or a
+/// response that omits a field, is not a switch.
+pub fn is_other_account(
+    prior_id: Option<&str>,
+    prior_uik: Option<&str>,
+    new_id: Option<&str>,
+    new_uik: Option<&str>,
+) -> bool {
+    let differs = |a: Option<&str>, b: Option<&str>| match (nonempty(a), nonempty(b)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    };
+    differs(prior_id, new_id) || differs(prior_uik, new_uik)
+}
+
+/// Is this machine currently paired to an account OTHER than
+/// (`account_id`, `account_uik`)? `sc login` to a different account switches the
+/// machine to it and starts clean (see `cli::logout::wipe_local_account_state`).
+pub fn paired_to_other_account(account_id: Option<&str>, account_uik: Option<&str>) -> bool {
+    let cfg = load().unwrap_or_default();
+    is_other_account(
+        cfg.account_id.as_deref(),
+        cfg.account_uik.as_deref(),
+        account_id,
+        account_uik,
+    )
+}
+
+/// The `(account_id, account_uik)` to persist after a pairing. Re-pairing the
+/// SAME account keeps a prior value the response omits (older backend /
+/// pre-UIK account). Pairing a DIFFERENT account takes the response as-is, so
+/// the old account's pinned UIK / id never survive into the new pairing.
+fn merge_account(
+    prior_id: Option<&str>,
+    prior_uik: Option<&str>,
+    new_id: Option<&str>,
+    new_uik: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let (keep_id, keep_uik) = if is_other_account(prior_id, prior_uik, new_id, new_uik) {
+        (None, None)
+    } else {
+        (nonempty(prior_id), nonempty(prior_uik))
+    };
+    (
+        nonempty(new_id).or(keep_id).map(str::to_string),
+        nonempty(new_uik).or(keep_uik).map(str::to_string),
+    )
 }
 
 /// The account's Supabase UUID, for logging / debug / support display ONLY (matching a
@@ -440,6 +493,30 @@ pub fn account_uik() -> Option<String> {
     load().ok()?.account_uik.filter(|s| !s.is_empty())
 }
 
+/// The paired account's UIK signing key ([`CliConfig::account_uik_pub`]), only
+/// when it self-certifies against the pinned [`account_uik`].
+pub fn account_uik_pub() -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    let cfg = load().ok()?;
+    let id = cfg.account_uik.filter(|s| !s.is_empty())?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cfg.account_uik_pub?.as_bytes())
+        .ok()?;
+    let pk = <[u8; 32]>::try_from(raw.as_slice()).ok()?;
+    (crate::identity::derive_id(crate::identity::IdKind::User, &pk) == id).then_some(pk)
+}
+
+/// Pin the account owner's UIK (`us_…` and its signing key) from a VERIFIED
+/// admit signer at pairing. The id is derived from the key, so the two can't
+/// disagree.
+pub fn put_account_uik_key(pk: &[u8; 32]) -> Result<PathBuf, String> {
+    use base64::Engine as _;
+    let mut cfg = load().unwrap_or_default();
+    cfg.account_uik = Some(crate::identity::derive_id(crate::identity::IdKind::User, pk));
+    cfg.account_uik_pub = Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk));
+    save(&cfg)
+}
+
 /// Clear the cloud pairing from config + the known-vaults catalog (the inverse of
 /// [`put_cloud_coords`]): drop daemon/vault/cloud_backend/frontend_origin/account_id
 /// + known_vaults, preserve user `settings`. Used by the §15 self-revoke wipe so it
@@ -452,6 +529,7 @@ pub fn clear_pairing() -> Result<(), String> {
     cfg.frontend_origin = None;
     cfg.account_id = None;
     cfg.account_uik = None;
+    cfg.account_uik_pub = None;
     cfg.vault_deleted_upstream = None;
     cfg.known_vaults.clear();
     save(&cfg)?;
@@ -472,6 +550,22 @@ pub fn frontend_origin() -> Option<String> {
     Some(derive_frontend_from_backend(backend))
 }
 
+/// Where console pages are linked for this pairing: the `app.` host of a
+/// SafeClaw console (whichever form was stored at `sc login`), otherwise the
+/// stored origin. [`frontend_origin`] stays the stored value (it selects the
+/// passkey relying party).
+pub fn console_origin() -> Option<String> {
+    frontend_origin().map(|o| crate::passkey::webauthn::console_link_origin(&o))
+}
+
+/// The console origin for a cloud backend URL, before any pairing is stored
+/// (`sc login`): the backend's frontend (`api.` dropped), at its console link
+/// host. The backend comes from the first-party allowlist / pinned config,
+/// never from a server response, so this is the origin `sc` pins for pairing.
+pub fn console_origin_for_backend(backend: &str) -> String {
+    crate::passkey::webauthn::console_link_origin(&derive_frontend_from_backend(backend))
+}
+
 /// Human web-approval link for an op. When the daemon is cloud-paired this is
 /// the absolute cloud page `{frontend_origin}/grant/{op_id}` — the only
 /// approval surface a remote user can actually reach (the daemon is
@@ -480,7 +574,7 @@ pub fn frontend_origin() -> Option<String> {
 /// exists yet, which is why callers gate absolute-vs-relative). Single source
 /// of truth for both the broker's `approve_url` and the CLI's remote-approve arm.
 pub fn grant_url(op_id: &str) -> String {
-    match frontend_origin() {
+    match console_origin() {
         Some(origin) => format!("{}/grant/{}", origin, op_id),
         None => format!("/op/{}", op_id),
     }
@@ -701,12 +795,11 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
     // vault and point at re-pairing instead of the generic "no vault" error.
     if let Some(dead) = cfg.vault_deleted_upstream.as_deref() {
         return Err(format!(
-            "vault {} was deleted on the web, so this device's pairing to it is gone — \
-             generate a new install token in the console (\"Connect a new agent\") and run `sc login`",
+            "vault {} was deleted on the web; run `sc vault ls` to pick another, or `sc login` to pair again",
             dead
         ));
     }
-    Err("no vault selected — run `sc login` or `sc vault use`".to_string())
+    Err("no vault selected: run `sc vault ls`, then pass `--vault <name>` or run `sc vault use <name>`".to_string())
 }
 
 /// Client-side mirror of the daemon's vault-id rule (`op::validate_vault_id`:
@@ -960,5 +1053,63 @@ mod tests {
             derive_frontend_from_backend("https://api.example.com/base"),
             "https://example.com/base"
         );
+    }
+
+    /// Re-pairing the SAME account keeps today's behavior: a field the response
+    /// omits keeps its prior value. Pairing a DIFFERENT account never carries
+    /// the old account's id / pinned UIK over, even when the response omits one.
+    #[test]
+    fn merge_account_clears_old_account_on_switch() {
+        let s = |v: &str| Some(v.to_string());
+        // same account, full response
+        assert_eq!(
+            merge_account(Some("a"), Some("us_a"), Some("a"), Some("us_a")),
+            (s("a"), s("us_a"))
+        );
+        // same account, response omits the UIK → keep the pinned one
+        assert_eq!(
+            merge_account(Some("a"), Some("us_a"), Some("a"), None),
+            (s("a"), s("us_a"))
+        );
+        assert_eq!(
+            merge_account(Some("a"), Some("us_a"), Some("a"), Some("")),
+            (s("a"), s("us_a"))
+        );
+        // different account, response omits the UIK → the old UIK is dropped
+        assert_eq!(
+            merge_account(Some("a"), Some("us_a"), Some("b"), None),
+            (s("b"), None)
+        );
+        // different account by UIK alone (id omitted) → the old id is dropped
+        assert_eq!(
+            merge_account(Some("a"), Some("us_a"), None, Some("us_b")),
+            (None, s("us_b"))
+        );
+        // first pairing
+        assert_eq!(
+            merge_account(None, None, Some("b"), Some("us_b")),
+            (s("b"), s("us_b"))
+        );
+    }
+
+    #[test]
+    fn other_account_needs_a_positive_mismatch() {
+        assert!(is_other_account(Some("a"), None, Some("b"), None));
+        assert!(is_other_account(None, Some("us_a"), None, Some("us_b")));
+        assert!(!is_other_account(
+            Some("a"),
+            Some("us_a"),
+            Some("a"),
+            Some("us_a")
+        ));
+        // unpaired machine, or nothing comparable in the response: not a switch
+        assert!(!is_other_account(None, None, Some("b"), Some("us_b")));
+        assert!(!is_other_account(Some("a"), None, None, Some("us_b")));
+        assert!(!is_other_account(
+            Some(""),
+            Some(""),
+            Some("b"),
+            Some("us_b")
+        ));
     }
 }

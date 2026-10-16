@@ -1,15 +1,18 @@
 //! `safeclaw status` / `safeclaw vault status` — current vault status.
 
-use crate::cli::active::{frontend_origin, join_vault_url, load as load_config};
+use crate::cli::active::{console_origin, frontend_origin, join_vault_url, load as load_config};
 
 #[derive(Debug)]
 pub struct VaultStatus {
     pub url: String,
-    /// Web console page for this vault (`{frontend_origin}/vault/{id}`) — the
+    /// Web console page for this vault (`{console_origin}/vault/{id}`) — the
     /// one URL here that IS meant for a browser. `None` when the device was
     /// never paired (local-only / self-host: no console exists).
     pub console: Option<String>,
     pub state: VaultState,
+    /// What the daemon has not applied, one sentence each (`GET
+    /// /v/{vid}/held`).
+    pub held: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -115,11 +118,12 @@ async fn control_port_tcp_alive(control_root: &str) -> bool {
 pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
     let url = join_vault_url(custodian, vault);
     // Mirrors the console's route shape (`/vault/{id}`, see fe vault-nav).
-    let console = frontend_origin().map(|o| format!("{}/vault/{}", o, vault));
+    let console = console_origin().map(|o| format!("{}/vault/{}", o, vault));
     let status = |state| VaultStatus {
         url: url.clone(),
         console: console.clone(),
         state,
+        held: Vec::new(),
     };
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -155,6 +159,11 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
         .map(|a| a.len())
         .unwrap_or(0);
 
+    let held = fetch_held(&client, custodian, vault).await;
+    let status = |state| VaultStatus {
+        held: held.clone(),
+        ..status(state)
+    };
     let kk_url = format!(
         "{}/v/{}/secret-keys",
         custodian.trim_end_matches('/'),
@@ -179,6 +188,57 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
         }
         Ok(r) if r.status().as_u16() == 409 => status(VaultState::Locked { passkeys }),
         _ => status(VaultState::Locked { passkeys }),
+    }
+}
+
+/// What the daemon has not applied for `vault` (`GET /v/{vid}/held`), one
+/// sentence each; empty when it cannot say.
+pub async fn fetch_held(client: &reqwest::Client, custodian: &str, vault: &str) -> Vec<String> {
+    let url = format!(
+        "{}/v/{}/held",
+        custodian.trim_end_matches('/'),
+        urlencoding::encode(vault)
+    );
+    let Ok(r) = client.get(&url).send().await else {
+        return Vec::new();
+    };
+    if !r.status().is_success() {
+        return Vec::new();
+    }
+    r.json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|b| b.get("held").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+/// This device's standing in the account ledger (§15), from the decision the
+/// daemon persisted (`principal_floor.json`) and the pairing in config.
+fn ledger_line(cfg: &crate::cli::active::CliConfig) -> String {
+    use crate::principal_ledger as pl;
+    let floor = pl::load_floor(&crate::config::default_state_dir());
+    let now = crate::util::now_unix();
+    let has_anchor = cfg.account_uik.as_deref().is_some_and(|s| !s.is_empty());
+    let has_dik = crate::device_auth::device_signer().is_some();
+    ledger_text(pl::gate(&floor, now, has_anchor, has_dik), pl::lease_days_left(&floor, now))
+}
+
+/// The `device:` line for a standing (pure).
+fn ledger_text(gate: crate::principal_ledger::DeviceGate, days_left: Option<u64>) -> String {
+    use crate::principal_ledger::DeviceGate;
+    match gate {
+        DeviceGate::Open => match days_left {
+            Some(d) if d < 2 => format!(
+                "admitted; {} day{} left before SafeClaw locks unless it reaches your account",
+                d,
+                if d == 1 { "" } else { "s" }
+            ),
+            _ => "admitted".to_string(),
+        },
+        DeviceGate::NotAdmitted => "not admitted to your account: run `sc login`".to_string(),
+        DeviceGate::Stale => "locked: SafeClaw could not reach your account for 7 days".to_string(),
+        DeviceGate::Revoked => "removed from your account: run `sc login` to pair it again".to_string(),
     }
 }
 
@@ -263,6 +323,7 @@ pub async fn run(json: bool) -> Result<(), String> {
             let host = origin_host(&origin);
             println!("  state: logged in");
             println!("  cloud: {} ({})", host, env_label(host));
+            println!("  device: {}", ledger_line(&cfg));
         }
         None => println!("  state: not logged in — run `sc login`"),
     }
@@ -282,7 +343,7 @@ pub async fn run(json: bool) -> Result<(), String> {
                     "  note:  vault {} was deleted on the web; this device's pairing to it is gone",
                     dead
                 );
-                println!("  hint:  generate a new install token in the console (\"Connect a new agent\"), then `sc login`");
+                println!("  hint:  run `sc vault ls` to pick another, or `sc login` to pair again");
             } else if d.vault_count == Some(0) {
                 println!("  hint:  no vaults yet — seal one on the web, then `sc login`");
             } else if crate::cli::active::known_vaults().is_empty() {
@@ -324,7 +385,7 @@ fn origin_host(origin: &str) -> &str {
 /// Short environment label for a paired cloud host: the first-party prod / dev
 /// domains, else `self-host`. Purely cosmetic — it never gates anything.
 fn env_label(host: &str) -> &'static str {
-    match host {
+    match crate::passkey::webauthn::console_root_of_host(host).unwrap_or(host) {
         "safeclaw.pro" => "prod",
         "dev.safeclaw.pro" => "dev",
         _ => "self-host",
@@ -354,6 +415,7 @@ fn print_json(
             "state": state,
             "passkeys": passkeys,
             "secrets": secrets,
+            "not_applied": s.held,
         })
     });
     let login_json = match frontend_origin() {
@@ -418,5 +480,34 @@ pub fn print_status(s: &VaultStatus) {
             println!("  passkeys: {}", passkeys);
             println!("  secrets:  {}", secrets);
         }
+    }
+    for line in &s.held {
+        println!("  note:     {}", crate::util::terminal_safe(line));
+    }
+}
+
+#[cfg(test)]
+mod env_label_tests {
+    use super::{env_label, ledger_text};
+
+    #[test]
+    fn either_console_host_names_its_environment() {
+        assert_eq!(env_label("dev.safeclaw.pro"), "dev");
+        assert_eq!(env_label("app.dev.safeclaw.pro"), "dev");
+        assert_eq!(env_label("app.safeclaw.pro"), "prod");
+        assert_eq!(env_label("vault.example.com"), "self-host");
+    }
+
+    #[test]
+    fn ledger_lines() {
+        use crate::principal_ledger::DeviceGate;
+        assert_eq!(ledger_text(DeviceGate::Open, Some(5)), "admitted");
+        assert!(ledger_text(DeviceGate::Open, Some(1)).contains("1 day left"));
+        assert!(ledger_text(DeviceGate::Open, Some(0)).contains("0 days left"));
+        assert_eq!(
+            ledger_text(DeviceGate::Stale, None),
+            "locked: SafeClaw could not reach your account for 7 days"
+        );
+        assert!(ledger_text(DeviceGate::NotAdmitted, None).contains("`sc login`"));
     }
 }

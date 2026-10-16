@@ -4,6 +4,7 @@
 //! — every approval flows through the one code path.
 
 use serde_json::json;
+use std::io::IsTerminal;
 
 use crate::cli::active::resolve_active;
 use crate::cli::approve::{approve_op, ApproveOpts};
@@ -30,8 +31,15 @@ async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), Str
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: true,
     };
     approve_op(&custodian, &vault, &op, label, &opts).await?;
+
+    if crate::cli::active::frontend_origin().is_some()
+        && (!std::io::stdin().is_terminal() || !std::io::stderr().is_terminal())
+    {
+        return Ok(());
+    }
 
     eprintln!("safeclaw {} — ok", label.to_lowercase());
     Ok(())

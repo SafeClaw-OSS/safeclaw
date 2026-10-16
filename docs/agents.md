@@ -1,13 +1,23 @@
 # Agents: attribution without possession
 
+This page explains agent identities, the setup commands that create them, and how policy controls what each agent may do.
+
+## Setup commands
+
+| Command | What it does | Who runs it | How often |
+|---|---|---|---|
+| `sc login` | Pairs this machine to the account | A person at a terminal, or `sc setup` under the hood | Once per machine, or after re-pairing |
+| `sc agent add <name>` | Registers an agent and creates its identity and env file | A person at a terminal, or `sc setup` under the hood | Once per agent |
+| `sc setup --name <name>` | Runs whichever pairing or registration is still needed, then writes the env file, installs the skill, and asks for vault unlock | A person or their agent | First setup and safe to re-run |
+
 To SafeClaw, an agent is an **identity**, not a trust decision. Each agent
 gets its own keypair; what any agent may *do* is decided elsewhere, by
 [policy](approvals.md), per action, at use time.
 
 ## The identity
 
-`sc agent add <name>` (or the console's install prompt) mints one env
-block of two non-secret values:
+`sc agent add <name>` mints one identity and writes its env file at
+`~/.safeclaw/agents/<name>/agent.env`. The file contains two non-secret values:
 
 | Var | Meaning |
 |---|---|
@@ -27,7 +37,7 @@ one identity file per agent, and don't re-mint when the env already exists.
 
 Discover connections through the registry, place phantoms, route commands
 through `sc run`, wait on approvals (`sc op wait`). The full behavioral
-contract fits in one file, [the skill](https://github.com/SafeClaw-OSS/safeclaw/blob/main/static/safeclaw-skill.md), and
+contract fits in one file, [the skill](https://github.com/getsafeclaw/safeclaw/blob/main/skills/safeclaw/SKILL.md), and
 one habit: **phantoms, not values** ([`sc run` and phantoms](sc-run.md)).
 
 ## What an agent can't do
@@ -42,5 +52,5 @@ is exactly what the audit trail records. Costs and limits in detail:
 
 ## Handing it over
 
-The console install prompt delivers pairing, env, and skill in one paste.
-Doing it by hand: [For your agent](for-your-agent.md).
+Agent-driven setup delivers pairing, env, and skill in one loop. Doing it by
+hand: [For your agent](for-your-agent.md).

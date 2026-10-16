@@ -23,6 +23,7 @@ use sudp::passkey::WebAuthn;
 use sudp::primitives::StdPrimitives;
 
 use crate::error::{AppError, Result};
+use crate::protocol::grant::GrantKey;
 use crate::protocol::Operation;
 use crate::server::handlers::op::validate_vault_id;
 use crate::state::AppState;
@@ -149,28 +150,17 @@ pub async fn passkeys(
             });
         }
     }
-    // Pending-passkey deposits (Stage 1 done, awaiting Stage 2 Enroll).
-    // list() opportunistically GC-sweeps expired files — that's the only
-    // place we know the daemon is actively serving this vault. Failure to
-    // list isn't fatal: pending list just renders empty.
-    let pending: Vec<Value> = crate::storage::pending_passkey::list(&state.vaults, &vault_id)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| p.public_metadata())
-        .collect();
     Ok(Json(json!({
         "vault_exists": true,
         "passkeys": metas,
-        "pending_passkeys": pending,
     })))
 }
 
 /// `GET /pubkey` — daemon HPKE outer-envelope public key (PROTOCOL.md §4.2.1 M1).
 ///
 /// Returns the daemon's static `sc_pk` plus the suite identifier so clients
-/// can pick the matching HPKE implementation. Currently used by the
-/// pending-passkey deposit flow (cross-device add-passkey); future use:
-/// `[HPKE: MUST]` grant submissions.
+/// can pick the matching HPKE implementation. Used by the local approve
+/// ceremony to seal the vault key it delivers (grant v3).
 ///
 /// `sc_pk_fingerprint` lets remote clients OOB-verify the key on first pin
 /// (per PROTOCOL.md §4.2.2 trust establishment).
@@ -192,11 +182,109 @@ pub async fn pubkey(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
+/// `GET /v/{vid}/keyset` — this vault's per-item KEYSET (passkey wraps, UIK
+/// membership seals, registry; no items). Local control plane only: the local
+/// approve ceremony (`sc`, same machine) opens `K` in its own process from it,
+/// so neither `W_c` nor a root ever reaches the daemon. Every field is wrapped
+/// or sealed material the cloud already syncs.
+pub async fn keyset(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Value>> {
+    validate_vault_id(&vault_id)?;
+    let path = state.vaults.per_item_path(&vault_id)?;
+    let pv = crate::storage::sealed_vault::read_per_item(&path)?.ok_or(AppError::NotFound)?;
+    Ok(Json(json!({ "keyset": pv.keyset })))
+}
+
 /// `POST /v/{vid}/sync` — on-demand cloud pull + complete-pending-connect
 /// (backs `sc sync`). No passkey: it only advances already-sealed state (the
 /// pull is device-key-authed; the connect re-seal uses the retained K and
 /// no-ops if the vault is locked). The vault id is validated; the rest is
 /// handled inside `sync::sync_vault_now`.
+/// `GET /v/{vid}/held`: what this device has not applied, one sentence each
+/// (`sc status`, `sc service ls`): the pulled changes it holds, and why; a
+/// pull at unlock that failed and is being retried; local changes the sync
+/// did not apply. Local, no passkey.
+pub async fn held(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    validate_vault_id(&vault_id)?;
+    Ok(Json(json!({ "held": held_lines(&state, &vault_id) })))
+}
+
+/// The sentences of [`held`]. A held change names its record when the vault
+/// is unlocked, and who signed it (or that nobody did), as the row says.
+pub(crate) fn held_lines(state: &AppState, vault_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let pv = state
+        .vaults
+        .per_item_path(vault_id)
+        .ok()
+        .and_then(|p| crate::storage::sealed_vault::read_per_item(&p).ok().flatten());
+    if let Some(pv) = pv {
+        let key = state.cloned_state_key(vault_id);
+        for (id, h) in &pv.held {
+            let opened = key.as_ref().and_then(|k| {
+                crate::storage::item::open_wire_item::<StdPrimitives>(
+                    VaultKeys::from_material(k),
+                    vault_id,
+                    id,
+                    h.version,
+                    &h.ct,
+                )
+                .ok()
+            });
+            let what = held_what(opened.as_ref(), pv.row_kinds.get(id).copied());
+            out.push(held_line(&what, h.signer.as_deref(), &h.reason));
+        }
+    }
+    if let Some(e) = state.catch_up_failure(vault_id) {
+        out.push(format!(
+            "changes from the cloud since unlock are not pulled yet ({}); retrying",
+            e
+        ));
+    }
+    out.extend(state.sync_note_lines(vault_id));
+    out
+}
+
+/// What a held row is, as [`held_line`] says it: a change to a data record
+/// (a secret, a connection, an in-flight connect, a service) or a config
+/// change (owner-config, an agent grant, a row not at its own address). Named
+/// when it reads under the session's key (`opened`); else known by what this
+/// device read the row as before (`kind`); a row never read is a change.
+fn held_what(
+    opened: Option<&crate::storage::item::ItemPayload>,
+    kind: Option<crate::storage::sealed_vault::RowKind>,
+) -> String {
+    use crate::storage::item::{record_label, rule, Conflict, ItemNs};
+    use crate::storage::sealed_vault::RowKind;
+    match opened {
+        Some(p) => {
+            let data = p.ns != ItemNs::Agent
+                && rule(p.ns, &p.name).is_some_and(|r| r.conflict != Conflict::OwnerConfig)
+                && kind != Some(RowKind::Guarded);
+            let what = if data { "change" } else { "config change" };
+            format!("{} to {}", what, record_label(p))
+        }
+        None if kind == Some(RowKind::Guarded) => "config change".to_string(),
+        None => "change".to_string(),
+    }
+}
+
+/// One held change as a sentence: what it is, where it came from (who
+/// signed it, as the row says, or that nobody did), and why it is not
+/// applied.
+fn held_line(what: &str, signer: Option<&str>, reason: &str) -> String {
+    let who = match signer {
+        Some(s) => format!("signed by {}", s.chars().take(64).collect::<String>()),
+        None => "unsigned".to_string(),
+    };
+    format!("{} from the cloud ({}) not applied: {}", what, who, reason)
+}
+
 pub async fn sync_now(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<String>,
@@ -219,6 +307,11 @@ pub async fn sync_now(
                         .map(|(conn, host)| json!({ "conn": conn, "host": host }))
                         .collect::<Vec<_>>(),
                 },
+                // Records whose local change the push set aside (the cloud
+                // row changed elsewhere meanwhile): the user re-runs them.
+                "conflicts": state.sync_conflict_records(&vault_id),
+                // Every other change not applied, as sentences.
+                "notes": state.sync_note_lines(&vault_id),
             }))
         }
         Err(e) => Json(json!({ "ok": false, "error": e })),
@@ -359,16 +452,53 @@ pub fn unwrap_k_from_keyset(
 ///   it from the passkey PRF), and `K` is HPKE-sealed to the member's UIK enc key
 ///   in this credential's per-row seal ([`crate::crypto::vault_key::UikRoot::open_k`]).
 ///
+/// On a re-keyed v2 vault the material also carries the vault's previous
+/// content keys from this member's own keyset entry, else from another
+/// entry's ([`crate::storage::item::material_with_prev`]).
+///
 /// One seam so no read path can diverge on how a grant resolves `K` across the
 /// two keyset formats. The grant wire is identical in both cases (a 32-byte
 /// secret HPKE-sealed to the daemon's `sc_pk`); only its meaning differs, and
 /// the keyset shape (`uik.is_some()`) — not the wire — selects the branch.
+///
+/// A [`GrantKey::VaultKey`] (an admin approving another member's op delivers
+/// the vault key itself, `k_enc`/`k_ct`) skips the member entry: the
+/// delivered material is the bundle a v2 open produces, kept with the
+/// vault's previous content keys from any keyset entry, the same as the root
+/// path. On a v1 keyset the delivered material is the 32-byte `K` itself
+/// (grant v3: every vault takes the vault key, never `W_c`).
 pub fn acquire_k_from_keyset(
     keyset: &crate::storage::sealed_vault::Keyset,
-    secret: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault_id: &str,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let secret = match key {
+        GrantKey::Custody(secret) => secret,
+        GrantKey::VaultKey(material) => {
+            let Some(uik) = keyset.uik.as_ref() else {
+                // v1 keyset (personal vault): the delivered material is `K` itself.
+                if material.len() != 32 {
+                    return Err(AppError::Unauthorized(
+                        "a delivered vault key for a personal vault must be 32 bytes".into(),
+                    ));
+                }
+                return Ok(zeroize::Zeroizing::new(material.to_vec()));
+            };
+            if material.len() != 32 && material.len() != 64 {
+                return Err(AppError::Unauthorized(
+                    "a delivered vault key must be 32 or 64 bytes".into(),
+                ));
+            }
+            let lists = uik.creds.values().map(|c| c.prev_content_ct.as_slice());
+            return Ok(crate::storage::item::material_with_prev::<StdPrimitives>(
+                zeroize::Zeroizing::new(material.to_vec()),
+                vault_id,
+                uik.generation,
+                lists,
+            ));
+        }
+    };
     let Some(uik) = keyset.uik.as_ref() else {
         // v1: `secret` is W_c → unwrap K directly.
         return unwrap_k_from_keyset(keyset, secret, credential_id_bytes);
@@ -399,19 +529,31 @@ pub fn acquire_k_from_keyset(
         .get(&cid_b64)
         .or_else(|| uik.creds.values().find(|c| c.user_id == us_id))
         .ok_or_else(|| AppError::Unauthorized("no UIK seal for this member".into()))?;
-    uik_root.open_k(vault_id, &entry.k_encapped, &entry.k_ct)
+    let bundle = uik_root.open_k(vault_id, &entry.k_encapped, &entry.k_ct)?;
+    // A re-keyed vault: the previous content keys ride the keyset entries,
+    // kept with the bundle so rows a re-key has not moved yet still read.
+    // This member's own entry's list first, else any other entry's: every
+    // list is sealed under the shared content key with the same AAD.
+    let lists = std::iter::once(entry.prev_content_ct.as_slice())
+        .chain(uik.creds.values().map(|c| c.prev_content_ct.as_slice()));
+    Ok(crate::storage::item::material_with_prev::<StdPrimitives>(
+        bundle,
+        vault_id,
+        uik.generation,
+        lists,
+    ))
 }
 
 /// Per-item analogue of [`decrypt_vault_view`]: unwrap `K` from the keyset via
 /// the grant, then fold all live item rows into a [`VaultPlaintextView`]. Used
 /// by the per-item Export path. Discards `K` after the fold (read-only).
 pub fn decrypt_vault_view_peritem(
-    wrapping_key: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<VaultPlaintextView> {
-    let k = acquire_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes, vault_id)?;
+    let k = acquire_k_from_keyset(&vault.keyset, key, credential_id_bytes, vault_id)?;
     vault.fold_view::<StdPrimitives>(VaultKeys::from_material(&k), vault_id)
 }
 
@@ -421,12 +563,12 @@ pub fn decrypt_vault_view_peritem(
 /// writes) without a second passkey. Used by the per-item unlock / write /
 /// enroll auto-unlock paths.
 pub fn decrypt_vault_view_peritem_keep_key(
-    wrapping_key: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
-    let k = acquire_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes, vault_id)?;
+    let k = acquire_k_from_keyset(&vault.keyset, key, credential_id_bytes, vault_id)?;
     let view = vault.fold_view::<StdPrimitives>(VaultKeys::from_material(&k), vault_id)?;
     Ok((view, k))
 }
@@ -458,19 +600,32 @@ pub fn open_view_for_grant(
     state: &AppState,
     vault_id: &str,
     op: &Operation,
-    wrapping_key: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault: Option<&crate::storage::SealedVault>,
 ) -> Result<VaultPlaintextView> {
     if let Ok(path) = state.vaults.per_item_path(vault_id) {
         if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
-            return decrypt_vault_view_peritem(wrapping_key, credential_id_bytes, &pv, vault_id);
+            return decrypt_vault_view_peritem(key, credential_id_bytes, &pv, vault_id);
         }
     }
     // Whole-blob fallback — only vaults that still have a vault.dat (daemon-side
     // Enroll/Write) reach here; a web-enrolled per-item vault is served above.
     let vault = vault.ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-    decrypt_vault_view(op, wrapping_key, credential_id_bytes, vault)
+    match key {
+        GrantKey::Custody(w_c) => decrypt_vault_view(op, w_c, credential_id_bytes, vault),
+        GrantKey::VaultKey(k) => decrypt_vault_view_with_key(whole_blob_k(k)?, vault),
+    }
+}
+
+/// A whole-blob vault (v1, personal) is sealed under the 32-byte `K`.
+fn whole_blob_k(k: &[u8]) -> Result<&[u8]> {
+    if k.len() != 32 {
+        return Err(AppError::Unauthorized(
+            "a delivered vault key for a personal vault must be 32 bytes".into(),
+        ));
+    }
+    Ok(k)
 }
 
 /// Like [`open_view_for_grant`] but RETAINS `K` for the unlocked session — the
@@ -479,14 +634,14 @@ pub fn open_view_for_grant_keep_key(
     state: &AppState,
     vault_id: &str,
     op: &Operation,
-    wrapping_key: &[u8],
+    key: GrantKey<'_>,
     credential_id_bytes: &[u8],
     vault: Option<&crate::storage::SealedVault>,
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
     if let Ok(path) = state.vaults.per_item_path(vault_id) {
         if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
             let (view, k) = decrypt_vault_view_peritem_keep_key(
-                wrapping_key,
+                key,
                 credential_id_bytes,
                 &pv,
                 vault_id,
@@ -501,7 +656,14 @@ pub fn open_view_for_grant_keep_key(
     }
     // Whole-blob fallback — see open_view_for_grant.
     let vault = vault.ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
-    decrypt_vault_view_keep_key(op, wrapping_key, credential_id_bytes, vault)
+    match key {
+        GrantKey::Custody(w_c) => decrypt_vault_view_keep_key(op, w_c, credential_id_bytes, vault),
+        GrantKey::VaultKey(k) => {
+            let k = whole_blob_k(k)?;
+            let view = decrypt_vault_view_with_key(k, vault)?;
+            Ok((view, zeroize::Zeroizing::new(k.to_vec())))
+        }
+    }
 }
 
 /// Open the CURRENT vault view with the RETAINED state key `K` — no grant, no
@@ -597,6 +759,49 @@ mod tests {
     use sudp::primitives::domain::DS_SEAL;
     use sudp::primitives::{Aead, ChaCha20Poly1305};
     use sudp::state::{ProtectedState, CURRENT_VERSION};
+
+    /// A held change says what it is, who signed it (or that nobody did)
+    /// and why it is not applied.
+    #[test]
+    fn a_held_change_says_where_it_came_from_and_why() {
+        use crate::storage::sealed_vault::{HELD_LOCKED, HELD_NOT_OWNER_SIGNED};
+        assert_eq!(
+            held_line("config change to policy", Some("us_member"), HELD_NOT_OWNER_SIGNED),
+            format!(
+                "config change to policy from the cloud (signed by us_member) not applied: {}",
+                HELD_NOT_OWNER_SIGNED
+            )
+        );
+        let locked = held_line("config change", None, HELD_LOCKED);
+        assert!(
+            locked.starts_with("config change from the cloud (unsigned) not applied: the vault is locked"),
+            "{locked}"
+        );
+        // A signer id is shown bounded.
+        let long = "x".repeat(500);
+        assert!(held_line("config change", Some(&long), "r").len() < 200);
+    }
+
+    /// A held row is said as what it is: a data record's change or a config
+    /// change, named when the session's key reads it, else by what the row
+    /// was read as before.
+    #[test]
+    fn a_held_row_is_said_as_data_or_config() {
+        use crate::storage::item::{ItemNs, ItemPayload};
+        use crate::storage::sealed_vault::RowKind;
+        let secret = ItemPayload::secret_live("API", "v");
+        let policy = ItemPayload::live(ItemNs::Policy, "", serde_json::json!({}));
+        let svc = ItemPayload::live(ItemNs::Service, "a1", serde_json::json!({ "service": "x" }));
+        assert_eq!(held_what(Some(&secret), Some(RowKind::Data)), "change to secret API");
+        assert_eq!(held_what(Some(&svc), None), "change to service a1");
+        assert_eq!(held_what(Some(&policy), None), "config change to policy");
+        // A data record's payload at a row read before as guarded (not at its
+        // own address): config.
+        assert_eq!(held_what(Some(&secret), Some(RowKind::Guarded)), "config change to secret API");
+        assert_eq!(held_what(None, Some(RowKind::Guarded)), "config change");
+        assert_eq!(held_what(None, Some(RowKind::Data)), "change");
+        assert_eq!(held_what(None, None), "change");
+    }
 
     /// The retained-K refresh path: a vault's body is K-sealed with AAD
     /// `DS_SEAL ‖ ver`, independent of any credential, so a held `K` opens it

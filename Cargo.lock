@@ -640,6 +640,7 @@ dependencies = [
  "curve25519-dalek-derive",
  "digest",
  "fiat-crypto",
+ "rand_core 0.6.4",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -2245,6 +2246,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs_merkle"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb09b49230ba22e8c676e7b75dfe2887dea8121f18b530ae0ba519ce442d2b21"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "rtoolbox"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2369,7 +2379,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safeclaw"
-version = "0.10.4"
+version = "1.1.0"
 dependencies = [
  "axum",
  "base64",
@@ -2377,7 +2387,9 @@ dependencies = [
  "data-encoding",
  "dirs",
  "ed25519-dalek",
+ "flate2",
  "futures-util",
+ "hkdf",
  "hmac",
  "hostname",
  "hpke",
@@ -2391,11 +2403,14 @@ dependencies = [
  "regex",
  "reqwest",
  "rpassword",
+ "rs_merkle",
  "rusqlite",
+ "rustix",
  "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",
+ "spake2",
  "subtle",
  "sudp",
  "tempfile",
@@ -2659,6 +2674,18 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spake2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5482afe85a0b6ce956c945401598dbc527593c77ba51d0a87a586938b1b893a"
+dependencies = [
+ "curve25519-dalek",
+ "hkdf",
+ "rand_core 0.6.4",
+ "sha2",
 ]
 
 [[package]]

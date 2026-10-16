@@ -1,42 +1,61 @@
 # Quickstart
 
-Zero to an agent making authenticated API calls with a key it never saw.
-Takes about five minutes.
+This page explains how to install SafeClaw, run agent-driven setup, approve the browser steps, and make the first brokered call.
 
 ## 1. Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/install.sh | sh
+curl -fsSL https://safeclaw.pro/install.sh | sh
 ```
 
-Puts the `sc` binary in `~/.local/bin` after verifying its `SHA256SUMS`. No
-sudo, no system changes. `sc --version` to confirm. Supported platforms and how
-to verify the download: [Platform support](reference/platform-support.md).
+The installer uses no sudo, verifies the download's SHA256, puts `sc` in
+`~/.local/bin`, and installs the skill at `skills/safeclaw/SKILL.md`. When run by
+an agent, it continues straight into `sc setup`; in a terminal it prints one
+next step. It also installs the skill with `sc skill install`. Official sources
+are [safeclaw.pro](https://safeclaw.pro) and
+[github.com/getsafeclaw/safeclaw](https://github.com/getsafeclaw/safeclaw).
+Supported platforms: [Platform support](reference/platform-support.md).
 
-## 2. Create your vault
+## 2. Run setup
 
-Sign in at [safeclaw.pro](https://safeclaw.pro) and register a passkey when
-prompted. The passkey is the root of everything: your vault's contents are
-sealed under it, and it is what you tap to approve sensitive actions later.
-There is no password.
-
-## 3. Pair this machine and your agent
-
-In the console, "Connect a new agent" mints a one-time pair token and an
-install prompt. Paste the prompt to your agent and it does the rest. What it
-runs:
+Run this as the person or as their agent:
 
 ```bash
-sc login                      # pair this machine; brings the daemon up and
-                              # prints a passkey-approval link you open once
-sc agent add my-agent         # mint the agent's env file:
-                              # SAFECLAW_BROKER_URL / SAFECLAW_AGENT_IDENTITY
+sc setup
 ```
 
-The approval is a passkey tap in your browser. After this, `sc status` shows
-the daemon up and the vault unlocked.
+`--name <a short name for the agent>` is optional and defaults to the agent's
+product name, such as `claude-code` or `codex`.
+`sc setup` never prompts. Each run prints what it needs from the person, if
+anything, and the command to run next:
 
-## 4. Add a credential
+```
+To pair this machine, open this link and enter the code:
+  https://app.safeclaw.pro/pair
+  Code: 4821-0937-5563 (expires in about 15 minutes)
+Next: sc setup --name codex --wait
+```
+
+The agent gives the person the link and code, runs `Next:`, and repeats until a
+run prints no `Next:`. After an error it runs the printed `Fix:`. The last
+`Next:` is usually `sc unlock`, which prints an unlock link and an `sc op wait`
+command. Continue to the next section after approval. With `--json`, each run
+prints one object whose `status` is `action_required`, `waiting`, `done` or
+`error`, with the same values as fields.
+
+In the browser, the person signs in or creates an account the first time,
+creates a passkey, and approves the machine. The passkey also creates the
+first vault. They then approve the agent and choose which vaults it may use.
+Under the hood, setup runs `sc login` if the machine is not paired and `sc agent
+add` if the agent is not registered. It writes
+`~/.safeclaw/agents/<name>/agent.env` and installs the skill. It is safe to run
+again.
+
+At a terminal, a person can still use `sc login` to pair a machine or `sc agent
+add <name>` to add an agent by hand, such as a second agent. `sc setup` runs
+whichever of those is still needed and also handles the env file and skill.
+
+## 3. Add a credential
 
 Two doors, same result: a **connection** with hosts and a **phantom**.
 
@@ -53,6 +72,12 @@ sc set HF_TOKEN --host huggingface.co
 Prompts for the value, asks for one passkey approval, and mints the phantom
 `__sc__hf_token__` anchored to `huggingface.co`. Entered this way the value
 never leaves your machine.
+
+## 4. Unlock the vault
+
+After approving the machine and the agent, run `sc unlock`. It prints an unlock
+link for the person and the `sc op wait` command. For several vaults, run
+`sc vault ls`, choose one, then run `sc unlock --vault <name>`.
 
 ## 5. First brokered call
 

@@ -30,8 +30,14 @@ pub fn registry(json: bool) -> Result<(), String> {
         );
     } else {
         println!("{:<24} {:<30} TAGS", "ID", "NAME");
+        use crate::util::terminal_safe;
         for s in &catalog.services {
-            println!("{:<24} {:<30} {}", s.id, s.name, s.tags.join(","));
+            println!(
+                "{:<24} {:<30} {}",
+                terminal_safe(&s.id),
+                terminal_safe(&s.name),
+                terminal_safe(&s.tags.join(","))
+            );
         }
     }
     Ok(())

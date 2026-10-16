@@ -1,9 +1,8 @@
 //! `safeclaw passkey ...` — manage the active vault's enrolled passkeys.
 //!
-//! Only `ls` ships today; `add` / `rm` / `rename` need the same
-//! WebAuthn + crypto plumbing as `sc vault create` and `sc write`,
-//! they'll land alongside those. The placeholder stubs print a clear
-//! "deferred" message so the surface is discoverable from `--help`.
+//! `ls` lists; `add` prints the console page (passkeys are enrolled in the
+//! browser, where the identity key lives). `rm` / `rename` are not built yet
+//! and say so.
 
 use std::time::Duration;
 
@@ -15,10 +14,12 @@ use crate::config::{PasskeyRemoveArgs, PasskeyRenameArgs, PasskeySubcommand};
 pub async fn run(sub: PasskeySubcommand, json: bool) -> Result<(), String> {
     match sub {
         PasskeySubcommand::Ls(_a) => run_ls(json).await,
-        PasskeySubcommand::Add(_) => Err(
-            "passkey add, not yet implemented (needs the /v/new-style crypto ceremony)"
-                .into(),
-        ),
+        PasskeySubcommand::Add(_) => {
+            let url = crate::cli::vault::console_page("/account/passkeys")?;
+            eprintln!("Add a passkey in the SafeClaw console:");
+            eprintln!("  {}", url);
+            Ok(())
+        }
         PasskeySubcommand::Rm(a) => Err(format!(
             "passkey rm {}, not yet implemented (needs passkey-signed Custom op)",
             a.credential_id

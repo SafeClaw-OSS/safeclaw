@@ -61,7 +61,7 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
     if let BrokerIntent::Host(hosts) = &intent {
         if !valid_conn_id(&conn) {
             return Err(format!(
-                "can't derive a connection id from '{}' — use `sc connect <name> --host {} --secret {}=<value>` instead",
+                "can't derive a connection id from '{}'; use `sc connection add <name> --host {} --from-literal {}=<value>` instead",
                 key,
                 hosts.first().map(String::as_str).unwrap_or("<domain>"),
                 key
@@ -118,6 +118,7 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     let body = approve_op(
         &custodian,
@@ -281,6 +282,7 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     let body = approve_op(
         &custodian,
@@ -334,6 +336,7 @@ pub async fn run_get(args: GetArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     let body = approve_op(&custodian, &vault, &op, &format!("Reveal {}", key), &opts).await?;
     let value = body

@@ -12,6 +12,7 @@
 //! GET  /op/{op_id}              poll op status + cached value
 //! POST /op/{op_id}/approve      U submits grant G → T validates, dispatches act
 //! POST /op/{op_id}/reject       U denies
+//! POST /op/{op_id}/cancel       requester withdraws its own op
 //! GET  /health                  custodian health
 //! GET  /pubkey                  custodian HPKE bootstrap key (placeholder)
 //! GET  /skill.md                skill file for agents (?agent=claude|cursor|codex)
@@ -67,16 +68,19 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/v/{vid}/secret", post(handlers::secret_set_local::create))
         .route("/v/{vid}/sync", post(handlers::metadata::sync_now))
         .route("/v/{vid}/passkeys", get(handlers::metadata::passkeys))
-        .route(
-            "/v/{vid}/pending-passkeys",
-            post(handlers::pending_passkey::create),
-        )
+        .route("/v/{vid}/keyset", get(handlers::metadata::keyset))
+        // What this device has not applied (held pulled changes, a failed
+        // pull at unlock, set-aside changes): `sc status`, `sc service ls`.
+        .route("/v/{vid}/held", get(handlers::metadata::held))
         .route("/v/{vid}/events", get(handlers::events::stream))
         .route(
             "/v/{vid}/secret-keys",
             get(handlers::secret_keys::secret_keys),
         )
         .route("/v/{vid}/registry", get(handlers::registry::vault_registry))
+        // The vault's own service definitions with their sources and status
+        // (`sc service ls`): unlocked session only, no passkey, no network.
+        .route("/v/{vid}/services", get(handlers::service_ops::list))
         .route("/v/{vid}/usage", get(handlers::usage::usage))
         // Device egress-proxy hot-reload (after `sc proxy set/clear`) — no vault
         // context, no params: re-reads the local stored value into the live
@@ -99,6 +103,10 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/op/{op_id}", get(handlers::approve::get_op))
         .route("/op/{op_id}/approve", post(handlers::approve::approve_op))
         .route("/op/{op_id}/reject", post(handlers::approve::reject_op))
+        // Requester withdrawal (design/approvals-inbox.md D1-E): the CLI that
+        // created an op voids it on Ctrl-C / SIGTERM / timeout. Never a user
+        // rejection; an Export needs its waiter secret.
+        .route("/op/{op_id}/cancel", post(handlers::op::cancel))
         .with_state(state.clone());
     router = router.layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
 
@@ -121,9 +129,8 @@ pub fn app_router(state: Arc<AppState>) -> Router {
     router
 }
 
-/// The agent-key-gated broker sub-router. Split out so the gate is a layer on
-/// these broker routes only — the control routes in `app_router` keep their own
-/// (passkey / X-Admin-Key / auth-free-localhost) gating untouched.
+/// The agent-facing stub sub-router: `/export` answers that raw export is
+/// disabled (no secret ever leaves here, so it needs no agent credential).
 fn broker_router(state: Arc<AppState>) -> Router {
     use crate::proxy::env;
 
@@ -131,11 +138,6 @@ fn broker_router(state: Arc<AppState>) -> Router {
         // /export → disabled stub (raw-secret export off the agent surface; the
         // op-plane Export ceremony is the human path).
         .route("/v/{vid}/export/{key}", post(env::disabled))
-        // Agent-key gate — scoped to exactly this route.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::api_key::require_api_key,
-        ))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }

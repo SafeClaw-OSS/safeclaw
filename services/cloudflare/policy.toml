@@ -1,5 +1,5 @@
-# Cloudflare DNS policy. The token never enters the agent and egress is
-# host-anchored. Reads and creating records ride the floor. The gate is spent on
+# Cloudflare policy (whole v4 API; token never enters the agent, egress is
+# host-anchored). Reads and creating records ride the floor. The gate is spent on
 # the changes that can silently hijack traffic: deleting a record can take a
 # service offline, and overwriting an existing A/MX/CNAME can re-point web or
 # mail traffic to an attacker. Each rule is a per-connection console toggle.

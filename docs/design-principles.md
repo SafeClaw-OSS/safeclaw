@@ -1,7 +1,6 @@
 # Design principles
 
-The rules the system is built on. Each one is checkable against behavior you
-can observe; none is aspirational.
+This page lists the rules that guide SafeClaw's design and can be checked against observable behavior.
 
 **1. Use is not possession.** The agent gets the *use* of a credential,
 never the credential. Phantoms in, API responses out; the value appears only

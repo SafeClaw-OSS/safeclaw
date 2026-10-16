@@ -1,0 +1,22 @@
+setup = """
+Cloudflare's v4 API takes a bearer API token, and account-scoped endpoints
+(/accounts/<id>/...) also need your Account ID - the token page shows both, so
+paste both here. The proxy substitutes each at egress; neither enters the agent:
+  sc run -- curl \\
+    "https://api.cloudflare.com/client/v4/accounts/__sc__cloudflare__cloudflare_account_id__/tokens/verify" \\
+    -H "Authorization: Bearer __sc__cloudflare__cloudflare_api_token__"
+Covers the whole v4 API (DNS, Workers, R2, ...) - scope the token to what you
+need when you mint it. Zone IDs vary per request (/zones/<id>/...), so the agent
+puts those straight in the URL.
+"""
+
+[service]
+id = "cloudflare"
+name = "Cloudflare"
+# Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
+tags = ["dev"]
+
+hosts = ["api.cloudflare.com"]
+secrets = ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]
+# Where a human mints the secret (auxiliary; display-only helper link).
+secret_url = "https://dash.cloudflare.com/profile/api-tokens"

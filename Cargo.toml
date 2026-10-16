@@ -1,6 +1,6 @@
 [package]
 name = "safeclaw"
-version = "0.10.4"
+version = "1.1.0"
 edition = "2021"
 description = "SafeClaw daemon — multi-vault passkey-gated credential vault for AI agents"
 # Functional Source License 1.1 (Apache-2.0 future). FSL is not an SPDX id,
@@ -8,7 +8,7 @@ description = "SafeClaw daemon — multi-vault passkey-gated credential vault fo
 # (offering a substitute commercial product/service); converts to Apache-2.0
 # two years after each release. See LICENSE.
 license-file = "LICENSE"
-repository = "https://github.com/SafeClaw-OSS/safeclaw"
+repository = "https://github.com/getsafeclaw/safeclaw"
 
 # Two bin targets share the same main.rs:
 #   `safeclaw` — canonical name (discoverable via brew/cargo install)
@@ -36,6 +36,8 @@ hostname = "0.4"
 # Authenticator). We keep p256 direct only for places sudp doesn't yet cover.
 sudp = { version = "0.3.0", features = ["std-primitives", "webauthn", "json-canonical"] }
 hmac = "0.12"
+hkdf = "0.12"
+spake2 = "=0.4.0"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "jwk"] }
 sha2 = "0.10"
 rand = "0.8"
@@ -86,6 +88,9 @@ tower-service = "0.3"
 # vendored libcurl) fail to verify passthrough (non-brokered) public hosts.
 rustls-native-certs = "0.8"
 toml = "0.8"
+# gzip for `sc service add github:…`: a source tarball is read in memory
+# (never extracted to disk). Already in the tree via hudsucker's decoder.
+flate2 = "1"
 dirs = "5"
 url = "2"
 urlencoding = "2"
@@ -107,6 +112,14 @@ jsonwebtoken = "9"
 # Per-tenant audit log (SQLite); bundled so deployments don't need libsqlite3
 # on the host. See src/audit.rs + PROTOCOL.md §5.3 layout.
 rusqlite = { version = "0.31", features = ["bundled"] }
+rs_merkle = "1.5.0"
+
+# `sc service add ./path`: a local source is read with an openat walk that
+# never follows a symbolic link (O_NOFOLLOW on every component), and its files
+# are opened non-blocking and checked with fstat before reading. Already in the
+# tree (via tempfile).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

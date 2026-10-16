@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{ConnectInfo, Path, State},
+    http::HeaderMap,
     Json,
 };
 use serde_json::{json, Value};
@@ -26,10 +27,54 @@ pub async fn create(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(vault_id): Path<String>,
+    headers: HeaderMap,
     Json(op): Json<Operation>,
 ) -> Result<Json<Value>> {
+    let mut op = op;
+    // Requester attribution: verified from the agent's proof over this exact
+    // op, else none (see `attribute_agent`).
+    let agent = attribute_agent(&headers, &vault_id, &mut op, crate::util::now_unix());
+    // An agent the account ledger does not admit is refused before any
+    // vault-level check (and before the op reaches the relay).
+    if let Some(ag) = agent.as_deref() {
+        if crate::principal_ledger::agent_not_admitted(&state, ag).await {
+            return Err(AppError::AgentNotAdmitted);
+        }
+    }
+    create_op::<crate::service::source::github::GitHubHttp>(
+        &state,
+        vault_id,
+        op,
+        agent,
+        addr.ip(),
+        None,
+    )
+    .await
+    .map(Json)
+}
+
+/// Create a pending op as `POST /v/{vid}/op` does, for `agent` (the verified
+/// requesting agent, if any) from `ip`: the one path every op of this
+/// process takes (the CLI's through the handler, a console install request
+/// through [`crate::server::handlers::service_ops::requests`]). `api` reads
+/// GitHub for a `service-add` (`None`: GitHub itself).
+pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
+    state: &Arc<AppState>,
+    vault_id: String,
+    op: Operation,
+    agent: Option<String>,
+    ip: IpAddr,
+    api: Option<&A>,
+) -> Result<Value> {
+    let state = state.clone();
+    // §15: a device that is not admitted, past its lease, or revoked unlocks
+    // nothing and raises no op.
+    if let Some(e) = state.ledger_refusal() {
+        return Err(e);
+    }
     validate_vault_id(&vault_id)?;
     reject_broker_kind(&op.act.kind)?;
+    check_scope_shape(&op.act.scope)?;
     // F-11: validate op.act.target length. A 256-char cap prevents
     // unbounded strings from reaching audit rows and downstream handlers.
     // Character set is not enforced globally (target syntax is act-kind
@@ -40,13 +85,25 @@ pub async fn create(
         ));
     }
     // Locked-state gate (H3 / PROTOCOL.md §6.3): when the vault is Locked,
-    // only the unlock ceremony (and first-time Enroll, which auto-unlocks)
-    // is admissible. Everything else gets a canned 409 so the caller knows
+    // only the unlock ceremony is admissible. Everything else gets a canned 409 so the caller knows
     // to drive a `Custom("vault-unlock")` op first.
-    let is_lifecycle_bypass = matches!(&op.act.kind, ActType::Enroll)
-        || matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock");
+    let is_lifecycle_bypass =
+        matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock");
     if !is_lifecycle_bypass && state.is_vault_locked(&vault_id) {
         return Err(AppError::VaultLocked);
+    }
+    // Concurrent unlock requests for one vault on this device are one intent:
+    // while one is pending, a second `sc up` (another terminal, a retry after
+    // `sc upgrade`) gets the SAME op back — same op_id, same challenge, so
+    // the /grant link the user was already given stays valid and the one
+    // approval satisfies every waiter — instead of minting a successor that
+    // supersedes that link out from under them. This daemon's in-memory store
+    // only: device A's pending unlock never answers device B, and the
+    // ceremony key is per vault.
+    if matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock") {
+        if let Some(pending) = pending_unlock_response(&state, &vault_id) {
+            return Ok(pending);
+        }
     }
     // ONE approval window (SSOT, user decision 2026-07-14): ops that arrive
     // without an explicit Valid window — the CLI ceremonies (unlock / set /
@@ -55,6 +112,40 @@ pub async fn create(
     // and the op's own expiry can never disagree. A locked vault (the unlock
     // ceremony) can't read its policy and takes the 30-min default.
     let mut op = op;
+    // connection-add: the approval card (bound keys per slot, written vs
+    // referenced, destinations, sharing) is computed HERE from the unlocked
+    // session state and stamped into the signed scope, overwriting anything
+    // the requester sent in those fields; apply re-derives and compares
+    // (`connection_add::assert_card`).
+    if matches!(&op.act.kind, ActType::Custom(name) if name == "connection-add") {
+        crate::server::handlers::connection_add::stamp_at_mint(&state, &vault_id, &mut op)
+            .map_err(AppError::BadRequest)?;
+    }
+    // service-add / service-rm: the same discipline for service sources (the
+    // services, every destination host, the rules, the source as checked; see
+    // `service_ops`), on every vault: each service is a data record.
+    if matches!(&op.act.kind, ActType::Custom(name) if name == "service-add") {
+        let minted = match api {
+            Some(api) => {
+                crate::server::handlers::service_ops::mint_add(&state, &vault_id, &mut op, api)
+                    .await
+            }
+            None => {
+                let api = crate::server::handlers::service_ops::source_check_api()
+                    .map_err(AppError::Internal)?;
+                crate::server::handlers::service_ops::mint_add(&state, &vault_id, &mut op, &api)
+                    .await
+            }
+        };
+        minted.map_err(AppError::BadRequest)?;
+    }
+    if matches!(&op.act.kind, ActType::Custom(name) if name == "service-rm") {
+        crate::server::handlers::service_ops::stamp_rm_at_mint(&state, &vault_id, &mut op)
+            .map_err(AppError::BadRequest)?;
+    }
+    // Every act's descriptor tone goes into the signed scope (the batch gate:
+    // danger = confirmed alone), over anything the requester sent there.
+    crate::protocol::consent::stamp_tone(&mut op);
     if op.valid.exp.is_none() {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -62,14 +153,30 @@ pub async fn create(
             .unwrap_or(0);
         op.valid.exp = Some(now_unix + state.policy_approval_hold(&vault_id));
     }
-    let ip: IpAddr = addr.ip();
     let r = {
         let mut store = state.challenges.lock().unwrap();
         store.issue(ip).ok_or(AppError::TooManyRequests)?
     };
+    // E1 (design/approvals-inbox.md D2): an Export's plaintext is bound to the
+    // process that created it. A random per-op waiter secret goes back ONLY in
+    // this response (never in SSE, never to the relay, never logged); the
+    // record keeps its SHA-256, and `GET /op/{id}` releases the value only to
+    // a poll presenting it.
+    let waiter_secret: Option<String> = if op.act.kind == ActType::Export {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use rand::RngCore as _;
+        let mut b = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        Some(URL_SAFE_NO_PAD.encode(b))
+    } else {
+        None
+    };
     let (op_id, expires_at) = {
         let mut store = state.approvals.lock().unwrap();
-        let id = store.create(vault_id.clone(), op.clone(), r.clone());
+        let id = store.create_bound(vault_id.clone(), op.clone(), r.clone(), None, agent.clone());
+        if let Some(secret) = &waiter_secret {
+            store.set_waiter(&id, secret);
+        }
         let exp = store.get(&id).map(|r| r.expires_at_unix).unwrap_or(0);
         (id, exp)
     };
@@ -94,7 +201,8 @@ pub async fn create(
             }
             _ => {}
         }
-        let row = audit::row_from_op(&op_id, &op, now, expires_at as i64);
+        let mut row = audit::row_from_op(&op_id, &op, now, expires_at as i64);
+        row.agent_prefix = agent.clone();
         if let Err(e) = store.insert(&row) {
             tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending failed: {}", e);
         }
@@ -110,14 +218,17 @@ pub async fn create(
         serde_json::to_value(&op).unwrap_or(Value::Null),
         r.clone(),
         expires_at,
-        None, // user-initiated lifecycle ceremony — no triggering agent
+        agent.clone(), // the verified requesting agent, if any
+        vec![],        // only `use` ops join intent chains
     );
 
     // Requester-side supersede: a lifecycle ceremony (unlock/lock) is a
     // singleton — at most one should be live per vault. When a new one is
-    // created (e.g. the user Ctrl-C'd `sc unlock` and retried), withdraw the
-    // stale prior op so the console stops showing "1 approval waiting". Only
-    // ceremonies supersede; Use/Export ops can legitimately be concurrent.
+    // created, withdraw the stale prior op so the console stops showing
+    // "1 approval waiting". A pending unlock is normally REUSED above, so
+    // this fires for lock, and for unlock only when the prior op went
+    // terminal or two creates raced past the reuse check. Only ceremonies
+    // supersede; Use/Export ops can legitimately be concurrent.
     if let ActType::Custom(name) = &op.act.kind {
         if name == "vault-unlock" || name == "vault-lock" {
             let prev = {
@@ -141,11 +252,83 @@ pub async fn create(
         reason: None,
     });
 
-    Ok(Json(json!({
+    // `op` = the op exactly as stored (and as relayed for approval), which may
+    // differ from the request body (a defaulted `valid.exp`, a stamped
+    // connection-add card). A local signer must sign THIS.
+    let mut resp = json!({
         "op_id": op_id,
         "r": r,
         "expires_at": expires_at,
-    })))
+        "op": serde_json::to_value(&op).unwrap_or(Value::Null),
+    });
+    if let Some(secret) = waiter_secret {
+        resp["waiter_secret"] = json!(secret);
+    }
+    Ok(resp)
+}
+
+/// The create-time response of `vault_id`'s still-pending unlock op on this
+/// device, when one is live: what `POST /v/{vid}/op` answered when that op
+/// was created (its op_id, its challenge, the stored op a local signer must
+/// sign), so a later `sc up` waits on the same approval. `None` when there is
+/// none, or it is terminal or expired: the caller mints fresh.
+fn pending_unlock_response(state: &AppState, vault_id: &str) -> Option<Value> {
+    let id = state
+        .live_ceremony_ops
+        .lock()
+        .unwrap()
+        .get(&(vault_id.to_string(), "vault-unlock".to_string()))
+        .cloned()?;
+    let store = state.approvals.lock().unwrap();
+    let rec = store.get(&id)?;
+    if !matches!(rec.status, crate::approval::store::ApprovalStatus::Pending) {
+        return None;
+    }
+    Some(json!({
+        "op_id": rec.id,
+        "r": rec.r,
+        "expires_at": rec.expires_at_unix,
+        "op": serde_json::to_value(&rec.op).ok()?,
+    }))
+}
+
+/// Requester attribution for an op created on this LOCAL API (the CLI
+/// ceremonies). A requester-supplied `scope.agent` is always dropped; the
+/// agent is stamped only from a valid proof of possession over exactly this
+/// op as received (header [`crate::agent_pop::OP_POP_HEADER`], verified by
+/// [`crate::agent_pop::verify_op_pop`]): the same `scope.agent` `ag_…` id a
+/// proxy-originated Use op carries, so the approval names the agent. A
+/// missing, malformed, stale, or mismatched proof yields no attribution.
+///
+/// This is display and consent information, not a security boundary: any
+/// local process can omit the proof (the op then reads as from a terminal),
+/// and nothing is authorized by it. It is therefore not checked against the
+/// vault's agents table (a locked vault, the unlock ceremony, cannot read
+/// it): the claim is only "the holder of this agent key asked", which the
+/// proof establishes either way.
+fn attribute_agent(
+    headers: &HeaderMap,
+    vault_id: &str,
+    op: &mut Operation,
+    now: u64,
+) -> Option<String> {
+    // Verify BEFORE any mutation: the proof covers the op as sent.
+    let verified = headers
+        .get(crate::agent_pop::OP_POP_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|t| crate::agent_pop::verify_op_pop(t, vault_id, op, now));
+    if let Some(o) = op.act.scope.as_object_mut() {
+        o.remove("agent");
+    }
+    let ag = verified?;
+    if op.act.scope.is_null() {
+        op.act.scope = json!({});
+    }
+    op.act
+        .scope
+        .as_object_mut()?
+        .insert("agent".into(), Value::String(ag.clone()));
+    Some(ag)
 }
 
 /// Withdraw a ceremony op that a newer one just superseded. Local: flip the
@@ -180,7 +363,145 @@ fn cancel_superseded(state: &Arc<AppState>, vault_id: &str, op_id: &str, now: i6
             reason: Some(REASON.into()),
         });
     }
-    crate::relay::client::spawn_cancel(state.clone(), vault_id.to_string(), op_id.to_string());
+    crate::relay::client::spawn_cancel(
+        state.clone(),
+        vault_id.to_string(),
+        op_id.to_string(),
+        None, // legacy reason-less withdraw (contract §2)
+    );
+}
+
+/// Local record reason for a requester withdrawal (contract §1).
+pub const WITHDRAWN_REASON: &str = "withdrawn by requester";
+/// Local record reason for the E1 liveness backstop.
+pub const ABANDONED_REASON: &str = "abandoned by requester";
+
+/// Liveness backstop window: a pending Export whose waiter has not polled
+/// (with its secret) for this long is withdrawn as abandoned (design
+/// D1-E). The CLI polls every ≤ 5 s, well inside it.
+pub const WAITER_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Withdraw a pending op on its requester's behalf: terminal
+/// `Rejected{reason}` locally, audit `cancelled`, SSE `cancelled`, relay row
+/// cancelled with `relay_reason`. NEVER `reject_op` — that reads as a user
+/// denial (and resolves an intent chain); a withdrawal is neither. Returns
+/// whether the op was still pending.
+fn withdraw(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    op_id: &str,
+    reason: &str,
+    relay_reason: crate::relay::client::CancelReason,
+) -> bool {
+    let was_pending = {
+        let mut store = state.approvals.lock().unwrap();
+        store.reject(op_id, reason).is_some()
+    };
+    if !was_pending {
+        return false;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Ok(store) = state.audits.for_vault(vault_id) {
+        if let Err(e) = store.finalize(
+            op_id,
+            audit::STATUS_CANCELLED,
+            now,
+            None,
+            Some(reason),
+            None,
+        ) {
+            tracing::warn!(vault = %vault_id, op = %op_id, "audit finalize cancelled failed: {}", e);
+        }
+    }
+    state.emit_event(ApprovalEvent {
+        vault_id: vault_id.to_string(),
+        approval_id: op_id.to_string(),
+        kind: "cancelled".into(),
+        op_summary: None,
+        response_preview: None,
+        reason: Some(reason.into()),
+    });
+    crate::relay::client::spawn_cancel(
+        state.clone(),
+        vault_id.to_string(),
+        op_id.to_string(),
+        Some(relay_reason),
+    );
+    true
+}
+
+/// `POST /op/{op_id}/cancel` — requester withdrawal (design D1-E, contract
+/// §1). Body `{ "waiter_secret"?: string }`; an op that has a waiter secret
+/// (every Export) can be withdrawn only by presenting it (constant-time).
+/// `sc get` and every `remote_approve` waiter call this on Ctrl-C, SIGTERM
+/// and timeout, so dead retries leave the inbox without any intent matching.
+pub async fn cancel(
+    State(state): State<Arc<AppState>>,
+    Path(op_id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>> {
+    let secret = body
+        .as_ref()
+        .and_then(|b| b.get("waiter_secret"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let vault_id = {
+        let store = state.approvals.lock().unwrap();
+        let rec = store.get(&op_id).ok_or(AppError::NotFound)?;
+        if rec.waiter_hash.is_some() && !rec.waiter_matches(secret.as_deref()) {
+            return Err(AppError::Forbidden(
+                "this request can be withdrawn only by the process that created it".into(),
+            ));
+        }
+        if !matches!(rec.status, crate::approval::ApprovalStatus::Pending) {
+            return Err(AppError::Conflict("op not pending".into()));
+        }
+        rec.vault_id.clone()
+    };
+    if !withdraw(
+        &state,
+        &vault_id,
+        &op_id,
+        WITHDRAWN_REASON,
+        crate::relay::client::CancelReason::Withdrawn,
+    ) {
+        return Err(AppError::Conflict("op not pending".into()));
+    }
+    Ok(Json(
+        json!({ "ok": true, "op_id": op_id, "status": "rejected", "reason": WITHDRAWN_REASON }),
+    ))
+}
+
+/// One reaper pass: withdraw every pending Export whose waiter has been
+/// silent for `idle` (kill -9'd `sc get`). Returns the withdrawn ids.
+pub fn reap_abandoned_exports(state: &Arc<AppState>, idle: std::time::Duration) -> Vec<String> {
+    let stale = state.approvals.lock().unwrap().abandoned_exports(idle);
+    let mut out = Vec::new();
+    for (op_id, vault_id) in stale {
+        if withdraw(
+            state,
+            &vault_id,
+            &op_id,
+            ABANDONED_REASON,
+            crate::relay::client::CancelReason::Abandoned,
+        ) {
+            tracing::info!(op = %op_id, "export waiter went silent; request withdrawn (abandoned)");
+            out.push(op_id);
+        }
+    }
+    out
+}
+
+/// Background liveness backstop for E1 (spawned once at daemon start).
+pub async fn reap_abandoned_exports_loop(state: Arc<AppState>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    loop {
+        tick.tick().await;
+        reap_abandoned_exports(&state, WAITER_IDLE);
+    }
 }
 
 /// Reject op kinds that are broker-plane primitives. Today: `Use`.
@@ -194,10 +515,36 @@ fn cancel_superseded(state: &Arc<AppState>, vault_id: &str, op_id: &str, now: i6
 /// Control-plane ops (Enroll, Write, Export, Custom("vault-unlock"/...))
 /// pass through; they're user-initiated state changes authorized by a
 /// passkey-signed grant.
+/// An op's scope is a JSON object, or null (no scope). Anything else is
+/// refused before any handler reads or stamps fields into it.
+fn check_scope_shape(scope: &Value) -> Result<()> {
+    if scope.is_object() || scope.is_null() {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "op.act.scope must be a JSON object".into(),
+        ))
+    }
+}
+
 fn reject_broker_kind(kind: &ActType) -> Result<()> {
     if matches!(kind, ActType::Use) {
         return Err(AppError::BadRequest(
             "Use ops must be created via the broker path, not the control-plane op endpoint".into(),
+        ));
+    }
+    // A whole-blob Write is retired: refuse it up front so nobody is asked to
+    // approve an op that can't apply (approve refuses it too).
+    if matches!(kind, ActType::Write) {
+        return Err(AppError::BadRequest(
+            crate::server::handlers::approve::WHOLE_BLOB_WRITE_RETIRED.into(),
+        ));
+    }
+    // Daemon-side Enroll (vault create, add passkey) is retired: both happen in
+    // the console, where the identity key lives (approve refuses it too).
+    if matches!(kind, ActType::Enroll) {
+        return Err(AppError::BadRequest(
+            crate::server::handlers::approve::ENROLL_RETIRED.into(),
         ));
     }
     Ok(())
@@ -228,11 +575,78 @@ mod tests {
         assert!(matches!(r, Err(AppError::BadRequest(_))));
     }
 
+    /// A scope that is neither an object nor null is a 400 at op create,
+    /// for every act kind.
+    #[test]
+    fn scope_must_be_an_object_or_null() {
+        assert!(check_scope_shape(&json!({ "service": "github" })).is_ok());
+        assert!(check_scope_shape(&Value::Null).is_ok());
+        for bad in [json!([1, 2]), json!("x"), json!(7), json!(true)] {
+            assert!(
+                matches!(check_scope_shape(&bad), Err(AppError::BadRequest(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Concurrent unlock requests for one vault on this device coalesce:
+    /// while one is pending, a second create gets the SAME op back (op_id,
+    /// challenge, stored op), so the /grant link already handed out stays
+    /// valid and the one approval satisfies every waiter polling that id.
+    /// Nothing crosses vaults, and a terminal op is never reused.
+    #[test]
+    fn a_second_unlock_request_reuses_the_pending_op() {
+        let state = test_state();
+        let unlock = |vault: &str| -> Operation {
+            serde_json::from_value(json!({
+                "act": { "type": { "custom": "vault-unlock" }, "target": vault, "scope": {} },
+                "bind": { "redeemer": vault },
+                "valid": { "iat": 0, "multiplicity": 1 }
+            }))
+            .unwrap()
+        };
+        // The first create's bookkeeping: the stored op and the per-vault
+        // ceremony singleton, exactly what `create_op` records.
+        let first_id = {
+            let mut s = state.approvals.lock().unwrap();
+            s.create("v1".into(), unlock("v1"), "r-one".into())
+        };
+        state
+            .live_ceremony_ops
+            .lock()
+            .unwrap()
+            .insert(("v1".into(), "vault-unlock".into()), first_id.clone());
+        let resp = pending_unlock_response(&state, "v1").expect("the pending op is reused");
+        assert_eq!(resp["op_id"], json!(first_id), "same /grant link");
+        assert_eq!(resp["r"], json!("r-one"), "same challenge");
+        assert_eq!(resp["op"]["bind"]["redeemer"], json!("v1"));
+        // Another vault has nothing to reuse: no cross-vault coalescing.
+        assert!(pending_unlock_response(&state, "v2").is_none());
+        // One approval flips the one record every waiter polls; a LATER
+        // request then mints fresh (a terminal op is never reused).
+        state.approvals.lock().unwrap().approve(&first_id, None);
+        assert!(matches!(
+            state.approvals.lock().unwrap().get_any(&first_id).unwrap().status,
+            crate::approval::store::ApprovalStatus::Approved
+        ));
+        assert!(pending_unlock_response(&state, "v1").is_none());
+    }
+
+    #[test]
+    fn reject_retired_whole_blob_write() {
+        match reject_broker_kind(&ActType::Write) {
+            Err(AppError::BadRequest(msg)) => assert!(msg.contains("Upgrade"), "{msg}"),
+            other => panic!("whole-blob Write must be refused, got {:?}", other.is_ok()),
+        }
+    }
+
     #[test]
     fn accept_control_plane_kinds() {
+        assert!(
+            reject_broker_kind(&ActType::Enroll).is_err(),
+            "daemon-side enroll is retired"
+        );
         for kind in [
-            ActType::Enroll,
-            ActType::Write,
             ActType::Export,
             ActType::Custom("vault-unlock".into()),
             ActType::Custom("vault-lock".into()),
@@ -256,12 +670,19 @@ mod tests {
             proxy_port: 0,
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
-            rp_id: "localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
             admin_key: None,
             relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
-        AppState::new(cfg)
+        {
+            let s = AppState::new(cfg);
+            s.open_ledger_for_tests(&[]);
+            s
+        }
     }
 
     /// RED LINE (verified invariant — see the export/allow discussion): an
@@ -308,6 +729,7 @@ mod tests {
             State(state.clone()),
             ConnectInfo(addr),
             Path("v1".into()),
+            HeaderMap::new(),
             Json(op),
         )
         .await
@@ -323,6 +745,14 @@ mod tests {
             body.get("r").is_some(),
             "pending Export must carry a challenge `r`, got {body}"
         );
+        // E1: the creator (and only the creator) gets a waiter secret.
+        assert!(
+            body.get("waiter_secret")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                == Some(43),
+            "Export create must return a 32-byte base64url waiter_secret, got {body}"
+        );
         // Nothing executed inline: no raw secret / reveal payload leaked.
         for leak in ["value", "secret", "plaintext", "revealed"] {
             assert!(
@@ -330,5 +760,342 @@ mod tests {
                 "Export create must NOT reveal '{leak}' inline (allow default leaked into Export!): {body}"
             );
         }
+    }
+
+    fn export_op() -> Operation {
+        use crate::protocol::operation::{Act, Bind, Valid};
+        Operation {
+            act: Act {
+                kind: ActType::Export,
+                target: "GITHUB_TOKEN".into(),
+                scope: Value::Null,
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, Some(u64::MAX / 2)),
+        }
+    }
+
+    async fn create_unlocked(state: &Arc<AppState>, op: Operation) -> Value {
+        if state.is_vault_locked("v1") {
+            state.unlock_vault(
+                "v1".into(),
+                crate::state::SecretsCache::default(),
+                zeroize::Zeroizing::new(Vec::new()),
+            );
+        }
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        create(
+            State(state.clone()),
+            ConnectInfo(addr),
+            Path("v1".into()),
+            HeaderMap::new(),
+            Json(op),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    async fn create_with(state: &Arc<AppState>, op: Operation, headers: HeaderMap) -> Value {
+        if state.is_vault_locked("v1") {
+            state.unlock_vault(
+                "v1".into(),
+                crate::state::SecretsCache::default(),
+                zeroize::Zeroizing::new(Vec::new()),
+            );
+        }
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        create(
+            State(state.clone()),
+            ConnectInfo(addr),
+            Path("v1".into()),
+            headers,
+            Json(op),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    fn agent_signer() -> crate::agent_pop::AgentProxyPopSigner {
+        let id = crate::identity::SigningIdentity::from_seed(&[7u8; 32]);
+        let ag = crate::identity::derive_id(crate::identity::IdKind::Agent, &id.public_bytes());
+        crate::agent_pop::AgentProxyPopSigner::new(id, ag)
+    }
+
+    fn pop_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(crate::agent_pop::OP_POP_HEADER, token.parse().unwrap());
+        h
+    }
+
+    fn rm_op(scope: Value) -> Operation {
+        serde_json::from_value(json!({
+            "act": { "type": { "custom": "secret-rm" }, "target": "GITHUB_TOKEN", "scope": scope },
+            "bind": { "redeemer": "v1" },
+            "valid": { "iat": 0, "multiplicity": 1 }
+        }))
+        .unwrap()
+    }
+
+    /// The stored op's `scope.agent`, the record's agent, and the audit row's.
+    fn attribution(state: &AppState, body: &Value) -> (Option<String>, Option<String>) {
+        let id = body["op_id"].as_str().unwrap();
+        let rec = state.approvals.lock().unwrap().get(id).unwrap().clone();
+        let scope_agent = rec
+            .op
+            .act
+            .scope
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        assert_eq!(
+            body["op"]["act"]["scope"]
+                .get("agent")
+                .and_then(|v| v.as_str()),
+            scope_agent.as_deref(),
+            "the response op (what a local signer signs) matches the stored op"
+        );
+        (scope_agent, rec.agent_prefix)
+    }
+
+    /// A CLI ceremony run by an agent carries a proof over the exact op; the
+    /// daemon stamps the agent into the signed scope (as a proxy Use op
+    /// carries it) and onto the record.
+    #[tokio::test]
+    async fn valid_op_pop_stamps_the_agent() {
+        let state = Arc::new(test_state());
+        let s = agent_signer();
+        state.open_ledger_for_tests(&[s.agent_id()]);
+        let op = rm_op(Value::Null);
+        let tok = s.op_token("v1", &op, crate::util::now_unix()).unwrap();
+        let body = create_with(&state, op, pop_headers(&tok)).await;
+        let (scope_agent, rec_agent) = attribution(&state, &body);
+        assert_eq!(scope_agent.as_deref(), Some(s.agent_id()));
+        assert_eq!(rec_agent.as_deref(), Some(s.agent_id()));
+    }
+
+    /// A ceremony from an agent the account ledger does not admit is refused
+    /// with `agent_not_admitted` before any op exists; the same request from
+    /// an admitted agent goes through. The on-miss re-pull is pre-debounced so
+    /// the test makes no network call.
+    #[tokio::test]
+    async fn an_agent_the_ledger_does_not_admit_is_refused_before_the_op() {
+        let state = Arc::new(test_state());
+        *state.ledger_sync.lock().await = Some(std::time::Instant::now());
+        let s = agent_signer();
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        state.open_ledger_for_tests(&["ag_someone_else"]);
+        let op = rm_op(Value::Null);
+        let tok = s.op_token("v1", &op, crate::util::now_unix()).unwrap();
+        let err = create(
+            State(state.clone()),
+            ConnectInfo(addr),
+            Path("v1".into()),
+            pop_headers(&tok),
+            Json(op),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code().0.as_str(), "agent_not_admitted");
+
+        state.open_ledger_for_tests(&[s.agent_id()]);
+        let op = rm_op(Value::Null);
+        let tok = s.op_token("v1", &op, crate::util::now_unix()).unwrap();
+        let body = create_with(&state, op, pop_headers(&tok)).await;
+        assert_eq!(attribution(&state, &body).0.as_deref(), Some(s.agent_id()));
+    }
+
+    /// §15: a device that is not admitted, or past its lease, raises no op
+    /// (so it can never be unlocked).
+    #[tokio::test]
+    async fn a_parked_or_stale_device_raises_no_op() {
+        use crate::principal_ledger::{DeviceGate, LedgerGate};
+        let state = Arc::new(test_state());
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        for (device, code) in [
+            (DeviceGate::NotAdmitted, "device_not_admitted"),
+            (DeviceGate::Stale, "ledger_stale"),
+        ] {
+            state.set_ledger(LedgerGate { device, agents: None });
+            let err = create(
+                State(state.clone()),
+                ConnectInfo(addr),
+                Path("v1".into()),
+                HeaderMap::new(),
+                Json(rm_op(Value::Null)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code().0.as_str(), code);
+        }
+    }
+
+    /// No proof, a proof over a different op, a proof for another vault, or a
+    /// garbage header: nothing is stamped, and a requester-supplied
+    /// `scope.agent` never survives.
+    #[tokio::test]
+    async fn absent_or_tampered_op_pop_stamps_nothing() {
+        let state = Arc::new(test_state());
+        let s = agent_signer();
+        let now = crate::util::now_unix();
+        let claimed = json!({ "agent": s.agent_id() });
+
+        // Absent proof, forged claim in the scope.
+        let body = create_with(&state, rm_op(claimed.clone()), HeaderMap::new()).await;
+        assert_eq!(attribution(&state, &body), (None, None));
+
+        // Proof signed over the op WITHOUT the claim, sent with it (tampered).
+        let tok = s.op_token("v1", &rm_op(Value::Null), now).unwrap();
+        let body = create_with(&state, rm_op(claimed.clone()), pop_headers(&tok)).await;
+        assert_eq!(attribution(&state, &body), (None, None));
+
+        // Proof for another vault.
+        let tok = s.op_token("v2", &rm_op(Value::Null), now).unwrap();
+        let body = create_with(&state, rm_op(Value::Null), pop_headers(&tok)).await;
+        assert_eq!(attribution(&state, &body), (None, None));
+
+        // A stale proof and a malformed one.
+        let tok = s.op_token("v1", &rm_op(Value::Null), now - 3600).unwrap();
+        let body = create_with(&state, rm_op(Value::Null), pop_headers(&tok)).await;
+        assert_eq!(attribution(&state, &body), (None, None));
+        let body = create_with(&state, rm_op(Value::Null), pop_headers("scpop1.x.y.z")).await;
+        assert_eq!(attribution(&state, &body), (None, None));
+    }
+
+    fn status_of(state: &AppState, id: &str) -> crate::approval::ApprovalStatus {
+        state
+            .approvals
+            .lock()
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .status
+            .clone()
+    }
+
+    /// Only Export ops get a waiter secret; the record keeps its hash only.
+    #[tokio::test]
+    async fn waiter_secret_only_for_export_and_stored_hashed() {
+        let state = Arc::new(test_state());
+        let body = create_unlocked(&state, export_op()).await;
+        let id = body["op_id"].as_str().unwrap().to_string();
+        let secret = body["waiter_secret"].as_str().unwrap().to_string();
+        {
+            let s = state.approvals.lock().unwrap();
+            let rec = s.get(&id).unwrap();
+            assert_eq!(
+                rec.waiter_hash,
+                Some(crate::approval::store::waiter_digest(&secret))
+            );
+        }
+        let mut lock = export_op();
+        lock.act.kind = ActType::Custom("vault-lock".into());
+        lock.act.target = String::new();
+        let body = create_unlocked(&state, lock).await;
+        assert!(body.get("waiter_secret").is_none(), "{body}");
+    }
+
+    /// `POST /op/{id}/cancel`: an Export needs its waiter secret; success is a
+    /// requester withdrawal (`withdrawn by requester`), never a user reject.
+    #[tokio::test]
+    async fn cancel_requires_waiter_secret_and_withdraws() {
+        let state = Arc::new(test_state());
+        let body = create_unlocked(&state, export_op()).await;
+        let id = body["op_id"].as_str().unwrap().to_string();
+        let secret = body["waiter_secret"].as_str().unwrap().to_string();
+
+        for bad in [
+            None,
+            Some(json!({})),
+            Some(json!({ "waiter_secret": "nope" })),
+        ] {
+            let err = cancel(State(state.clone()), Path(id.clone()), bad.map(Json))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Forbidden(_)), "{err}");
+            assert!(matches!(
+                status_of(&state, &id),
+                crate::approval::ApprovalStatus::Pending
+            ));
+        }
+        let ok = cancel(
+            State(state.clone()),
+            Path(id.clone()),
+            Some(Json(json!({ "waiter_secret": secret }))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.0["reason"], WITHDRAWN_REASON);
+        match status_of(&state, &id) {
+            crate::approval::ApprovalStatus::Rejected { reason } => {
+                assert_eq!(reason, WITHDRAWN_REASON)
+            }
+            other => panic!("expected withdrawn, got {other:?}"),
+        }
+        // Already resolved → 409, nothing changes.
+        let err = cancel(
+            State(state.clone()),
+            Path(id.clone()),
+            Some(Json(json!({ "waiter_secret": secret }))),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)));
+
+        // A non-Export op (no waiter secret on record) is withdrawable by id.
+        let mut lock = export_op();
+        lock.act.kind = ActType::Custom("vault-lock".into());
+        lock.act.target = String::new();
+        let body = create_unlocked(&state, lock).await;
+        let lid = body["op_id"].as_str().unwrap().to_string();
+        let _ = cancel(State(state.clone()), Path(lid.clone()), None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            status_of(&state, &lid),
+            crate::approval::ApprovalStatus::Rejected { .. }
+        ));
+    }
+
+    /// The liveness reaper withdraws a pending Export whose waiter went silent
+    /// past the window (kill -9'd `sc get`) as `abandoned`, and leaves a live
+    /// one alone.
+    #[tokio::test]
+    async fn reaper_withdraws_abandoned_exports() {
+        let state = Arc::new(test_state());
+        let stale = create_unlocked(&state, export_op()).await["op_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let live = create_unlocked(&state, export_op()).await["op_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        state
+            .approvals
+            .lock()
+            .unwrap()
+            .get_mut_for_test(&stale)
+            .unwrap()
+            .last_waiter_poll = std::time::Instant::now() - std::time::Duration::from_secs(61);
+
+        let reaped = reap_abandoned_exports(&state, WAITER_IDLE);
+        assert_eq!(reaped, vec![stale.clone()]);
+        match status_of(&state, &stale) {
+            crate::approval::ApprovalStatus::Rejected { reason } => {
+                assert_eq!(reason, ABANDONED_REASON)
+            }
+            other => panic!("expected abandoned, got {other:?}"),
+        }
+        assert!(matches!(
+            status_of(&state, &live),
+            crate::approval::ApprovalStatus::Pending
+        ));
+        // Idempotent: nothing left to reap.
+        assert!(reap_abandoned_exports(&state, WAITER_IDLE).is_empty());
     }
 }

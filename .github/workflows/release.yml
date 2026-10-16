@@ -2,7 +2,7 @@ name: Release (official = open core + private team overlay)
 
 # The OFFICIAL binary everyone downloads (stable AND pre-release) is the ASSEMBLED
 # build: this public core pinned at the release tag + the PRIVATE team overlay
-# (SafeClaw-OSS/safeclaw-ee). team-edition §9 (VS Code / Code-OSS model).
+# (getsafeclaw/safeclaw-ee). team-edition §9 (VS Code / Code-OSS model).
 #
 # Single trigger: a version tag on THIS repo. The overlay repo has no release CI,
 # so there is exactly one build per tag (no duplicate). To ship an overlay change,
@@ -49,13 +49,13 @@ jobs:
       # cache (avoids the path-dep-outside-mount problem).
       #
       # EE_READ_TOKEN = a fine-grained PAT with ONLY `Contents: Read` on
-      # SafeClaw-OSS/safeclaw-ee (the org has deploy keys disabled, so a read
+      # getsafeclaw/safeclaw-ee (the org has deploy keys disabled, so a read
       # token is the minimal way for this public repo's CI to fetch the private
       # overlay). Store it in this repo's Actions secrets.
       - name: Checkout private overlay (safeclaw-ee)
         uses: actions/checkout@v4
         with:
-          repository: SafeClaw-OSS/safeclaw-ee
+          repository: getsafeclaw/safeclaw-ee
           ref: main
           token: ${{ secrets.EE_READ_TOKEN }}
           path: safeclaw-ee
@@ -66,7 +66,7 @@ jobs:
       - name: Pin core to the release tag
         run: |
           cd safeclaw-ee
-          sed -i -E "s#^safeclaw = .*#safeclaw = { git = \"https://github.com/SafeClaw-OSS/safeclaw\", tag = \"${{ github.ref_name }}\" }#" Cargo.toml
+          sed -i -E "s#^safeclaw = .*#safeclaw = { git = \"https://github.com/getsafeclaw/safeclaw\", tag = \"${{ github.ref_name }}\" }#" Cargo.toml
           echo "--- pinned core dep ---"; grep '^safeclaw = ' Cargo.toml
           echo "core=${{ github.ref_name }} overlay=$(git rev-parse HEAD)" > ../assembly.txt
 

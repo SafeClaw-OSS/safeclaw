@@ -9,37 +9,44 @@
 #   and `{{vars.scope.<key>}}`. No surface may show requester-authored prose.
 # - P3 rule: an undefined/empty var renders empty; a fact row whose value
 #   renders empty (incl. `false`) is omitted. `true` renders as "yes".
-# - `tone` is advisory upward-only for clients: a client's built-in danger
-#   floor for an act kind can never be downgraded by this table.
+# - `explain` / `explain_zh` is THE one consequence sentence the approval
+#   card shows (the five-question card, public/mock/approval-card.html): what
+#   approving means, nothing else. No product explainers, no second sentence.
+# - `tone` ("neutral" | "warn" | "danger") is the consequence tier, styling
+#   AND the batch gate. neutral = one-shot or reversible. warn = persistent
+#   or irrevocable consequence (amber), still batchable. danger = destruction
+#   (red), confirmed alone, never batched (today: vault-delete only).
+#   Upward-only for clients: a client's built-in danger floor for an act kind
+#   can never be downgraded by this table.
 # - Keep in lockstep with `DISPATCHED_CUSTOM_ACTS` (approve.rs) — the
 #   `dispatch_and_table_agree` test fails on drift in either direction.
 
 [acts.vault-unlock]
 action = "Unlock vault"
 action_zh = "解锁 vault"
-explain = "Brings your vault online so your agent can use its stored credentials this session. No secret leaves SafeClaw."
-explain_zh = "让你的 vault 上线，这个会话里你的 agent 就能用里面存的凭证。任何凭证都不会离开 SafeClaw。"
+explain = "For this session, the agent on this device can use this vault's credentials."
+explain_zh = "本次会话内，这台设备上的 agent 可以使用这个 vault 的凭证。"
 tone = "neutral"
 
 [acts.vault-lock]
 action = "Lock vault"
 action_zh = "锁定 vault"
-explain = "Takes your vault offline. Your agent can no longer use stored credentials until you unlock again."
-explain_zh = "让你的 vault 下线。在你再次解锁之前，你的 agent 无法使用存储的凭证。"
+explain = "Your agent can no longer use this vault's credentials until you unlock it again."
+explain_zh = "在你再次解锁之前，你的 agent 无法再使用这个 vault 的凭证。"
 tone = "neutral"
 
 [acts.vault-delete]
 action = "Delete vault"
 action_zh = "删除 vault"
-explain = "Permanently erases this vault and everything in it. This cannot be undone. You would have to set it up again from scratch."
-explain_zh = "永久抹除此 vault 及其中的一切内容。此操作无法撤销，之后只能从头重新设置。"
+explain = "This vault and everything in it is permanently deleted on every device; this cannot be undone."
+explain_zh = "这个 vault 及其全部内容会在所有设备上永久删除，无法撤销。"
 tone = "danger"
 
 [acts.rename-passkey]
 action = "Rename a passkey"
 action_zh = "重命名 Passkey"
-explain = "Changes a passkey's display name. Keys and access are unchanged."
-explain_zh = "仅更改 Passkey 的显示名称，密钥与访问权限不变。"
+explain = "Only this passkey's display name changes; keys and access stay the same."
+explain_zh = "只更改这个 Passkey 的显示名称，密钥与访问权限不变。"
 tone = "neutral"
 facts = [
   { label = "New name", label_zh = "新名称", value = "{{vars.scope.new_name}}" },
@@ -48,9 +55,9 @@ facts = [
 [acts.widen-host]
 action = "Permanently allow {{vars.scope.host}}"
 action_zh = "永久允许 {{vars.scope.host}}"
-explain = "Adds this host to the connection's allowed destinations forever. Every future brokered request may send its credential here without asking again. Grant only a host you trust."
-explain_zh = "将此主机永久添加到该连接的允许目标。今后每个代理请求都可能不再询问就把凭证发送到这里。仅授权你信任的主机。"
-tone = "danger"
+explain = "{{vars.scope.connection_id}}'s credential can be sent to {{vars.scope.host}} from now on, without asking, until you remove it."
+explain_zh = "{{vars.scope.connection_id}} 的凭证今后可发往 {{vars.scope.host}}，不再询问，直到你移除。"
+tone = "warn"
 facts = [
   { label = "Connection", label_zh = "连接", value = "{{vars.scope.connection_id}}" },
   { label = "Host", label_zh = "主机", value = "{{vars.scope.host}}" },
@@ -59,48 +66,61 @@ facts = [
 [acts.narrow-host]
 action = "Stop allowing {{vars.scope.host}}"
 action_zh = "不再允许 {{vars.scope.host}}"
-explain = "Removes this host from the connection's allowed destinations. Brokered requests can no longer send the credential there. Tightening access is always safe."
-explain_zh = "将此主机从该连接的允许目标中移除。此后代理请求不能再把凭证发送到这里。收紧权限始终是安全的。"
+explain = "Brokered requests can no longer send {{vars.scope.connection_id}}'s credential to {{vars.scope.host}}."
+explain_zh = "代理请求不能再把 {{vars.scope.connection_id}} 的凭证发往 {{vars.scope.host}}。"
 tone = "neutral"
 facts = [
   { label = "Connection", label_zh = "连接", value = "{{vars.scope.connection_id}}" },
   { label = "Host", label_zh = "主机", value = "{{vars.scope.host}}" },
 ]
 
-[acts.service-ls]
-action = "List custom services"
-action_zh = "列出自定义服务"
-explain = "Reads the names and validity of this vault's custom service definitions. Nothing changes and no secret is revealed."
-explain_zh = "读取此 vault 的自定义服务定义名称与有效性。不做任何更改，也不泄露任何密钥。"
-tone = "neutral"
-
 [acts.service-add]
-action = "Add a custom service definition"
-action_zh = "添加自定义服务定义"
-explain = "Stores a service definition (hosts, auth shape, request rules) in your vault. It only takes effect for connections you explicitly create with it."
-explain_zh = "将一个服务定义（主机、认证方式、请求规则）存入 vault。仅当你显式用它创建连接时才会生效。"
+action = "Install a third-party service"
+action_zh = "安装第三方服务"
+explain = "SafeClaw does not review third-party services. Connections that use one send credentials to the hosts it lists."
+explain_zh = "SafeClaw 不审查第三方服务。使用它的连接会把凭证发往它列出的主机。"
 tone = "neutral"
+variants = [
+  { when = "{{vars.scope.update}}", action = "Update a third-party service", action_zh = "更新第三方服务" },
+]
+facts = [
+  { label = "Services", label_zh = "服务", value = "{{vars.scope.ids}}" },
+  { label = "Sends credentials to", label_zh = "凭证发往", value = "{{vars.scope.destinations}}" },
+  { label = "Source", label_zh = "来源", value = "{{vars.scope.from}}" },
+  { label = "OAuth", label_zh = "OAuth", value = "{{vars.scope.oauth}}" },
+  { label = "New destinations", label_zh = "新增目标主机", value = "{{vars.scope.new_destinations}}" },
+  { label = "Loosened or removed rules", label_zh = "放宽或删除的规则", value = "{{vars.scope.loosens}}" },
+  { label = "Rules applied", label_zh = "生效的规则", value = "{{vars.scope.tightens}}" },
+  { label = "Replaces", label_zh = "替换", value = "{{vars.scope.replaces}}" },
+  { label = "Removes", label_zh = "移除", value = "{{vars.scope.removes}}" },
+  { label = "Definition", label_zh = "定义原文", value = "{{vars.scope.definitions}}", detail = true },
+]
 
 [acts.service-rm]
-action = "Remove custom service {{vars.target}}"
-action_zh = "移除自定义服务 {{vars.target}}"
-explain = "Deletes this custom service definition. Connections referencing it are kept but stop working until it is re-added."
-explain_zh = "删除该自定义服务定义。引用它的连接会保留，但在重新添加之前无法工作。"
-tone = "danger"
+action = "Remove service definitions {{vars.target}}"
+action_zh = "移除服务定义 {{vars.target}}"
+explain = "These service definitions are removed from your vault, and connections that use them stop working until a definition is added again."
+explain_zh = "这些服务定义会从 vault 中移除，使用它们的连接将停止工作，直到重新添加定义。"
+tone = "neutral"
+facts = [
+  { label = "Services", label_zh = "服务", value = "{{vars.scope.ids}}" },
+  { label = "Source", label_zh = "来源", value = "{{vars.scope.from}}" },
+  { label = "Connections that stop working", label_zh = "将停止工作的连接", value = "{{vars.scope.connections}}" },
+]
 
 [acts.secret-rm]
 action = "Remove secret {{vars.target}}"
 action_zh = "移除密钥 {{vars.target}}"
-explain = "Deletes this secret's value from your vault. Connections referencing it stop working until the key is re-added."
-explain_zh = "从 vault 中删除该密钥的值。引用它的连接将无法工作，直到重新添加。"
-tone = "danger"
+explain = "This secret's value is deleted from your vault, and connections referencing it stop working until the key is added again."
+explain_zh = "该密钥的值会从 vault 中删除，引用它的连接将停止工作，直到重新添加。"
+tone = "neutral"
 
 [acts.connection-rm]
 action = "Remove connection {{vars.target}}"
 action_zh = "移除连接 {{vars.target}}"
-explain = "Removes this connection and any secret only it references. Your agent loses access immediately."
-explain_zh = "移除此连接，及仅被它引用的密钥。你的 agent 将立即失去访问。"
-tone = "danger"
+explain = "This connection and the secrets it wrote that nothing else uses are removed, and your agent loses this access immediately."
+explain_zh = "该连接及其写入且没有其他连接在用的密钥会被移除，你的 agent 立即失去此访问。"
+tone = "neutral"
 facts = [
   { label = "Secrets kept", label_zh = "保留密钥", value = "{{vars.scope.keep_secrets}}" },
 ]
@@ -108,20 +128,23 @@ facts = [
 [acts.connection-add]
 action = "Add connection {{vars.target}}"
 action_zh = "添加连接 {{vars.target}}"
-explain = "Stores the listed secret key(s) in your vault and anchors them to the destination above. The values never left your device; this page only checks their fingerprint."
-explain_zh = "将列出的密钥存入你的 vault，并锚定到上方的目标。密钥值从未离开你的设备，本页面只核对它的指纹。"
+explain = "The listed keys are bound to this connection, which sends them only to the hosts shown."
+explain_zh = "列出的密钥会绑定到这条连接，它只会把这些密钥发往所示主机。"
 tone = "neutral"
 facts = [
   { label = "Service", label_zh = "服务", value = "{{vars.scope.service}}" },
-  { label = "Host", label_zh = "主机", value = "{{vars.scope.hosts}}" },
-  { label = "Secret in use", label_zh = "使用的密钥", value = "{{vars.scope.secrets}}" },
+  { label = "Sends to", label_zh = "发往", value = "{{vars.scope.destinations}}" },
+  { label = "Uses existing secret", label_zh = "使用已有密钥", value = "{{vars.scope.referenced}}" },
+  { label = "Stores new value", label_zh = "存入新值", value = "{{vars.scope.written}}" },
+  { label = "Overwrites", label_zh = "覆盖", value = "{{vars.scope.overwrites}}" },
+  { label = "Replaces existing connection", label_zh = "替换同名连接", value = "{{vars.scope.replaces}}" },
 ]
 
 [acts.secret-set]
 action = "Store secret {{vars.target}}"
 action_zh = "保存密钥 {{vars.target}}"
-explain = "Stores this secret in your vault. If a host is shown above it is anchored there for brokered agent use; with no host, your agent cannot use it. The value never left your device."
-explain_zh = "将该密钥存入你的 vault。上方显示主机时会锚定给 agent 经代理使用；未显示主机则 agent 无法使用。密钥值从未离开你的设备。"
+explain = "This secret is stored in your vault, anchored to the host shown for brokered agent use (with no host, your agent cannot use it)."
+explain_zh = "该密钥会存入你的 vault，并锚定到所示主机供 agent 经代理使用（未显示主机则 agent 无法使用）。"
 tone = "neutral"
 facts = [
   { label = "Host", label_zh = "主机", value = "{{vars.scope.hosts}}" },

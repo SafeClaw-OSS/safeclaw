@@ -94,7 +94,7 @@ pub fn device_signer() -> Option<DeviceRequestSigner> {
 /// `req.url` (path, `?`, query; no scheme/host). Both sides sign THIS so the PoP
 /// verifies. `None` if the URL doesn't parse (caller then skips signing rather
 /// than sign bytes the backend can't reproduce).
-fn path_and_query(full_url: &str) -> Option<String> {
+pub(crate) fn path_and_query(full_url: &str) -> Option<String> {
     let u = reqwest::Url::parse(full_url).ok()?;
     Some(match u.query() {
         Some(q) => format!("{}?{}", u.path(), q),

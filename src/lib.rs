@@ -20,6 +20,8 @@ pub mod audit;
 pub mod auth;
 pub mod cli;
 pub mod config;
+#[cfg(test)]
+mod contract_vectors;
 pub mod core;
 pub mod crypto;
 pub mod device_auth;
@@ -29,6 +31,7 @@ mod generated_services;
 pub mod identity;
 pub mod identity_file;
 pub mod passkey;
+pub mod pairing;
 pub mod principal_ledger;
 pub mod protocol;
 pub mod proxy;

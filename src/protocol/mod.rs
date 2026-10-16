@@ -15,6 +15,6 @@ pub mod grant;
 pub mod operation;
 pub mod render;
 
-pub use grant::{validate_grant, Grant, ValidatedGrant};
+pub use grant::{validate_batch_grant, validate_grant, Grant, ValidatedGrant};
 pub use operation::{Act, ActType, Bind, NewCredential, Operation, RecipientPk, Valid, WritePatch};
 pub use render::render_operation;

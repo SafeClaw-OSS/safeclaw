@@ -14,10 +14,97 @@
 //!
 //! Rule matching uses path patterns (nginx-style):
 //! - `match`: `"METHOD /path/with/*/wildcards"` — `*` matches one path segment
-//! - `body`: regex matched against request body text (optional)
-use regex::Regex;
-use serde::{Deserialize, Serialize};
+//! - `body`: regex matched against request body text (optional), compiled once
+//!   when its rule is loaded ([`BodyPattern`])
+use regex::{Regex, RegexBuilder};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+
+// ── Body patterns ──────────────────────────────────────────────────────────────
+
+/// A rule's `body` predicate, compiled once when the rule is loaded (a
+/// definition at the gate, a user edit when the sealed policy is read) and
+/// matched with `is_match` only, so no request ever compiles a regex. The
+/// builder limits follow the regex crate's "Untrusted input" guidance: a
+/// bounded pattern length and an explicit compiled-size limit.
+#[derive(Clone)]
+pub struct BodyPattern {
+    source: String,
+    /// `Err` only for a user edit (`aux.policy`) whose pattern does not
+    /// compile; a definition carrying one is rejected at the gate. See
+    /// `matches_rule` for how such a rule decides. Shared, so the copies a
+    /// per-request rule merge makes reuse one compiled program and its cache.
+    compiled: Result<std::sync::Arc<Regex>, String>,
+}
+
+impl BodyPattern {
+    /// Compile `source` under the definition limits, or say why it cannot be.
+    pub fn compile(source: &str) -> Result<BodyPattern, String> {
+        use crate::service::limits::{
+            BODY_REGEX_DFA_SIZE_LIMIT, BODY_REGEX_NEST_LIMIT, BODY_REGEX_SIZE_LIMIT,
+            MAX_BODY_PATTERN_BYTES,
+        };
+        if source.len() > MAX_BODY_PATTERN_BYTES {
+            return Err(format!(
+                "is {} bytes; the limit is {}",
+                source.len(),
+                MAX_BODY_PATTERN_BYTES
+            ));
+        }
+        RegexBuilder::new(source)
+            .size_limit(BODY_REGEX_SIZE_LIMIT)
+            .dfa_size_limit(BODY_REGEX_DFA_SIZE_LIMIT)
+            .nest_limit(BODY_REGEX_NEST_LIMIT)
+            .build()
+            .map(|re| BodyPattern {
+                source: source.to_string(),
+                compiled: Ok(std::sync::Arc::new(re)),
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// A user edit's pattern: compiled now; one that does not compile is kept
+    /// as unreadable rather than failing the whole sealed policy.
+    pub fn lenient(source: &str) -> BodyPattern {
+        Self::compile(source).unwrap_or_else(|e| BodyPattern {
+            source: source.to_string(),
+            compiled: Err(e),
+        })
+    }
+
+    /// The pattern as written.
+    pub fn as_str(&self) -> &str {
+        &self.source
+    }
+
+    /// Why the pattern does not compile, when it does not.
+    pub fn error(&self) -> Option<&str> {
+        self.compiled.as_ref().err().map(String::as_str)
+    }
+
+    /// Does the pattern match `text`? `None` when it is unreadable.
+    fn is_match(&self, text: &str) -> Option<bool> {
+        self.compiled.as_ref().ok().map(|re| re.is_match(text))
+    }
+}
+
+impl std::fmt::Debug for BodyPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BodyPattern({:?})", self.source)
+    }
+}
+
+impl Serialize for BodyPattern {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.source.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for BodyPattern {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(BodyPattern::lenient(&String::deserialize(d)?))
+    }
+}
 
 /// Serde for a rule's `match`: accept either a single `"METHOD /path"` string or
 /// a list of them (OR — any pattern matches). A single pattern serializes back
@@ -54,7 +141,8 @@ pub(crate) mod match_spec {
 /// The access DECISION for a request.
 ///
 /// - `Allow`: pass through immediately, no approval
-/// - `Ask`: approve once, then cache for the rule's `ttl`
+/// - `Ask`: approve once; the approval holds for the rule's / floor's `ttl`
+///   (what it covers: `crate::approval::reuse`)
 /// - `AskAlways`: approve every request, never cache
 /// - `Deny`: block unconditionally
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +221,7 @@ pub struct PolicyRule {
     pub match_patterns: Vec<String>,
     /// Regex matched against request body text. Omit to skip body matching.
     #[serde(default)]
-    pub body: Option<String>,
+    pub body: Option<BodyPattern>,
     /// A structured field condition, AND-combined with `match`/`body`:
     /// `"vars.<name> <op> <literal>"`, e.g. `"vars.amount > 80"`. The var is
     /// resolved from the request's matching `[requests]` shape (service.toml);
@@ -187,7 +275,7 @@ pub struct RuleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
+    pub body: Option<BodyPattern>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +320,10 @@ pub struct Policy {
     /// Per-connection user policy, keyed by `connection_id`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub connections: HashMap<String, ConnectionPolicy>,
+    /// The owner's switch for installed services (definitions stored with a
+    /// source): off (absent) = the vault neither loads nor adds them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_installed_services: bool,
 }
 
 impl Default for Policy {
@@ -261,6 +353,7 @@ impl Default for Policy {
             default: Some(allow_rw()),
             categories,
             connections: HashMap::new(),
+            allow_installed_services: false,
         }
     }
 }
@@ -282,6 +375,7 @@ impl Policy {
                 p.categories.insert(k.clone(), v.clone());
             }
             p.connections = u.connections.clone();
+            p.allow_installed_services = u.allow_installed_services;
         }
         p
     }
@@ -348,17 +442,188 @@ pub fn merge_rules(built_in: &[PolicyRule], user: &HashMap<String, RuleConfig>) 
     out
 }
 
+/// A connection's own rule edit that cannot be enforced as written on a
+/// scoped request (the service declares a `[requests]` shape for its path),
+/// with the reason; `None` when every edit covering the request is
+/// enforceable.
+///
+/// An approval on a scoped path binds only the matched shape's `scope`
+/// values, so a rule whose decision depends on anything else could be
+/// approved for one request and then decide a different request the approval
+/// still matches. The same invariant the compiled policies are held to (the
+/// gate, `service::gate`: a deciding field must be bound), applied per
+/// request to the user's edits:
+///   - a `when` on a var the matched shape declares but does not bind;
+///   - a `body` regex (the body is never bound).
+///
+/// Each edit is judged as the rule it produces: the MERGED rule
+/// ([`merge_rules`]), so an edit of only `level` on a built-in rule that has
+/// a `body` decides on that body and is judged so. Only rules a user edit
+/// touches (`aux.policy.connections.<id>.rules`) are checked, only those that
+/// decide `ask` or `ask-always` (an `allow` or `deny` mints no approval and
+/// is re-decided on every request), and only those whose `match` covers this
+/// request. A `when` naming a var this shape does not declare never fires
+/// here (P3) and is not refused.
+/// `shape` / `declared` / `binds` describe the matched shape
+/// (`crate::service::RequestScope`).
+pub fn unenforceable_user_rule(
+    built_in: &[PolicyRule],
+    user: &HashMap<String, RuleConfig>,
+    method: &str,
+    path: &str,
+    shape: &str,
+    declared: &[String],
+    binds: &[String],
+) -> Option<String> {
+    let merged = merge_rules(built_in, user);
+    let mut edited: Vec<(&str, &PolicyRule)> = merged
+        .iter()
+        .filter_map(|r| {
+            let id = r.id.as_deref()?;
+            user.contains_key(id).then_some((id, r))
+        })
+        .collect();
+    edited.sort_by_key(|(id, _)| *id);
+    for (id, rule) in edited {
+        // Only an ask decision mints an approval this could ride: `allow` and
+        // `deny` (or no level) are re-decided on every request.
+        if !matches!(rule.level, Some(AccessLevel::Ask | AccessLevel::AskAlways)) {
+            continue;
+        }
+        let covers = rule.match_patterns.is_empty()
+            || rule
+                .match_patterns
+                .iter()
+                .any(|p| pattern_matches(p, method, path));
+        if !covers {
+            continue;
+        }
+        if rule.body.is_some() {
+            return Some(format!(
+                "this connection's policy rule '{}' decides on the request body, which an approval \
+                 on this path does not bind (it binds only the [requests.{}] scope fields); remove \
+                 the rule's body match, or gate it with `when` on a bound field",
+                id, shape
+            ));
+        }
+        let Some(cond) = rule.when.as_deref().and_then(Condition::parse) else {
+            continue; // an unparseable `when` never matches (P3)
+        };
+        let var = cond.var_name();
+        // The declared fields the `when` can resolve to, by the same lookup
+        // evaluation uses (`extract_request_scope` inserts each var as `name`
+        // and as `<shape>.name`). None: it never resolves on this path.
+        let qualified = format!("{}.", shape);
+        let fields: Vec<&str> = [Some(var), var.strip_prefix(qualified.as_str())]
+            .into_iter()
+            .flatten()
+            .filter(|f| declared.iter().any(|d| d == f))
+            .collect();
+        if fields.iter().any(|f| !binds.iter().any(|b| b == f)) {
+            return Some(format!(
+                "this connection's policy rule '{}' gates on `vars.{}`, which the [requests.{}] \
+                 shape does not bind, so an approval could not hold it fixed; gate the rule on a \
+                 bound field instead",
+                id, var, shape
+            ));
+        }
+    }
+    None
+}
+
 // ── Path Pattern Matching ─────────────────────────────────────────────────────
 
-/// Parse a match pattern into (optional_method, path_pattern).
+/// Parse a match pattern into (optional_method, path_pattern). The first word
+/// is the method when it is ASCII letters in any case (`DELETE /x`,
+/// `delete /x`); every rule source (policy.toml, inline policy, a user edit)
+/// reads it the same way, and matching compares it case-insensitively.
 fn parse_match_pattern(pattern: &str) -> (Option<&str>, &str) {
-    if let Some(space_pos) = pattern.find(' ') {
-        let method = &pattern[..space_pos];
-        if method.bytes().all(|b| b.is_ascii_uppercase()) {
-            return (Some(method), &pattern[space_pos + 1..]);
+    if let Some((method, path)) = pattern.split_once(' ') {
+        if !method.is_empty() && method.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return (Some(method), path.trim_start());
         }
     }
     (None, pattern)
+}
+
+/// Why a definition's `match` pattern could never match a request, or `None`
+/// when it is well formed: `"/path"` or `"METHOD /path"`, the path starting
+/// with `/`, free of whitespace, `?` and `#` (matching sees the path without
+/// its query), with `**` only as the final segment.
+pub(crate) fn match_pattern_problem(pattern: &str) -> Option<String> {
+    let (method, path) = parse_match_pattern(pattern);
+    if method.is_none() && pattern.contains(char::is_whitespace) {
+        return Some(format!(
+            "match '{}' must be \"/path\" or \"METHOD /path\" (METHOD in letters)",
+            pattern
+        ));
+    }
+    if !path.starts_with('/') {
+        return Some(format!("match '{}': the path must start with '/'", pattern));
+    }
+    if path.contains(char::is_whitespace) || path.contains(['?', '#']) {
+        return Some(format!(
+            "match '{}': the path may not contain whitespace, '?' or '#'",
+            pattern
+        ));
+    }
+    let segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    if let Some((_, init)) = segments.split_last() {
+        if init.contains(&"**") {
+            return Some(format!(
+                "match '{}': '**' is only allowed as the final segment",
+                pattern
+            ));
+        }
+    }
+    None
+}
+
+/// Could one request match both patterns? Methods agree when either is absent
+/// or they are equal ignoring case; paths agree segment by segment (`*` is
+/// any one segment, a final `**` any one or more). A path-level check only:
+/// it decides whether a rule can apply on a path a `[requests]` shape covers.
+pub(crate) fn patterns_overlap(a: &str, b: &str) -> bool {
+    let (ma, pa) = parse_match_pattern(a);
+    let (mb, pb) = parse_match_pattern(b);
+    if let (Some(x), Some(y)) = (ma, mb) {
+        if !x.eq_ignore_ascii_case(y) {
+            return false;
+        }
+    }
+    let split = |p: &str| -> (Vec<String>, bool) {
+        let mut segs: Vec<String> = p
+            .trim_end_matches('/')
+            .split('/')
+            .map(str::to_string)
+            .collect();
+        let rest = segs.last().is_some_and(|s| s == "**");
+        if rest {
+            segs.pop();
+        }
+        (segs, rest)
+    };
+    let (sa, ra) = split(pa);
+    let (sb, rb) = split(pb);
+    let seg_ok = |x: &String, y: &String| x == "*" || y == "*" || x == y;
+    let common = sa.len().min(sb.len());
+    if !sa
+        .iter()
+        .zip(sb.iter())
+        .take(common)
+        .all(|(x, y)| seg_ok(x, y))
+    {
+        return false;
+    }
+    match (ra, rb) {
+        // Fixed lengths must agree.
+        (false, false) => sa.len() == sb.len(),
+        // `a/**` needs at least one segment past its prefix; `b` fixed supplies it.
+        (true, false) => sb.len() > sa.len(),
+        (false, true) => sa.len() > sb.len(),
+        // Both open-ended: a path long enough for both exists.
+        (true, true) => true,
+    }
 }
 
 /// Match a request path against a pattern. `*` matches exactly one path
@@ -507,6 +772,20 @@ impl Condition {
         &self.var
     }
 
+    /// Why this condition could never decide a request, or `None`: a numeric
+    /// literal must be finite (`NaN`, `inf`, `1e400` compare as nothing
+    /// useful), and an ordering comparison needs a number (an ordering
+    /// against `80usd` or a quoted string is never true, see [`Self::eval`]).
+    pub fn never_fires(&self) -> Option<&'static str> {
+        match self.lit_num {
+            Some(n) if !n.is_finite() => Some("its literal is not a finite number"),
+            None if matches!(self.op, CmpOp::Gt | CmpOp::Lt | CmpOp::Ge | CmpOp::Le) => {
+                Some("an ordering comparison needs a numeric literal")
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluate against the request vars. An undefined var → `false` (P3: the
     /// rule simply doesn't match; the engine invents no decision). Ordering
     /// comparisons need both sides numeric; equality falls back to string.
@@ -549,12 +828,14 @@ impl Condition {
 /// Does a single `"METHOD /path"` (or `"/path"`) pattern match this request?
 /// The method/path half of rule matching, exposed so the service layer can
 /// resolve which `[requests]` shape a request hits with the SAME grammar the
-/// policy rules use (no second matcher to drift).
+/// policy rules use (no second matcher to drift). The method compares
+/// case-insensitively: the proxy normalizes it to uppercase at ingress, and a
+/// caller that did not still matches the rule it names.
 pub(crate) fn pattern_matches(pattern: &str, method: &str, path: &str) -> bool {
     let path_no_query = path.split('?').next().unwrap_or(path);
     let (rule_method, rule_path) = parse_match_pattern(pattern);
     if let Some(m) = rule_method {
-        if m != method {
+        if !m.eq_ignore_ascii_case(method) {
             return false;
         }
     }
@@ -581,16 +862,20 @@ fn matches_rule(
         }
     }
     if let Some(ref pattern) = rule.body {
-        let body_text = body.unwrap_or("");
-        match Regex::new(pattern) {
-            Ok(re) => {
-                if !re.is_match(body_text) {
+        match pattern.is_match(body.unwrap_or("")) {
+            Some(true) => {}
+            Some(false) => return false,
+            // An unreadable pattern (only a user edit can carry one; the gate
+            // rejects a definition with one) never loosens a decision: the
+            // rule matches wherever it would restrict, and never where it
+            // would allow.
+            None => {
+                if !matches!(
+                    rule.level,
+                    Some(AccessLevel::Ask | AccessLevel::AskAlways | AccessLevel::Deny)
+                ) {
                     return false;
                 }
-            }
-            Err(e) => {
-                tracing::warn!("Invalid body regex '{}': {}", pattern, e);
-                return false;
             }
         }
     }
@@ -607,8 +892,13 @@ fn matches_rule(
 
 // ── Policy Evaluation ──────────────────────────────────────────────────────────
 
-fn is_write_method(method: &str) -> bool {
-    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+/// The read/write split the default floors and the reuse classes use. Fails
+/// closed: only `GET`, `HEAD` and `OPTIONS` (any case) are reads; every other
+/// method, including extension methods (`MOVE`, `PROPPATCH`, …), is a write.
+pub(crate) fn is_write_method(method: &str) -> bool {
+    !["GET", "HEAD", "OPTIONS"]
+        .iter()
+        .any(|read| read.eq_ignore_ascii_case(method))
 }
 
 /// Determine the access level for a request. See [`evaluate_with_match`].
@@ -635,19 +925,24 @@ pub fn evaluate(
     .0
 }
 
+/// What decided a request: a matched rule, or a default floor (connection,
+/// tag, global, or the safe floor). The unit an `ask` approval is reused by
+/// (`crate::approval::Reuse`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// A rule matched; its `id` and `label` as declared.
+    Rule {
+        id: Option<String>,
+        label: Option<String>,
+    },
+    /// No rule matched.
+    Floor,
+}
+
 /// Resolve the access decision for a request, returning `(level,
-/// matched_rule_id, ttl)`.
-///
-/// Resolution (PROTOCOL.md §6.4):
-///   1. Among ALL matching rules, the **most restrictive** effective level wins
-///      (deny-override / fail-safe). Ties broken by specificity for a
-///      deterministic ask-cache scope (`(connection, rule_id, method)`).
-///   2. else connection default (read/write floor),
-///   3. else tag default (the service's tags matched against the
-///      `Policy.categories` floor map; several hits → most restrictive wins),
-///   4. else global default,
-///   5. else `ask-always` (safe floor).
-/// `matched_rule_id` / `ttl` are `Some` only when a rule decided (step 1).
+/// matched_rule_id, ttl)`. See [`evaluate_decision`], which also says what
+/// decided it.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_with_match(
     method: &str,
     path: &str,
@@ -658,13 +953,70 @@ pub fn evaluate_with_match(
     policy: &Policy,
     tags: &[String],
 ) -> (AccessLevel, Option<String>, Option<u64>) {
+    let (level, by, ttl) = evaluate_decision(
+        method,
+        path,
+        body,
+        vars,
+        rules,
+        connection_levels,
+        policy,
+        tags,
+    );
+    let id = match by {
+        DecidedBy::Rule { id, .. } => id,
+        DecidedBy::Floor => None,
+    };
+    (level, id, ttl)
+}
+
+/// The stricter of two decisions for one request: `overlay` only where it is
+/// more restrictive than `base`, a tie keeps `base`. How a policy that may
+/// only tighten (a vault definition's) joins the decision made without it.
+pub fn stricter(
+    base: (AccessLevel, DecidedBy, Option<u64>),
+    overlay: (AccessLevel, DecidedBy, Option<u64>),
+) -> (AccessLevel, DecidedBy, Option<u64>) {
+    if overlay.0.restrictiveness() > base.0.restrictiveness() {
+        overlay
+    } else {
+        base
+    }
+}
+
+/// Resolve the access decision for a request, returning `(level, what decided
+/// it, ttl)`.
+///
+/// Resolution (PROTOCOL.md §6.4):
+///   1. Among ALL matching rules, the **most restrictive** effective level wins
+///      (deny-override / fail-safe). Ties broken by specificity for a
+///      deterministic ask-cache scope (`(connection, rule_id, method)`).
+///   2. else connection default (read/write floor),
+///   3. else tag default (the service's tags matched against the
+///      `Policy.categories` floor map; several hits → most restrictive wins),
+///   4. else global default,
+///   5. else `ask-always` (safe floor).
+///
+/// [`DecidedBy::Rule`] when a rule decided (step 1), else
+/// [`DecidedBy::Floor`].
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_decision(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    vars: &VarMap,
+    rules: Option<&Vec<PolicyRule>>,
+    connection_levels: Option<&Levels>,
+    policy: &Policy,
+    tags: &[String],
+) -> (AccessLevel, DecidedBy, Option<u64>) {
     // The `ask`-cache window a matched rule inherits when it pins no `ttl` of
     // its own: the ttl of the most-specific floor (connection → tag → global),
     // the SAME precedence as the read/write floor decision below. Direction-
     // independent (Levels.ttl is a single value). Resolved up front because a
-    // rule decision returns early; consumed only by an `ask` rule (a
-    // floor-`ask` never caches), and a final constant fills in when nothing
-    // pins a window at all.
+    // rule decision returns early; consumed only by an `ask` rule (a floor
+    // decision returns its own floor's ttl), and a final constant fills in
+    // when nothing pins a window at all.
     let floor_ttl = connection_levels
         .and_then(|lv| lv.ttl)
         .or_else(|| {
@@ -691,7 +1043,11 @@ pub fn evaluate_with_match(
         }
         if let Some((_, _, rule, level)) = best {
             // The rule's own ttl wins; else it inherits the default-floor window.
-            return (level, rule.id.clone(), rule.ttl.or(floor_ttl));
+            let by = DecidedBy::Rule {
+                id: rule.id.clone(),
+                label: rule.label.clone(),
+            };
+            return (level, by, rule.ttl.or(floor_ttl));
         }
     }
 
@@ -706,7 +1062,7 @@ pub fn evaluate_with_match(
     };
     if let Some(lv) = connection_levels {
         if let Some((l, ttl)) = pick(lv) {
-            return (l, None, ttl);
+            return (l, DecidedBy::Floor, ttl);
         }
     }
     // A service may carry several tags; if more than one hits a floor that
@@ -718,16 +1074,16 @@ pub fn evaluate_with_match(
         .filter_map(|lv| pick(lv))
         .max_by_key(|(l, _)| l.restrictiveness());
     if let Some((l, ttl)) = tag_hit {
-        return (l, None, ttl);
+        return (l, DecidedBy::Floor, ttl);
     }
     if let Some(lv) = policy.default.as_ref() {
         if let Some((l, ttl)) = pick(lv) {
-            return (l, None, ttl);
+            return (l, DecidedBy::Floor, ttl);
         }
     }
 
     // 5. Safe floor.
-    (AccessLevel::AskAlways, None, None)
+    (AccessLevel::AskAlways, DecidedBy::Floor, None)
 }
 
 // ── Unit Tests ─────────────────────────────────────────────────────────────────
@@ -815,6 +1171,343 @@ mod tests {
         );
         assert_eq!(AccessLevel::parse("nope"), None);
         assert!(AccessLevel::Deny.restrictiveness() > AccessLevel::Allow.restrictiveness());
+    }
+
+    // ── Connection rule edits on scoped paths ────────────────────────────────
+    #[test]
+    fn user_rule_on_a_scoped_path_must_decide_on_bound_fields() {
+        let built_in = vec![rule("pay", "POST /pay", AccessLevel::Ask)];
+        let declared = vec!["amount".to_string(), "memo".to_string()];
+        let binds = vec!["amount".to_string()];
+        let check = |user: &HashMap<String, RuleConfig>, m: &str, p: &str| {
+            unenforceable_user_rule(&built_in, user, m, p, "purchase", &declared, &binds)
+        };
+        let add = |pat: Option<&str>, when: Option<&str>, body: Option<&str>| RuleConfig {
+            match_pattern: pat.map(str::to_string),
+            when: when.map(str::to_string),
+            body: body.map(BodyPattern::lenient),
+            level: Some(AccessLevel::AskAlways),
+            ..Default::default()
+        };
+        let mut user = HashMap::new();
+        // Gating on a bound field is enforceable.
+        user.insert(
+            "big".to_string(),
+            add(Some("POST /pay"), Some("vars.amount > 100"), None),
+        );
+        assert_eq!(check(&user, "POST", "/pay"), None);
+
+        // A declared but unbound field decides: refused, by rule and field.
+        user.insert(
+            "memo".to_string(),
+            add(Some("POST /pay"), Some("vars.memo == \"x\""), None),
+        );
+        let e = check(&user, "post", "/pay").expect("refused");
+        assert!(e.contains("'memo'") && e.contains("vars.memo"), "{e}");
+        assert!(!e.contains('\u{2014}'), "no em dash in copy");
+        // Only where the rule's match covers the request.
+        assert_eq!(check(&user, "POST", "/other"), None);
+        user.remove("memo");
+
+        // Qualified by this shape: the same field; by another shape: never
+        // resolves here, so not refused. An undeclared var never fires.
+        user.insert(
+            "q".to_string(),
+            add(Some("POST /pay"), Some("vars.purchase.memo == 1"), None),
+        );
+        assert!(check(&user, "POST", "/pay").is_some());
+        user.insert(
+            "q".to_string(),
+            add(Some("POST /pay"), Some("vars.refund.memo == 1"), None),
+        );
+        assert_eq!(check(&user, "POST", "/pay"), None);
+        user.insert(
+            "q".to_string(),
+            add(Some("POST /pay"), Some("vars.nope == 1"), None),
+        );
+        assert_eq!(check(&user, "POST", "/pay"), None);
+        user.remove("q");
+
+        // An override of a built-in rule by id is checked on the built-in's
+        // match, with the built-in's level.
+        user.insert(
+            "pay".to_string(),
+            RuleConfig {
+                when: Some("vars.memo == 1".into()),
+                ..Default::default()
+            },
+        );
+        assert!(check(&user, "POST", "/pay").unwrap().contains("'pay'"));
+        user.remove("pay");
+
+        // A body match on a covered scoped path: refused (the body is never bound).
+        user.insert("b".to_string(), add(Some("/pay"), None, Some("refund")));
+        let e = check(&user, "POST", "/pay").expect("refused");
+        assert!(e.contains("'b'") && e.contains("body"), "{e}");
+        assert_eq!(check(&user, "POST", "/elsewhere"), None);
+        user.remove("b");
+
+        // `allow` / `deny` edits mint no approval: never refused.
+        for level in [AccessLevel::Allow, AccessLevel::Deny] {
+            let mut only = HashMap::new();
+            only.insert(
+                "protect".to_string(),
+                RuleConfig {
+                    level: Some(level),
+                    ..add(Some("POST /pay"), Some("vars.memo == 1"), Some("bitcoin"))
+                },
+            );
+            assert_eq!(check(&only, "POST", "/pay"), None, "{level:?}");
+        }
+
+        // A declared var whose own name has a dot resolves verbatim, as at
+        // evaluation.
+        let dotted = vec!["a.b".to_string(), "amount".to_string()];
+        let mut only = HashMap::new();
+        only.insert(
+            "d".to_string(),
+            add(Some("POST /pay"), Some("vars.a.b == 1"), None),
+        );
+        assert!(unenforceable_user_rule(
+            &built_in, &only, "POST", "/pay", "purchase", &dotted, &binds
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn scoped_check_judges_the_merged_rule() {
+        // A built-in `deny` that decides on the body; an edit of only its
+        // level to `ask` produces an ask that decides on the body, which an
+        // approval on this scoped path does not bind: refused.
+        let built_in = vec![PolicyRule {
+            body: Some(BodyPattern::compile("gift").unwrap()),
+            ..rule("gifts", "POST /pay", AccessLevel::Deny)
+        }];
+        let declared = vec!["amount".to_string()];
+        let binds = vec!["amount".to_string()];
+        let check = |user: &HashMap<String, RuleConfig>| {
+            unenforceable_user_rule(
+                &built_in, user, "POST", "/pay", "purchase", &declared, &binds,
+            )
+        };
+        let mut user = HashMap::new();
+        assert_eq!(check(&user), None, "the built-in deny mints no approval");
+        user.insert(
+            "gifts".to_string(),
+            RuleConfig {
+                level: Some(AccessLevel::Ask),
+                ..Default::default()
+            },
+        );
+        let e = check(&user).expect("level-only edit on a body rule");
+        assert!(e.contains("'gifts'") && e.contains("body"), "{e}");
+        // A `ttl`-only edit keeps the deny: nothing to refuse.
+        user.insert(
+            "gifts".to_string(),
+            RuleConfig {
+                ttl: Some(60),
+                ..Default::default()
+            },
+        );
+        assert_eq!(check(&user), None);
+        // A built-in ask gated on a field this shape does not bind, edited
+        // only in ttl: the merged rule still decides on that field.
+        let built_in = vec![PolicyRule {
+            when: Some("vars.memo == 1".into()),
+            ..rule("memo", "POST /pay", AccessLevel::Ask)
+        }];
+        let declared = vec!["amount".to_string(), "memo".to_string()];
+        let mut user = HashMap::new();
+        user.insert(
+            "memo".to_string(),
+            RuleConfig {
+                ttl: Some(60),
+                ..Default::default()
+            },
+        );
+        assert!(unenforceable_user_rule(
+            &built_in, &user, "POST", "/pay", "purchase", &declared, &binds
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn method_word_is_case_insensitive_at_every_source() {
+        assert_eq!(
+            parse_match_pattern("delete /repos/*/*"),
+            (Some("delete"), "/repos/*/*")
+        );
+        assert_eq!(parse_match_pattern("Patch /x"), (Some("Patch"), "/x"));
+        assert_eq!(parse_match_pattern("/x"), (None, "/x"));
+        // A user edit's `match` is read the same way.
+        let mut user = HashMap::new();
+        user.insert(
+            "del".to_string(),
+            RuleConfig {
+                match_pattern: Some("delete /repos/*/*".into()),
+                level: Some(AccessLevel::Deny),
+                ..Default::default()
+            },
+        );
+        let rules = merge_rules(&[], &user);
+        let level = evaluate(
+            "DELETE",
+            "/repos/o/r",
+            None,
+            &VarMap::new(),
+            Some(&rules),
+            None,
+            &policy(),
+            &[],
+        );
+        assert_eq!(level, AccessLevel::Deny);
+        // Specificity counts the method in any case.
+        assert_eq!(
+            specificity(&rule("a", "delete /x", AccessLevel::Ask)),
+            specificity(&rule("b", "DELETE /x", AccessLevel::Ask))
+        );
+    }
+
+    #[test]
+    fn match_patterns_that_cannot_match_are_named() {
+        for good in [
+            "/x",
+            "GET /x",
+            "get /x/*",
+            "/repos/*/*/git/refs/**",
+            "POST /",
+        ] {
+            assert_eq!(match_pattern_problem(good), None, "{good}");
+        }
+        for bad in [
+            "x", "GET x", "/a b", "/x?y=1", "/x#f", "/a/**/b", "GE T /x", "",
+        ] {
+            assert!(match_pattern_problem(bad).is_some(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn pattern_overlap() {
+        assert!(patterns_overlap("POST /buy", "POST /buy"));
+        assert!(patterns_overlap("/buy", "POST /buy"));
+        assert!(patterns_overlap("post /buy", "POST /buy"));
+        assert!(patterns_overlap("POST /*", "POST /buy"));
+        assert!(patterns_overlap("/**", "POST /a/b"));
+        assert!(patterns_overlap("/a/**", "/a/*/c"));
+        assert!(patterns_overlap("/a/**", "/*/b/**"));
+        assert!(!patterns_overlap("GET /buy", "POST /buy"));
+        assert!(!patterns_overlap("POST /buy", "POST /refund"));
+        assert!(!patterns_overlap("/a/*", "/a/b/c"));
+        assert!(!patterns_overlap("/a/**", "/a"));
+        assert!(!patterns_overlap("/a/b/**", "/a/c/d"));
+    }
+
+    #[test]
+    fn body_patterns_compile_once_and_unreadable_ones_never_loosen() {
+        let p = BodyPattern::compile("gift|card").unwrap();
+        assert_eq!(p.is_match("a gift"), Some(true));
+        assert_eq!(p.is_match("cash"), Some(false));
+        assert!(BodyPattern::compile("(unclosed").is_err());
+        assert!(BodyPattern::compile(&"a".repeat(2000)).is_err());
+        // Serde: a sealed user edit with a bad pattern still loads.
+        let edit: RuleConfig = serde_json::from_value(
+            serde_json::json!({"match": "POST /x", "body": "(", "level": "deny"}),
+        )
+        .unwrap();
+        let body = edit.body.as_ref().unwrap();
+        assert!(body.error().is_some());
+        assert_eq!(serde_json::to_value(body).unwrap(), serde_json::json!("("));
+        // The rule that carries it restricts everywhere its match covers, and
+        // never allows.
+        let with = |level| {
+            vec![PolicyRule {
+                body: Some(BodyPattern::lenient("(")),
+                ..rule("r", "POST /x", level)
+            }]
+        };
+        let floor = Levels {
+            read: Some(AccessLevel::Allow),
+            write: Some(AccessLevel::Ask),
+            ttl: None,
+        };
+        let decide = |rules: &Vec<PolicyRule>| {
+            evaluate(
+                "POST",
+                "/x",
+                Some("anything"),
+                &VarMap::new(),
+                Some(rules),
+                Some(&floor),
+                &policy(),
+                &[],
+            )
+        };
+        assert_eq!(decide(&with(AccessLevel::Deny)), AccessLevel::Deny);
+        assert_eq!(
+            decide(&with(AccessLevel::AskAlways)),
+            AccessLevel::AskAlways
+        );
+        assert_eq!(
+            decide(&with(AccessLevel::Allow)),
+            AccessLevel::Ask,
+            "falls to the floor"
+        );
+    }
+
+    // ── Method normalization (fail closed) ───────────────────────────────────
+    #[test]
+    fn only_get_head_options_are_reads() {
+        for m in ["GET", "HEAD", "OPTIONS", "get", "Head", "options"] {
+            assert!(!is_write_method(m), "{m} is a read");
+        }
+        for m in [
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "delete",
+            "MOVE",
+            "PROPPATCH",
+            "COPY",
+            "MKCOL",
+            "TRACE",
+            "",
+        ] {
+            assert!(is_write_method(m), "{m} is a write");
+        }
+    }
+
+    #[test]
+    fn rule_method_matches_case_insensitively() {
+        let rules = vec![rule("del", "DELETE /x", AccessLevel::Deny)];
+        let floor = Levels {
+            read: Some(AccessLevel::Allow),
+            write: Some(AccessLevel::Ask),
+            ttl: None,
+        };
+        let decide = |m: &str| {
+            evaluate_decision(
+                m,
+                "/x",
+                None,
+                &VarMap::new(),
+                Some(&rules),
+                Some(&floor),
+                &policy(),
+                &[],
+            )
+        };
+        // A lowercase `delete` hits the DELETE rule, never a floor.
+        let (level, by, _) = decide("delete");
+        assert_eq!(level, AccessLevel::Deny);
+        assert!(matches!(by, DecidedBy::Rule { id: Some(ref id), .. } if id == "del"));
+        // An extension method falls to the WRITE floor, not the read one.
+        for m in ["MOVE", "PROPPATCH", "propfind"] {
+            let (level, by, _) = decide(m);
+            assert_eq!(by, DecidedBy::Floor);
+            assert_eq!(level, AccessLevel::Ask, "{m} takes the write floor");
+        }
+        assert_eq!(decide("GET").0, AccessLevel::Allow);
     }
 
     // ── Path matching / specificity (unchanged engine) ───────────────────────

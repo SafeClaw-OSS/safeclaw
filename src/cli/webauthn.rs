@@ -158,18 +158,48 @@ pub async fn create_op(
     vault: &str,
     op: &Value,
 ) -> Result<(String, String), String> {
+    let c = create_op_full(custodian, vault, op).await?;
+    Ok((c.op_id, c.r))
+}
+
+/// A created op as the daemon returned it. `waiter_secret` is present for an
+/// Export only (E1): the one credential that releases its value and lets this
+/// process withdraw it. Never printed or logged.
+pub struct CreatedOp {
+    pub op_id: String,
+    pub r: String,
+    pub waiter_secret: Option<String>,
+    /// The op as the daemon STORED it (a defaulted `valid.exp`, a stamped
+    /// connection-add card). A local gesture signs this, never the request
+    /// body. `None` from an older daemon.
+    pub op: Option<Value>,
+}
+
+/// When this CLI runs as an agent (`SAFECLAW_AGENT_IDENTITY` names its
+/// identity file), a proof of possession over exactly `op` for `vault`, so the
+/// approval names the agent instead of a bare terminal. The daemon verifies it
+/// and drops any unproven claim; this is display and consent information, not
+/// access control. `None` (no attribution) when there is no agent identity or
+/// the op does not parse.
+fn agent_op_token(vault: &str, op: &Value) -> Option<String> {
+    let signer = crate::agent_pop::signer_from_env()?;
+    let op: crate::protocol::operation::Operation = serde_json::from_value(op.clone()).ok()?;
+    signer.op_token(vault, &op, crate::util::now_unix())
+}
+
+/// [`create_op`] keeping the Export `waiter_secret`.
+pub async fn create_op_full(custodian: &str, vault: &str, op: &Value) -> Result<CreatedOp, String> {
     let client = http_client()?;
     let url = format!(
         "{}/v/{}/op",
         custodian.trim_end_matches('/'),
         urlencoding::encode(vault)
     );
-    let resp = client
-        .post(&url)
-        .json(op)
-        .send()
-        .await
-        .map_err(|e| format!("create op: {}", e))?;
+    let mut req = client.post(&url).json(op);
+    if let Some(token) = agent_op_token(vault, op) {
+        req = req.header(crate::agent_pop::OP_POP_HEADER, token);
+    }
+    let resp = req.send().await.map_err(|e| format!("create op: {}", e))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -184,7 +214,14 @@ pub async fn create_op(
     let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
     let op_id = body["op_id"].as_str().ok_or("no op_id")?.to_string();
     let r = body["r"].as_str().ok_or("no r")?.to_string();
-    Ok((op_id, r))
+    let waiter_secret = body["waiter_secret"].as_str().map(str::to_string);
+    let op = body.get("op").filter(|v| v.is_object()).cloned();
+    Ok(CreatedOp {
+        op_id,
+        r,
+        waiter_secret,
+        op,
+    })
 }
 
 pub fn compute_beta(r: &[u8], op: &Value) -> Result<Vec<u8>, String> {

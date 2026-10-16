@@ -1,8 +1,7 @@
 # Security model: where your keys actually live
 
-Straight answers to the questions that decide whether you trust a credential
-broker. The cryptographic detail behind each one is in
-[PROTOCOL.md](https://github.com/SafeClaw-OSS/safeclaw/blob/main/design/protocol.md).
+This page answers the security questions about SafeClaw's credential broker. The cryptographic detail behind each one is in
+[PROTOCOL.md](https://github.com/getsafeclaw/safeclaw/blob/main/design/protocol.md).
 
 ## Where is the plaintext?
 
@@ -30,7 +29,7 @@ Enroll a backup passkey (your vault's Passkeys tab) the day you set up.
 
 Less than you'd fear. It holds phantoms, which are inert everywhere except
 SafeClaw's proxy. Through the proxy it can spend a credential only toward that
-connection's own hosts, under your policy, and sensitive actions block until
+connection's own hosts, under your policy, and sensitive actions wait until
 you approve them with a passkey. What it cannot do: read a value, send a
 credential to an attacker's host, or approve its own requests. Exfiltrating a
 key it never held is not on the table.

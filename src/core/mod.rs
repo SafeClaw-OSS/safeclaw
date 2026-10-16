@@ -2,6 +2,7 @@
 //! forwarding, approval flow. Ported from the per-VM dev branch and adapted
 //! for the SaaS multi-vault custodian.
 
+pub mod egress;
 pub mod forward;
 pub mod host;
 pub mod policy;

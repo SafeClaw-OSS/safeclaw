@@ -63,6 +63,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Set up this machine and one agent without prompting. Re-run the command
+    /// after completing each browser approval until it reports done.
+    Setup(SetupArgs),
+    /// Install or remove the SafeClaw agent skill.
+    Skill(SkillArgs),
     /// Print SafeClaw's status: the daemon (running? version) and the active
     /// vault (which one, locked/unlocked, key count).
     Status(StatusArgs),
@@ -135,7 +140,7 @@ pub enum Command {
     /// The DEVICE axis of the account plane: `sc device login/logout` are the
     /// canonical spellings of top-level `sc login`/`sc logout` (kept as
     /// shortcuts). Symmetric with `sc agent *` — both are account-level,
-    /// device-key/pair-token authed, cloud-backed.
+    /// device-key authed, cloud-backed.
     Device(DeviceArgs),
     /// Print `export` lines for the HUMAN's shell (`eval "$(sc env)"`):
     /// SAFECLAW_BROKER_URL projected from this device's config — never a key,
@@ -146,10 +151,9 @@ pub enum Command {
     /// verify its sha256, and replace the running binary in place. No-op when
     /// already current. This is also how the baked cloud domain changes ship.
     Upgrade(UpgradeArgs),
-    /// Pair this host to your vault: exchange a one-shot pair-token (from
-    /// safeclaw.pro's "Connect a new agent" modal) for this host's persistent
-    /// cloud-side daemon credential. Writes `~/.safeclaw/device-key` (0600) and
-    /// sets the active vault. Run once per host (re-run to repair/re-pair).
+    /// Pair this host to your SafeClaw account: prints a short code and an
+    /// approval link; you approve in the browser, then this host gets its
+    /// cloud-side daemon credential. Writes `~/.safeclaw/device-key` (0600). Run once per host (re-run to repair/re-pair).
     /// `sc login` then brings the daemon up and unlocks for you; `sc up` is the
     /// everyday "make sure it's running" afterwards.
     Login(LoginArgs),
@@ -195,9 +199,9 @@ pub enum Command {
     /// Health + reachability checks: daemon connectivity, active
     /// profile, API key presence. Read-only; no vault state mutation.
     Doctor(CommonArgs),
-    /// Work with service.toml definitions. Today: `service validate <path>`
-    /// runs the static safety checks the console upload editor enforces.
-    /// Offline, no daemon needed.
+    /// Service definitions in the active vault, added from sources: a local
+    /// folder or a GitHub repository pinned to a commit (add / update / ls /
+    /// rm), and `validate` to run the same checks offline.
     Service(ServiceArgs),
     /// git credential helper — **invoked by git, not users**. Registered
     /// per-process by `sc run` (`GIT_CONFIG_KEY_*=credential.helper`,
@@ -210,9 +214,8 @@ pub enum Command {
     /// the only thing it ever prints.
     #[command(name = "git-credential", hide = true)]
     GitCredential(GitCredentialArgs),
-    /// Approval ops. `sc op wait <op_id>` blocks until the op resolves — the
-    /// waiter an agent backgrounds after a pending-approval reply; its exit
-    /// is the wake-up (0 approved, 5 rejected, 3 expired, 4 timeout).
+    /// Approval ops. `sc op wait <op_id>` blocks until the op resolves; its
+    /// exit code is the outcome (`sc op wait --help`).
     Op(OpArgs),
 }
 
@@ -240,11 +243,11 @@ pub struct ConnectArgs {
     /// be prompted (with the rest of the wizard); required off a terminal.
     #[arg(value_name = "ID")]
     pub name: Option<String>,
-    /// Back this connection with a catalog SERVICE — its id from `sc registry`
-    /// (e.g. `github`), which supplies the hosts + declared secret keys. `--host`
+    /// Back this connection with a catalog SERVICE: its id from `sc registry`
+    /// (e.g. `github`), which supplies the hosts + declared secret slots. `--host`
     /// then only PINS an exact FQDN inside one of the service's `*.suffix`
-    /// wildcards. Omit for a raw connection (you anchor your own `--host` +
-    /// `--secret`).
+    /// wildcards. Omit for a raw connection (you anchor your own `--host` and
+    /// fill its keys with `--from-literal` / `--from-secret`).
     #[arg(long)]
     pub service: Option<String>,
     /// Anchored egress host (exact domain, repeatable). Required for a raw
@@ -252,16 +255,26 @@ pub struct ConnectArgs {
     /// `--service` connection: optional, and each must be ⊆ the service's hosts.
     #[arg(long)]
     pub host: Vec<String>,
-    /// A secret to store on this connection: `KEY=VALUE` (non-interactive) or a
-    /// bare `KEY` (prompts for a hidden value on a TTY). Repeatable.
-    #[arg(long)]
-    pub secret: Vec<String>,
-    /// Back this connection with an EXISTING vault secret named KEY (no new
-    /// value). KEY is matched as typed: native keys fold to their stored
-    /// UPPERCASE form; an external store's key (e.g. a lowercase GCP secret
-    /// id) is matched exactly. Repeatable.
-    #[arg(long)]
-    pub use_existing: Vec<String>,
+    /// Fill a slot with a NEW secret value, written to the vault when the
+    /// connection is approved: `SLOT=VALUE`. With `--service`, SLOT is one of
+    /// the service's declared secret roles (case-insensitive); for a raw
+    /// connection SLOT is the vault KEY itself (stored UPPERCASE). A bare `SLOT`
+    /// prompts for the value with hidden input on a terminal. Repeatable.
+    #[arg(long = "from-literal", value_name = "SLOT=VALUE")]
+    pub from_literal: Vec<String>,
+    /// Fill a slot with a secret ALREADY in the vault, by its KEY; no value is
+    /// written or shown: `SLOT=KEY`. With `--service`, SLOT is one of the
+    /// service's declared secret roles and the `SLOT=KEY` form is required; for
+    /// a raw connection SLOT is the KEY itself, so `--from-secret KEY` is the
+    /// short form. KEY is matched as typed: native keys fold to their stored
+    /// UPPERCASE form; an external store's key (e.g. a lowercase GCP secret id)
+    /// is matched exactly. Repeatable. The service's primary credential slot
+    /// (its token, or the refresh token it mints from) is required: named by
+    /// neither flag, it is prompted for (hidden) on a terminal and is an error
+    /// off one. Its other slots are optional: offered on a terminal (blank
+    /// skips), left unfilled otherwise.
+    #[arg(long = "from-secret", value_name = "SLOT=KEY")]
+    pub from_secret: Vec<String>,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
@@ -279,10 +292,14 @@ pub struct ConnectionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ConnectionSubcommand {
-    /// Create a connection (secret(s) + host anchor) in one unlock+write cycle.
-    /// On a terminal, `sc connection add` with no args runs a short wizard
-    /// (id → optional service → host(s) → secret(s)); off a terminal, pass the
-    /// `<id>` and `--host`/`--secret` (or `--service`) as flags.
+    /// Create a connection (secret(s) + host anchor) in one approval. Each secret
+    /// slot is filled from a new value (`--from-literal SLOT=VALUE`) or from a
+    /// secret already in the vault (`--from-secret SLOT=KEY`). An agent may run
+    /// this to propose a connection; it takes effect only after the vault
+    /// owner approves it with a passkey, on a card that lists every bound key
+    /// and every destination host. On a terminal, `sc connection add` with no
+    /// args runs a short wizard (id → optional service → host(s) → secret(s));
+    /// off a terminal, pass the `<id>` and the flags.
     Add(ConnectArgs),
     /// List the connections the agent can use (id, hosts, phantoms). Requires an
     /// unlocked vault. `--json` for scripts.
@@ -340,8 +357,10 @@ pub struct ConnectionRmArgs {
     #[arg(long, short = 'y')]
     pub yes: bool,
     /// Remove only the connection record and keep every secret value in the
-    /// vault (unreference). Default deletes the keys ONLY this connection
-    /// references; keys other connections still reference are always kept.
+    /// vault (unreference). Default deletes the keys this connection WROTE
+    /// that no other connection references; a key it only bound
+    /// (`--from-secret`), a key another connection references, and every key
+    /// of a connection added before write tracking are always kept.
     #[arg(long)]
     pub keep_secrets: bool,
     #[arg(long)]
@@ -362,6 +381,14 @@ pub struct OpArgs {
 #[derive(Debug, Subcommand)]
 pub enum OpSubcommand {
     /// Block until an approval op resolves; the exit code carries the outcome.
+    ///
+    /// Exit codes:
+    ///   0  approved: re-run the original command
+    ///   5  not approved: do not retry it unchanged
+    ///   6  withdrawn or replaced by a newer request: re-run to ask again
+    ///   3  expired or unknown: re-run for a fresh approval link
+    ///   4  stopped waiting (--timeout): the op may still be pending; wait again
+    #[command(verbatim_doc_comment)]
     Wait(OpWaitArgs),
 }
 
@@ -418,32 +445,72 @@ pub struct ServiceArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ServiceSubcommand {
-    /// Validate a service.toml definition against the broker's safety rules.
-    /// Prints each problem and exits non-zero on failure.
-    Validate(ServiceValidateArgs),
-    /// Store a validated custom service definition in the active vault
-    /// (`aux.services`), so its connections show up in the catalog and can be
-    /// added like any built-in. Validates the v4 schema first; the daemon
-    /// re-validates (v4 schema, no tool-named sections) at unlock before it
-    /// can broker. Two passkey gestures (unlock + write).
+    /// Add service definitions from a source to the active vault, with one
+    /// passkey approval whose card lists each service, every host its
+    /// credentials may be sent to, the rules it applies, and the source.
+    /// SOURCE: `./path` or `/abs/path` (a service folder with service.toml
+    /// and an optional policy.toml, or a collection folder with
+    /// services/<id>/...), or `github:owner/repo[:sub/path]` (`git:` works
+    /// too), pinned to a full commit. GitHub only for now.
     Add(ServiceAddArgs),
-    /// List the vault's custom service definitions (`aux.services`) with each
-    /// one's validation status — an INVALID definition is silently skipped by
-    /// the daemon (its connections stay stuck), and the console only surfaces
-    /// definitions that have a connection, so this is where orphaned or broken
-    /// defs become visible. One passkey gesture (unlock, read-only).
+    /// Update definitions from their source. A GitHub source proposes the
+    /// repository's default branch head (or `--ref`); a local source is re-read
+    /// only when you pass its path again (`sc service update ./path`). Shows
+    /// what changes, highlighting new hosts and loosened or removed rules,
+    /// then asks for the passkey approval (always required).
+    Update(ServiceUpdateArgs),
+    /// List the vault's service definitions grouped by source, with the
+    /// pinned commit and whether each is loaded or skipped (and why). Reads
+    /// the unlocked vault; no network, no passkey.
     Ls(ServiceLsArgs),
-    /// Delete a custom service definition from the vault (`aux.services`).
-    /// Warns when connections still reference it (they keep working off stored
-    /// secrets but lose the service backing). Two passkey gestures
-    /// (unlock + write).
+    /// Remove one service, or every service of a source
+    /// (`github:owner/repo[:path]` or `./path`). Connections that use them are
+    /// kept but stop working; they are listed first. One passkey approval.
     Rm(ServiceRmArgs),
+    /// Run the checks `add` runs on a source (the definition gate, and that no
+    /// id is a built-in one), without a vault. Exits non-zero on any problem.
+    Validate(ServiceValidateArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ServiceAddArgs {
-    /// Path to the v4 service.toml to store in the vault.
-    pub path: std::path::PathBuf,
+    /// `./path`, `/abs/path`, or `github:owner/repo[:sub/path]`.
+    pub source: String,
+    /// Store a single-service source under this id instead of its own (when
+    /// it collides with a built-in service or another source's).
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
+    /// Branch or tag of a GitHub source (default: its default
+    /// branch). Resolved to a full commit and pinned.
+    #[arg(long = "ref", value_name = "REF")]
+    pub git_ref: Option<String>,
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Fixed port for the localhost callback server (for SSH port-forwarding).
+    #[arg(long, env = "SAFECLAW_CB_PORT")]
+    pub cb_port: Option<u16>,
+    #[arg(long, default_value = "120")]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceUpdateArgs {
+    /// A service id or a source (`github:owner/repo[:path]`, `./path`).
+    #[arg(required_unless_present = "all")]
+    pub target: Option<String>,
+    /// Update every GitHub source in the vault.
+    #[arg(long, conflicts_with_all = ["target", "git_ref"])]
+    pub all: bool,
+    /// Show what would change; change nothing.
+    #[arg(long)]
+    pub check: bool,
+    /// Skip the terminal confirmation (the passkey approval is still required).
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Update a GitHub source to this branch or tag instead of its
+    /// default branch head.
+    #[arg(long = "ref", value_name = "REF")]
+    pub git_ref: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
@@ -455,19 +522,15 @@ pub struct ServiceAddArgs {
 
 #[derive(Debug, Args)]
 pub struct ServiceLsArgs {
-    #[arg(long)]
-    pub no_browser: bool,
-    /// Fixed port for the localhost callback server (for SSH port-forwarding).
-    #[arg(long, env = "SAFECLAW_CB_PORT")]
-    pub cb_port: Option<u16>,
-    #[arg(long, default_value = "120")]
-    pub timeout: u64,
+    /// Show one service in detail.
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct ServiceRmArgs {
-    /// The service id to delete (as shown by `sc service ls`).
-    pub id: String,
+    /// A service id, or a source (`github:owner/repo[:path]`, `./path`) to
+    /// remove all of its services.
+    pub target: String,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
@@ -479,13 +542,11 @@ pub struct ServiceRmArgs {
 
 #[derive(Debug, Args)]
 pub struct ServiceValidateArgs {
-    /// Path to the service.toml to validate.
-    pub path: std::path::PathBuf,
-    /// Validate as a first-party (trusted) definition — allows exec /
-    /// non-upstream steps. Default: validate as an UPLOADED definition (exec
-    /// forbidden), i.e. the same strict checks the console upload editor applies.
-    #[arg(long)]
-    pub first_party: bool,
+    /// `./path`, `/abs/path`, or `github:owner/repo[:sub/path]`.
+    pub source: String,
+    /// Branch or tag of a GitHub source.
+    #[arg(long = "ref", value_name = "REF")]
+    pub git_ref: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -511,9 +572,8 @@ pub enum AgentSubcommand {
     Add(AgentAddArgs),
     /// List this account's agents (name, key prefix, last-used).
     Ls,
-    /// Revoke an agent by name (or key prefix / id). Propagates to every
-    /// device in under a second over the sync stream (one poll cycle when a
-    /// device is offline or unstreamed).
+    /// Remove an agent: prints the SafeClaw console page where the owner signs
+    /// the removal. Every device refuses the agent at its next ledger pull.
     Rm(AgentRmArgs),
 }
 
@@ -527,8 +587,67 @@ pub struct AgentAddArgs {
 
 #[derive(Debug, Args)]
 pub struct AgentRmArgs {
-    /// Agent name, key prefix, or id (see `sc agent ls`).
+    /// Agent name (see `sc agent ls`).
     pub name: String,
+}
+
+/// `sc setup` is an agent-driven, re-runnable state machine. `name` stays
+/// optional at clap's boundary so the command can return its structured usage
+/// error instead of clap writing a different shape to stderr.
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// A short name identifying the agent being set up, such as claude-code.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// First-party environment selector: prod (default) or dev.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Wait briefly for an already-running setup background process.
+    #[arg(long)]
+    pub wait: bool,
+    /// Internal detached-background entrypoint.
+    #[arg(long, hide = true)]
+    pub background: bool,
+    /// Print the detected agent name and exit.
+    #[arg(long, hide = true)]
+    pub detect_agent: bool,
+    /// Internal setup phase run by the detached background process.
+    #[arg(long, hide = true, value_enum)]
+    pub phase: Option<SetupPhase>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum SetupPhase {
+    Device,
+    Agent,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillArgs {
+    #[command(subcommand)]
+    pub sub: SkillSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillSubcommand {
+    /// Install or update the SafeClaw skill for agents on this machine.
+    Install(SkillInstallArgs),
+    /// Remove the skill files previously written by SafeClaw.
+    Remove(SkillRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SkillInstallArgs {
+    /// Replace a copy that was modified after SafeClaw installed it.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillRemoveArgs {
+    /// Remove a copy that was modified after SafeClaw installed it.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// `sc device` — the device axis of the account plane.
@@ -552,9 +671,8 @@ pub enum PasskeySubcommand {
     /// credential id, device name, transports, timestamps). No vault
     /// unlock or passkey gesture required.
     Ls(CommonArgs),
-    /// Add a new passkey (cross-device or same-device). NOT YET
-    /// IMPLEMENTED, needs the daemon-side `/cli/auth?op=enroll-passkey`
-    /// page and the same crypto vendoring as `sc setup`.
+    /// Add a passkey: prints the SafeClaw console page where passkeys are
+    /// enrolled (in the browser, where the identity key lives).
     Add(CommonArgs),
     /// Remove an enrolled passkey by credential id. NOT YET IMPLEMENTED.
     Rm(PasskeyRemoveArgs),
@@ -593,10 +711,8 @@ pub enum VaultSubcommand {
     /// Remove a vault from the local known list (does NOT touch the
     /// daemon, for that use `sc vault rm`). Pass URL or index.
     Forget(VaultForgetArgs),
-    /// Create a new vault. Default = local (http://localhost:23293,
-    /// vault id "default"). Pass --remote <URL> to create on a remote
-    /// custodian (auto-generates a UUID). Saves to config and makes
-    /// the new vault active.
+    /// Create a new vault: prints the SafeClaw console page where vaults are
+    /// created. The new vault syncs to this machine on its own.
     Create(VaultCreateArgs),
     /// Irreversibly delete a vault's daemon-side state. Passkey-gated
     /// via the standard `/op/{op_id}` browser-callback ceremony.
@@ -630,24 +746,7 @@ pub struct VaultForgetArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct VaultCreateArgs {
-    /// Create on a remote custodian (default is local). Pass the
-    /// custodian root URL like `https://custodian.dev.safeclaw.pro`.
-    #[arg(long)]
-    pub remote: Option<String>,
-    #[arg(long)]
-    pub no_browser: bool,
-    /// Fixed port for the localhost callback server (for SSH forwarding).
-    #[arg(long, env = "SAFECLAW_CB_PORT")]
-    pub cb_port: Option<u16>,
-    #[arg(long, default_value = "120")]
-    pub timeout: u64,
-    /// Reuse an existing registered passkey instead of registering a new one.
-    /// Skips the create() ceremony; uses get() PRF from an already-enrolled
-    /// vault. Saves a browser gesture when the hardware key is already set up.
-    #[arg(long)]
-    pub reuse_passkey: bool,
-}
+pub struct VaultCreateArgs {}
 
 #[derive(Debug, Args)]
 pub struct VaultDeleteArgs {
@@ -775,7 +874,12 @@ pub struct ServeArgs {
 
     /// WebAuthn relying party ID. Defaults to the host part of --origin
     /// (e.g. `custodian.example.com`), which is what 99% of deployments
-    /// want. Override only for eTLD+1 sharing across subdomains.
+    /// want. Override only for eTLD+1 sharing across subdomains. With
+    /// neither --origin nor --rp-id, a daemon paired with the SafeClaw
+    /// console (safeclaw.pro, dev.safeclaw.pro) accepts its root, `app.` and
+    /// `www.` origins under the root RP ID
+    /// (`passkey::webauthn::RelyingParty::console`); any other console
+    /// origin is matched exactly.
     #[arg(long, env = "SAFECLAW_RP_ID")]
     pub rp_id: Option<String>,
 
@@ -856,12 +960,6 @@ pub struct UpgradeArgs {
 /// Args for `sc login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// One-shot pair-token from safeclaw.pro → Connect-a-new-agent modal
-    /// (single-use, format `spt_...`). OMIT it to use Device Flow instead:
-    /// `sc login` with no token asks the cloud for a short code you approve in
-    /// your browser — nothing secret touches the prompt (design §12).
-    #[arg(long)]
-    pub pair_token: Option<String>,
     /// Friendly label shown for this host in the dashboard's device list.
     /// Defaults to the machine's hostname, else `agent-device`.
     #[arg(long)]
@@ -874,9 +972,9 @@ pub struct LoginArgs {
     #[arg(long)]
     pub profile: Option<String>,
     /// Test-only: allow a plaintext `http://` custodian URL. Without this,
-    /// `sc login` refuses non-HTTPS URLs to keep the pair-token off the wire
-    /// in cleartext (a malicious skill prompt could otherwise smuggle in an
-    /// attacker's device-key by suggesting an `http://` custodian).
+    /// `sc login` refuses non-HTTPS URLs (a malicious skill prompt could
+    /// otherwise smuggle in an attacker's device-key by suggesting an
+    /// `http://` custodian).
     /// `http://localhost:*` and `http://127.0.0.1:*` are exempt, that's the
     /// common dev-loopback case and is on-host plaintext.
     #[arg(long)]
@@ -976,8 +1074,10 @@ pub struct Config {
     /// Credential-proxy plane bind port (the hudsucker MITM). S2 binds it.
     pub proxy_port: u16,
     pub listen: String,
+    /// The console origin links point at (`{origin}/vault/<id>`).
     pub origin: String,
-    pub rp_id: String,
+    /// Whose WebAuthn assertions verify: the RP ID and the accepted origins.
+    pub relying_party: crate::passkey::webauthn::RelyingParty,
     pub admin_key: Option<String>,
     pub relay_url: Option<String>,
     /// See `ServeArgs::body_cap` / [`DEFAULT_BODY_CAP`].
@@ -995,17 +1095,18 @@ impl Config {
         // thing that'd want a localhost rpId — isn't used when paired: all
         // approvals route to the cloud /grant page.) An explicit --origin /
         // SAFECLAW_ORIGIN always wins.
+        let explicit = args.origin.is_some() || args.rp_id.is_some();
         let origin = args.origin.unwrap_or_else(|| {
             crate::cli::active::frontend_origin()
                 .unwrap_or_else(|| format!("http://localhost:{}", args.port))
         });
-        // rp_id defaults to origin's host: cheaper than depending on a URL
-        // crate, and we already require origin to be well-formed for WebAuthn
-        // to work. Strips scheme, path, and :port. Falls back to "localhost"
-        // if origin is somehow unparseable.
-        let rp_id = args
-            .rp_id
-            .unwrap_or_else(|| host_from_origin(&origin).unwrap_or_else(|| "localhost".into()));
+        // A paired daemon's console origin (stored at `sc login`, either the
+        // root or its `app.` host) gives the console relying party: the root
+        // RP ID and its root / `app.` / `www.` origins. Explicit --origin /
+        // --rp-id, and a localhost or self-host origin, match exactly; the
+        // rp_id then defaults to the origin's host (scheme, path and :port
+        // stripped; "localhost" if it does not parse).
+        let relying_party = relying_party_for(&origin, explicit, args.rp_id);
         // state_dir default = ~/.safeclaw/state (see `default_state_dir`).
         let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
         Self {
@@ -1014,7 +1115,7 @@ impl Config {
             proxy_port: args.proxy_port,
             listen: args.listen,
             origin,
-            rp_id,
+            relying_party,
             admin_key: args.admin_key,
             relay_url: args.relay_url,
             body_cap: args.body_cap,
@@ -1037,6 +1138,27 @@ pub fn default_state_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./state"))
 }
 
+/// The WebAuthn relying party for `origin`: the SafeClaw console's (root RP
+/// ID, root / `app.` / `www.` origins) when `origin` is one of its hosts and
+/// neither the origin nor the RP ID was given explicitly. Every other origin
+/// (a self-hosted console, localhost) is matched exactly under `rp_id`
+/// (default: the origin's host).
+fn relying_party_for(
+    origin: &str,
+    explicit: bool,
+    rp_id: Option<String>,
+) -> crate::passkey::webauthn::RelyingParty {
+    use crate::passkey::webauthn::RelyingParty;
+    match RelyingParty::console(origin).filter(|_| !explicit) {
+        Some(rp) => rp,
+        None => {
+            let rp_id = rp_id
+                .unwrap_or_else(|| host_from_origin(origin).unwrap_or_else(|| "localhost".into()));
+            RelyingParty::exact(origin, &rp_id)
+        }
+    }
+}
+
 fn host_from_origin(origin: &str) -> Option<String> {
     let after_scheme = origin
         .strip_prefix("https://")
@@ -1047,5 +1169,50 @@ fn host_from_origin(origin: &str) -> Option<String> {
         None
     } else {
         Some(host.to_string())
+    }
+}
+
+#[cfg(test)]
+mod relying_party_tests {
+    use super::*;
+
+    #[test]
+    fn stored_console_origin_gives_the_root_party_explicit_flags_stay_exact() {
+        for stored in ["https://safeclaw.pro", "https://app.safeclaw.pro"] {
+            let rp = relying_party_for(stored, false, None);
+            assert_eq!(rp.rp_id, "safeclaw.pro");
+            assert!(rp.allows("https://safeclaw.pro"));
+            assert!(rp.allows("https://app.safeclaw.pro"));
+            assert!(rp.allows("https://www.safeclaw.pro"));
+            assert!(!rp.allows("https://evil.safeclaw.pro"));
+        }
+        let dev = relying_party_for("https://app.dev.safeclaw.pro", false, None);
+        assert_eq!(dev.rp_id, "dev.safeclaw.pro");
+        // --origin / --rp-id: exactly as given.
+        let explicit = relying_party_for("https://app.safeclaw.pro", true, None);
+        assert_eq!(explicit.rp_id, "app.safeclaw.pro");
+        assert_eq!(
+            explicit.origins,
+            vec!["https://app.safeclaw.pro".to_string()]
+        );
+        let rp_only = relying_party_for("https://safeclaw.pro", true, Some("safeclaw.pro".into()));
+        assert_eq!(rp_only.origins, vec!["https://safeclaw.pro".to_string()]);
+        // Unpaired localhost.
+        let local = relying_party_for("http://localhost:23293", false, None);
+        assert_eq!(local.rp_id, "localhost");
+        assert_eq!(local.origins, vec!["http://localhost:23293".to_string()]);
+        // A self-hosted console: its own hostname is the RP ID and its origin
+        // the only one, whatever its labels.
+        for (stored, host) in [
+            ("https://vault.corp.example", "vault.corp.example"),
+            ("https://app.corp.example", "app.corp.example"),
+            ("https://www.corp.example", "www.corp.example"),
+        ] {
+            let rp = relying_party_for(stored, false, None);
+            assert_eq!(rp.rp_id, host, "{stored}");
+            assert_eq!(rp.origins, vec![stored.to_string()], "{stored}");
+            assert!(!rp.allows(&format!("https://app.{host}")));
+            assert!(!rp.allows(&format!("https://www.{host}")));
+        }
     }
 }

@@ -57,13 +57,6 @@ impl VaultDir {
         Ok(self.dir_for(vault_id)?.join("audit.db"))
     }
 
-    /// `vaults/{vid}/pending-passkeys/` — transient store for cross-device
-    /// add-passkey deposits, one file per pending credential id. Files are
-    /// deleted on Stage 2 consumption or by TTL sweep (1h).
-    pub fn pending_passkeys_dir(&self, vault_id: &str) -> Result<PathBuf> {
-        Ok(self.dir_for(vault_id)?.join("pending-passkeys"))
-    }
-
     pub fn ensure_dir(&self, vault_id: &str) -> Result<PathBuf> {
         let d = self.dir_for(vault_id)?;
         std::fs::create_dir_all(&d)?;

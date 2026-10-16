@@ -1,4 +1,6 @@
-# Policy — 审批策略 (per-action decisions)
+# Policy: 审批策略 (per-action decisions)
+
+This page describes SafeClaw's per-action policy levels and how the policy engine evaluates them.
 
 > 状态:**已实现 (safeclaw v0.9.2)**。源码即权威:`src/core/policy.rs`(类型 + 求值)、
 > `src/service/mod.rs`(recipe 解析)、`src/storage/plaintext.rs`(`VaultAux.policy`)。
@@ -11,7 +13,7 @@
 
 - **risk 是主观的**。GitHub/Google 自己都不给 endpoint 标 risk;由我们(recipe 作者)这个
   第三方去替它打分,是最弱的一种主观。主流做法(MCP tool annotations、HTTP safe/idempotent、
-  Android/Google 的敏感度)要么标**客观行为事实**,要么由**资源拥有方**标——都不是第三方主观分数。
+  Android/Google 的敏感度)要么标**客观行为事实**,要么由**资源拥有方**标::都不是第三方主观分数。
 - **不驱动动作的标注就是噪音**。一个只挂在 UI 上、不改变默认决策的 risk 徽章,只会误导。
 - 用户的心智模型是 **动作 → 决策**("删库,allow 还是 ask?"),risk 在中间插了一层用户没
   授权的间接。
@@ -28,10 +30,10 @@
 | `allow` | 直接放行,不审批 |
 | `ask` | 审批一次,之后在该 rule 的 `ttl` 内复用 |
 | `ask-always` | 每次都审批,永不缓存 |
-| `deny` | 无条件拒绝 |
+| `deny` | 无条件拦截 |
 
 **deny 从不做出厂默认**:SafeClaw 是 gate 非 block。recipe/用户显式把某条 rule 设成 `deny`
-才会拒。
+才会拦截。
 
 ## 3. Recipe `policy.toml` 格式
 
@@ -51,6 +53,8 @@ level = "ask"
 # 可选: body = "<regex>",  ttl = <秒>
 ```
 
+定义里的 `ttl`(rule 或 `[default]`)上限 31536000 秒(一年),超出则整份定义拒收,不截断。console 里 owner 自己的设置不受此限。
+
 `match` = `"METHOD /path"` 或 `"/path"`(任意方法);`*` 匹配一个 path segment。
 **无 `level` 的 rule 被静默跳过**(它永远无法决策)。
 
@@ -59,7 +63,7 @@ level = "ask"
 对一个请求 `(method, path, body)`:
 
 ```
-1. 规则层 — 在所有【匹配的】rule 里,【最严格】的 level 胜(deny-override / fail-safe)。
+1. 规则层: 在所有【匹配的】rule 里,【最严格】的 level 胜(deny-override / fail-safe)。
             平手按 specificity(nginx 最长匹配)tiebreak,使 ask-cache scope 确定。
             匹配但无 level 的 rule → 跳过。
 2. 连接 default floor   (aux.policy.connections.<id>.default 的 read/write)
@@ -74,7 +78,7 @@ level = "ask"
   `read`)在读/写之间取一个 level。这是"从协议事实推默认",零主观。
 - ask 审批缓存 key = `(connection, rule_id, method)`,TTL = 命中 rule 的 `ttl`。
 
-## 5. 封存 schema — 一棵 `aux.policy` 树
+## 5. 封存 schema: 一棵 `aux.policy` 树
 
 `src/storage/plaintext.rs` `VaultAux.policy: Option<Policy>`;fresh vault 为 `None` →
 daemon 用 `Policy::default()`(allow-everywhere floor + `llm`/`channel` 类别 allow)。

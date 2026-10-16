@@ -60,10 +60,44 @@ fn kind_from_str(s: &str) -> Result<IdKind, String> {
 }
 
 /// The identity file path for an agent named `name` (§5). `<home>/.safeclaw/
-/// agents/<name>/identity`.
+/// agents/<dir>/identity`, where `<dir>` is [`agent_dir_name`].
 pub fn agent_identity_path(name: &str) -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "cannot locate home dir".to_string())?;
-    Ok(home.join(".safeclaw").join("agents").join(name).join("identity"))
+    Ok(home
+        .join(".safeclaw")
+        .join("agents")
+        .join(agent_dir_name(name))
+        .join("identity"))
+}
+
+/// The directory an agent's identity lives in. A plain name (`[A-Za-z0-9._-]`, not
+/// `.`/`..`) is used as is, so existing agents keep their path. Any other name (spaces,
+/// brackets, a `/`) becomes a lowercase slug plus 8 hex of SHA-256(name): the path stays
+/// one directory under `agents/`, needs no quoting, and two names never share it.
+pub fn agent_dir_name(name: &str) -> String {
+    let plain = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if plain {
+        return name.to_string();
+    }
+    let mut slug = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "agent" } else { slug };
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(name.as_bytes());
+    let tag: String = h[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{slug}-{tag}")
 }
 
 /// The daemon-local device identity file path (§5). `<home>/.safeclaw/device/
@@ -106,8 +140,7 @@ pub fn write(path: &Path, kind: IdKind, seed: &[u8; 32]) -> Result<String, Strin
         id: id.clone(),
         seed: BASE64.encode(seed),
     };
-    let json =
-        serde_json::to_vec_pretty(&rec).map_err(|e| format!("serialize identity: {e}"))?;
+    let json = serde_json::to_vec_pretty(&rec).map_err(|e| format!("serialize identity: {e}"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
@@ -174,6 +207,25 @@ pub fn load(path: &Path) -> Result<LoadedIdentity, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_agent_dir_is_one_plain_directory() {
+        assert_eq!(super::agent_dir_name("claude"), "claude");
+        assert_eq!(super::agent_dir_name("deploy-bot_2.0"), "deploy-bot_2.0");
+        let d = super::agent_dir_name("Claude Code (VM)");
+        assert!(
+            d.starts_with("claude-code-vm-") && d.len() == "claude-code-vm-".len() + 8,
+            "{d}"
+        );
+        assert_ne!(d, super::agent_dir_name("claude code vm"));
+        for hostile in ["..", ".", "../../.ssh", "a/b", ""] {
+            let d = super::agent_dir_name(hostile);
+            assert!(
+                !d.contains('/') && d != ".." && d != "." && !d.is_empty(),
+                "{hostile:?} -> {d:?}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

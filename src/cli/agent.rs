@@ -18,7 +18,7 @@ use crate::device_auth::DikRequestExt;
 
 pub async fn run(sub: AgentSubcommand, json: bool) -> Result<(), String> {
     match sub {
-        AgentSubcommand::Add(a) => add(a).await,
+        AgentSubcommand::Add(a) => add_cli(a).await,
         AgentSubcommand::Ls => ls(json).await,
         AgentSubcommand::Rm(a) => rm(a).await,
     }
@@ -30,9 +30,8 @@ fn cloud_and_key() -> Result<(String, String), String> {
     let cloud = cfg
         .cloud_backend
         .filter(|s| !s.is_empty())
-        .ok_or("this device isn't paired — run `sc login --pair-token <token>` first")?;
-    let key = crate::sync::device_key()
-        .ok_or("no device-key — run `sc login --pair-token <token>` first")?;
+        .ok_or("this device isn't paired — run `sc login` first")?;
+    let key = crate::sync::device_key().ok_or("no device-key — run `sc login` first")?;
     Ok((cloud.trim_end_matches('/').to_string(), key))
 }
 
@@ -41,28 +40,6 @@ fn client() -> Result<reqwest::Client, String> {
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client init: {}", e))
-}
-
-/// Device-Flow authorize response for the agent-admission ceremony (§14). Same
-/// shape as `sc login`'s AuthorizeResp — a short-lived code pair the human
-/// approves at `<console>/pair`.
-#[derive(Deserialize)]
-struct PairAuthorizeResp {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    #[serde(default)]
-    verification_uri_complete: Option<String>,
-    #[serde(default)]
-    interval: Option<u64>,
-}
-
-/// Poll response. `status` ∈ { pending, denied, approved }. Any credential the
-/// server returns is ignored — the agent authenticates by its AIK (proof-of-
-/// possession), so admission just needs the `approved` signal.
-#[derive(Deserialize)]
-struct PairPollResp {
-    status: String,
 }
 
 #[derive(Deserialize)]
@@ -78,7 +55,16 @@ struct ListKey {
     last_used_at: Option<String>,
 }
 
-async fn add(args: AgentAddArgs) -> Result<(), String> {
+pub struct AddedAgent {
+    pub identity_path: std::path::PathBuf,
+    pub broker_url: String,
+}
+
+/// Run the agent admission ceremony and persist the identity without printing
+/// its env projection. The `sc agent add` wrapper below retains the command's
+/// existing stdout and stderr exactly; setup background processes consume this result
+/// directly.
+pub async fn add_and_persist(name: &str) -> Result<AddedAgent, String> {
     // Requires a paired device: the cloud backend to run the admission ceremony
     // against comes from `sc login`. (The ceremony's authorize/poll are
     // unauthenticated — the device_code + AIK PoP are the auth — so the
@@ -101,101 +87,51 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // orphan identity file.
     let (seed, ag_id) = crate::identity_file::mint(crate::identity::IdKind::Agent);
     let (aik, _) = crate::identity_file::resolve(crate::identity::IdKind::Agent, &seed);
-    let aik_pub = data_encoding::BASE64.encode(&aik.public_bytes());
-    let identity_path = crate::identity_file::agent_identity_path(&args.name)?;
+    let identity_path = crate::identity_file::agent_identity_path(name)?;
 
-    // ── §14 agent-admission ceremony = the /pair browser confirm ─────────────
-    // Adding an agent to the account is an OWNER decision, symmetric to pairing a
-    // device: it goes through the same Device-Flow /pair page (ONE primitive),
-    // just with principal='agent'. The silent `POST /api/vault/agents` device-key
-    // path is retired — a new agent is now PENDING until the owner approves it in
-    // the browser (admission = session-auth, no passkey/K; vault access stays the
-    // separate K-signed Agents-tab toggle). No secret enters the prompt.
+    // ── §14 agent admission = the same /pair ceremony as a device (C2) ──────
+    // Adding an agent to the account is an OWNER decision: the PAKE short code,
+    // approved in the browser, with principal='agent'. The admit must be signed
+    // by the account this machine is paired to (its pinned owner UIK): an agent
+    // acts as that one account.
+    let pinned = crate::cli::active::account_uik_pub()
+        .ok_or("this machine's pairing predates verified pairing: run `sc login` first")?;
+    let origin = crate::cli::active::console_origin()
+        .ok_or("this machine isn't paired to SafeClaw yet: run `sc login` first")?;
     let client = client()?;
-    let auth_body = serde_json::json!({
-        "principal": "agent",
-        "device_name": args.name,   // the agent's name (reuses the shared column)
-        "device_id": ag_id,
-        "device_pubkey": aik_pub,
-    });
-    let auth_url = format!("{}/api/pair/authorize", cloud);
-    let resp = client
-        .post(&auth_url)
-        .json(&auth_body)
-        .send()
-        .await
-        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
-    if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        // A 404 here usually means the server predates agent admission via /pair,
-        // or `sc` is too old — upgrading is the fix either way.
+    let paired = crate::cli::pair_flow::pair(
+        &client,
+        &crate::cli::pair_flow::PairRequest {
+            principal: "agent",
+            name,
+            principal_id: &ag_id,
+            signer: &aik,
+            sc_pk: None,
+            cloud: &cloud,
+            origin: &origin,
+            restart: "sc agent add",
+        },
+    )
+    .await?;
+    if paired.uik_pub != pinned {
         return Err(format!(
-            "could not start agent authorization (HTTP {}{}). Your `sc` or the \
-             server may be too old — run `sc upgrade` and try again.",
-            code,
-            if detail.trim().is_empty() { String::new() } else { format!(": {}", detail.trim()) }
+            "the agent was approved by another account ({}) than the one this machine is \
+             paired to; it was not set up. Approve it signed in as the paired account.",
+            paired.uik_id
         ));
-    }
-    let auth: PairAuthorizeResp = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse authorize response: {}", e))?;
-
-    // PoP: sign the (secret) device_code with the AIK so the server proves — before
-    // it admits anything — that we hold the key whose pubkey we registered. §12.3.
-    let pop = data_encoding::BASE64.encode(&aik.sign(auth.device_code.as_bytes()));
-
-    let open_uri = auth
-        .verification_uri_complete
-        .as_deref()
-        .unwrap_or(&auth.verification_uri);
-    eprintln!();
-    eprintln!(
-        "To authorize the agent '{}' on your account, open this URL and approve it:",
-        args.name
-    );
-    eprintln!("  {}", open_uri);
-    eprintln!("Verification code: {}", auth.user_code);
-    eprintln!();
-    eprintln!("Waiting for you to approve in the browser…");
-
-    // Poll until approved / denied / expired. Same cadence as `sc login`.
-    let interval = auth.interval.unwrap_or(5).clamp(1, 30);
-    loop {
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-        let presp = client
-            .post(format!("{}/api/pair/poll", cloud))
-            .json(&serde_json::json!({ "device_code": auth.device_code, "pop": pop }))
-            .send()
-            .await
-            .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
-        let status = presp.status();
-        if status.as_u16() == 410 {
-            return Err("authorization code expired before you approved it; run `sc agent add` again.".to_string());
-        }
-        if !status.is_success() {
-            let detail = presp.text().await.unwrap_or_default();
-            return Err(format!(
-                "agent authorization failed (HTTP {}{})",
-                status.as_u16(),
-                if detail.trim().is_empty() { String::new() } else { format!(": {}", detail.trim()) }
-            ));
-        }
-        let poll: PairPollResp = presp
-            .json()
-            .await
-            .map_err(|e| format!("parse poll response: {}", e))?;
-        match poll.status.as_str() {
-            "pending" => continue,
-            "denied" => return Err("agent authorization was declined in the browser.".to_string()),
-            "approved" => break,
-            other => return Err(format!("unexpected authorization status '{}'", other)),
-        }
     }
 
     // Admitted — NOW persist the AIK identity file (0600).
     crate::identity_file::write(&identity_path, crate::identity::IdKind::Agent, &seed)?;
+
+    Ok(AddedAgent {
+        identity_path,
+        broker_url,
+    })
+}
+
+async fn add_cli(args: AgentAddArgs) -> Result<(), String> {
+    let added = add_and_persist(&args.name).await?;
 
     // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
     // The agent's env is now just TWO non-secret lines: the daemon's API face and
@@ -204,8 +140,11 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // emitted (it was legacy dual-auth cruft the shim stripped anyway). So there's
     // no secret to guard: this output can be shown, and appended to the agent's env
     // file directly. The daemon still holds an account-roster row for this AIK.
-    println!("SAFECLAW_BROKER_URL={}", broker_url);
-    println!("SAFECLAW_AGENT_IDENTITY={}", identity_path.display());
+    println!("SAFECLAW_BROKER_URL={}", added.broker_url);
+    println!(
+        "SAFECLAW_AGENT_IDENTITY={}",
+        env_value(&added.identity_path.display().to_string())
+    );
 
     let rm_name = if args.name.contains(char::is_whitespace) {
         format!("'{}'", args.name)
@@ -213,10 +152,10 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         args.name.clone()
     };
     eprintln!(
-        "\nAgent '{}' authorized — its SafeClaw env (two non-secret lines: the broker URL \
+        "\nAgent '{}' authorized. Its SafeClaw env (two non-secret lines: the broker URL \
          and its identity-file path) went to stdout. Append them to the env file your \
-         framework loads. It can reach any vault you toggle on for it in the console's \
-         Agents tab. Works on any paired device; revoke: `sc agent rm {}`.",
+         framework loads. It can reach any vault you turn it on for in that vault's \
+         Agent access page. Works on any paired device; revoke: `sc agent rm {}`.",
         args.name, rm_name
     );
     Ok(())
@@ -277,46 +216,96 @@ async fn ls(json: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// `sc agent rm`: revoking an agent is an owner-signed ledger revoke, signed in
+/// the console (this machine holds no owner key). Print the page; every device
+/// refuses the agent at its next ledger pull.
 async fn rm(args: AgentRmArgs) -> Result<(), String> {
     let (cloud, key) = cloud_and_key()?;
     let agents = fetch_agents(&cloud, &key).await?;
     let matches: Vec<&ListKey> = agents
         .iter()
-        .filter(|k| {
-            k.label.as_deref() == Some(args.name.as_str())
-                || k.id == args.name
-                || k.prefix == args.name
+        .filter(|agent| {
+            agent.label.as_deref() == Some(args.name.as_str())
+                || agent.id == args.name
+                || agent.prefix == args.name
         })
         .collect();
-    let id = match matches.as_slice() {
-        [k] => k.id.clone(),
-        [] => {
-            return Err(format!(
-                "no agent named '{}' (see `sc agent ls`)",
-                args.name
-            ))
-        }
-        _ => {
-            return Err(format!(
-                "'{}' matches multiple agents — remove by id or prefix (`sc agent ls`)",
-                args.name
-            ))
-        }
-    };
-    let url = format!("{}/api/vault/agents/{}", cloud, id);
-    let resp = client()?
-        .delete(&url)
-        .bearer_auth(&key)
-        .dik_pop("DELETE", &url, &[])
-        .send()
-        .await
-        .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
-    if !resp.status().is_success() {
-        return Err(format!("revoke failed: HTTP {}", resp.status()));
+    if matches.len() > 1 {
+        return Err(format!(
+            "'{}' matches multiple agents; remove it by id or prefix from `sc agent ls`",
+            args.name
+        ));
     }
-    eprintln!(
-        "Revoked agent '{}'. Streaming devices drop it within a second; an offline device drops it on its next sync.",
-        args.name
-    );
+    let remote_id = matches.first().map(|agent| agent.id.clone());
+    let local_name = matches
+        .first()
+        .and_then(|agent| agent.label.clone())
+        .unwrap_or_else(|| args.name.clone());
+    let url = crate::cli::vault::console_page("/account/access")?;
+    if remote_id.is_some() {
+        eprintln!(
+            "Remove the agent '{}' in the SafeClaw console (it asks for your passkey):",
+            args.name
+        );
+        eprintln!("  {}", url);
+        eprintln!("Waiting for the cloud removal to finish...");
+    }
+
+    // Agent removal is owner-signed in the browser, so the CLI cannot perform
+    // it with the device key. Observe the cloud list until that signed removal
+    // lands, and only then delete the local private identity directory.
+    if let Some(remote_id) = remote_id {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let remaining = fetch_agents(&cloud, &key).await?;
+            if !remaining.iter().any(|agent| agent.id == remote_id) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "the cloud removal is not finished; complete it at {} and re-run `sc agent rm {}`",
+                    url, args.name
+                ));
+            }
+        }
+    }
+
+    let identity = crate::identity_file::agent_identity_path(&local_name)?;
+    if let Some(dir) = identity.parent() {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)
+                .map_err(|e| format!("remove local agent directory {}: {}", dir.display(), e))?;
+            eprintln!("Removed local agent identity at {}.", dir.display());
+        }
+    }
+    eprintln!("Every device stops serving the removed agent after it receives the signed update.");
     Ok(())
+}
+
+/// A dotenv value that also survives `set -a; . file`: bare when it is only path-safe
+/// characters, else single-quoted (dotenv parsers strip the quotes). A home directory
+/// with a space is the usual case.
+pub(crate) fn env_value(v: &str) -> String {
+    if !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '+'))
+    {
+        v.to_string()
+    } else {
+        format!("'{}'", v.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod env_value_tests {
+    #[test]
+    fn a_path_with_a_space_is_quoted_once() {
+        assert_eq!(
+            super::env_value("/home/a/.safeclaw/agents/claude/identity"),
+            "/home/a/.safeclaw/agents/claude/identity"
+        );
+        assert_eq!(super::env_value("/Users/Jo Lee/x"), "'/Users/Jo Lee/x'");
+        assert_eq!(super::env_value("/it's"), "'/it'\\''s'");
+    }
 }

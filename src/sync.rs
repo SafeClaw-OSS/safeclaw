@@ -24,7 +24,7 @@ use crate::cli::active;
 use crate::device_auth::DikRequestExt;
 use crate::state::AppState;
 use crate::storage::sealed_vault::{self, SealedVault};
-use crate::sync_stream::{Mode, StreamHealth, VaultStatus, WakeCell, Work};
+use crate::sync_stream::{Mode, StreamHealth, WakeCell, Work};
 
 /// How long an auth-rejected (401/403) sync path parks before retrying. The
 /// pre-parking behavior — `return`, killing sync for the daemon's lifetime —
@@ -144,7 +144,7 @@ pub async fn pull_on_start(state_dir: &Path) {
         // PER-ITEM: pull the KEYSET (the passkey-wrap layer, now on `/keys`)
         // BEFORE the content rows, so the folded view later sees a fresh K-wrap
         // layer. Best-effort; a 404 / non-per-item vault is a no-op.
-        match pull_keys(state_dir, cloud, vault, &dk).await {
+        match pull_keys(state_dir, cloud, vault, &dk, StoreLock::Boot).await {
             Ok(n) if n > 0 => {
                 tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled keyset rows")
             }
@@ -154,7 +154,7 @@ pub async fn pull_on_start(state_dir: &Path) {
         // PER-ITEM: pull content rows too (pre-serve, no cache to refresh yet —
         // the first unlock folds them). Best-effort; a 404 / non-per-item vault
         // is a no-op.
-        match pull_items(state_dir, cloud, vault, &dk).await {
+        match pull_items(state_dir, cloud, vault, &dk, None, StoreLock::Boot).await {
             Ok(n) if n > 0 => {
                 tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled item rows")
             }
@@ -227,22 +227,44 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     // the folded item view so the new rows are served without a re-unlock.
     if let Some(cloud2) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) {
         if let Some(dk2) = device_key() {
-            match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2).await {
-                Ok(n) if n > 0 => {
+            let lock = StoreLock::Take(state);
+            let keys_pulled = match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2, lock).await {
+                Ok(n) => {
                     state.record_cloud_contact(vault_id);
-                    tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows")
+                    if n > 0 {
+                        tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows");
+                    }
+                    true
                 }
-                Ok(_) => state.record_cloud_contact(vault_id),
-                Err(e) => tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e),
-            }
-            match pull_items(&state.config.state_dir, cloud2, vault_id, &dk2).await {
+                Err(e) => {
+                    tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e);
+                    false
+                }
+            };
+            let key = state.cloned_state_key(vault_id);
+            match pull_items(
+                &state.config.state_dir,
+                cloud2,
+                vault_id,
+                &dk2,
+                key.as_deref().map(|m| &m[..]),
+                lock,
+            )
+            .await
+            {
                 Ok(n) if n > 0 => {
                     state.record_cloud_contact(vault_id);
                     tracing::info!(vault = %vault_id, adopted = n, "per-item pull: adopted rows");
                     refresh_after_item_pull(state, vault_id);
                 }
-                Ok(_) => state.record_cloud_contact(vault_id),
+                Ok(_) => {
+                    state.record_cloud_contact(vault_id);
+                    crate::server::handlers::service_ops::requests::after_sync(state, vault_id);
+                }
                 Err(e) => tracing::debug!(vault = %vault_id, "per-item pull failed: {}", e),
+            }
+            if keys_pulled {
+                confirm_unreadable_after_refresh(state, vault_id).await;
             }
         }
     }
@@ -270,6 +292,7 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
 /// missing the credential ("unknown credential") even though the cloud offers it.
 /// On a lookup miss we re-pull the WHOLE triple (since=0) here and retry once.
 /// Returns rows adopted. Best-effort caller: a local-only/unpaired daemon errs.
+/// The caller (an approve) holds the vault write lock.
 pub async fn resync_membership_now(state: &Arc<AppState>, vault_id: &str) -> Result<usize, String> {
     let cfg = active::load().map_err(|_| "not paired".to_string())?;
     let cloud = cfg
@@ -279,7 +302,15 @@ pub async fn resync_membership_now(state: &Arc<AppState>, vault_id: &str) -> Res
         .ok_or_else(|| "local-only daemon (no cloud) — cannot resync membership".to_string())?;
     let dk =
         device_key().ok_or_else(|| "daemon not paired — cannot resync membership".to_string())?;
-    let n = pull_membership(&state.config.state_dir, cloud, vault_id, &dk, true).await?;
+    let n = pull_membership(
+        &state.config.state_dir,
+        cloud,
+        vault_id,
+        &dk,
+        true,
+        StoreLock::Held,
+    )
+    .await?;
     if n > 0 {
         state.record_cloud_contact(vault_id);
         tracing::info!(vault = %vault_id, adopted = n, "membership resync (self-heal): backfilled keyset");
@@ -359,11 +390,61 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
     }
 }
 
+/// True when this daemon syncs its vaults with a cloud (a backend is
+/// configured); false for a local-only daemon.
+pub(crate) fn cloud_configured() -> bool {
+    active::load()
+        .ok()
+        .and_then(|c| c.cloud_backend)
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// Pull `vault_id`'s item rows now, serving what was adopted. A daemon with
+/// no cloud configured has nothing to pull (local-only): `Ok`. A paired one
+/// that cannot pull: `Err`.
+pub(crate) async fn pull_items_now(state: &Arc<AppState>, vault_id: &str) -> Result<(), String> {
+    let Ok(cfg) = active::load() else {
+        return Ok(());
+    };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let dk = device_key().ok_or("this daemon is not paired")?;
+    let key = state.cloned_state_key(vault_id);
+    let key = key.as_deref().map(|m| &m[..]);
+    let lock = StoreLock::Take(state);
+    if pull_items(&state.config.state_dir, cloud, vault_id, &dk, key, lock).await? > 0 {
+        refresh_after_item_pull(state, vault_id);
+    } else {
+        // Nothing adopted, but a request a racing pull adopted (or one whose
+        // op resolved here) may still be waiting: re-check on every sync.
+        crate::server::handlers::service_ops::requests::after_sync(state, vault_id);
+    }
+    Ok(())
+}
+
+/// The per-item store of `vault` folded under `key` (`None`: no store, or
+/// it does not fold; logged).
+pub(crate) fn fold_with_key(
+    state: &AppState,
+    vault: &str,
+    key: &[u8],
+) -> Option<crate::storage::plaintext::VaultPlaintextView> {
+    let pv = read_per_item_store(&state.config.state_dir, vault)?;
+    match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(key, &pv, vault) {
+        Ok(view) => Some(view),
+        Err(e) => {
+            tracing::warn!(vault = %vault, "fold after the unlock pull failed (serving the view opened at unlock): {}", e);
+            None
+        }
+    }
+}
+
 /// After a per-item pull adopted new rows, refresh the in-memory cache for an
 /// UNLOCKED vault by folding the per-item store with the retained `K` — no
 /// passkey. Locked vault (no K) → no-op (the next unlock folds the new rows). A
 /// rotated `K` that can't unseal → log + leave the cache (graceful).
-fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
+pub(crate) fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
     let Some(k) = state.cloned_state_key(vault) else {
         return;
     };
@@ -375,6 +456,8 @@ fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
             let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
             state.unlock_vault(vault.to_string(), cache, k);
             tracing::info!(vault = %vault, "per-item pull: cache refreshed from item rows");
+            // The console's install requests, handled as `sc service add`.
+            crate::server::handlers::service_ops::requests::after_sync(state, vault);
         }
         Err(_) => {
             tracing::warn!(
@@ -634,6 +717,15 @@ pub fn spawn_watchers(state: Arc<AppState>) {
         tracing::debug!("cloud sync watch: no cloud_backend; not started (local-only daemon)");
         return;
     };
+    // §15 account principal ledger, enforced: pull (DIK proof of possession, no
+    // bearer: a revoked device whose key the backend dropped still gets its
+    // revoke), verify strictly, decide (serve / park / lock / wipe). Runs
+    // before the device-key gate below for that reason. No anchor = parked at
+    // startup ([`crate::principal_ledger::init_gate`]); the anchor is only
+    // learned at pairing, which restarts the daemon.
+    if active::account_uik().is_some() {
+        tokio::spawn(crate::principal_ledger::principal_ledger_loop(state.clone()));
+    }
     let Some(dk) = device_key() else {
         tracing::debug!("cloud sync watch: no device-key (unpaired); not started");
         return;
@@ -673,19 +765,6 @@ pub fn spawn_watchers(state: Arc<AppState>) {
     // with the vaults already watched above so it only spawns for NEW ones.
     let watched: std::collections::HashSet<String> =
         synced_vault_ids(&cfg).into_iter().collect();
-    // §15 account principal ledger: pull + verify + (flag-gated) enforce a VERIFIED
-    // self-revoke (lock + wipe all + logout). The anchor is the account's owner-UIK
-    // us_ pinned at login (NOT the account UUID) — self-certifying. Dormant until
-    // SAFECLAW_PRINCIPAL_ENFORCE is on (the P6 cutover flips the default). Uses clones
-    // so the discovery loop below still takes ownership.
-    if let Some(anchor_uik) = active::account_uik() {
-        tokio::spawn(crate::principal_ledger::principal_ledger_loop(
-            state.clone(),
-            cloud.clone(),
-            dk.clone(),
-            anchor_uik,
-        ));
-    }
     tokio::spawn(discovery_reconcile_loop(state, cloud, dk, watched));
 }
 
@@ -780,6 +859,19 @@ fn decode_sig64(s: &str) -> Option<[u8; 64]> {
     Some(a)
 }
 
+/// Highest vault data format this build understands (`vaults.format`, carried
+/// in the signed envelope). 1 = legacy personal, 2 = membership triple + unified
+/// addressing, 3 = secret items may carry `{ value, notes }`. A vault the server
+/// says is NEWER than this fails loudly (`sc upgrade`) instead of being read
+/// with parts silently missing. Bump together with the backend's per-format
+/// daemon floor whenever the sealed data shape changes.
+pub(crate) const SUPPORTED_VAULT_FORMAT: u64 = 3;
+
+/// Whether a (signature-verified) vault format is beyond what this build reads.
+fn vault_format_too_new(format: u64) -> bool {
+    format > SUPPORTED_VAULT_FORMAT
+}
+
 /// Apply the server-signed operational envelope (team §9 — "谁是权威谁签名"):
 /// trust `kind` and advance the offline-lease contact clock ONLY from a signature
 /// we can verify against the pinned server key. A present-but-invalid signature
@@ -823,6 +915,19 @@ fn apply_verified_envelope(state: &Arc<AppState>, vault: &str, body: &serde_json
             return;
         }
         state.set_vault_shared(vault, kind == "shared");
+        // Data format newer than this build: refuse the vault loudly (the proxy
+        // returns SC_UPGRADE_REQUIRED to the agent) rather than serve a partial
+        // view. The 200 that delivered this envelope cleared the flag first, so
+        // setting it here is the final word for this sync.
+        if vault_format_too_new(format) {
+            state.set_vault_upgrade_required(vault, true);
+            tracing::warn!(
+                vault = %vault,
+                format,
+                supported = SUPPORTED_VAULT_FORMAT,
+                "cloud sync: vault uses a newer data format than this SafeClaw reads; run `sc upgrade`"
+            );
+        }
     } else if let Some(shared) = parse_shared_from_body(body) {
         // Legacy server (no `env` signature): trust the plain `kind` field.
         state.set_vault_shared(vault, shared);
@@ -1039,13 +1144,9 @@ pub(crate) async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) 
 /// (the caller stops this vault's watcher — a later pull would re-adopt the triple).
 /// SAFE: acts ONLY on a `Verified`, non-empty fold that EXCLUDES our `us_`
 /// ([`PerItemVault::verified_membership`] = `Some(false)`); an untrusted / rolled-back
-/// / bootstrap / personal-`NoUik` vault yields `None` → parks. Flag-gated (default OFF,
-/// P6 flips it). Recoverable if ever wrong: the discovery loop won't re-add a
+/// / bootstrap / personal-`NoUik` vault yields `None` → parks. Recoverable if ever wrong: the discovery loop won't re-add a
 /// non-member vault, and a re-invite + passkey re-unlock restores it.
 async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool {
-    if !crate::principal_ledger::principal_enforce_enabled() {
-        return false;
-    }
     let Some(us) = active::account_uik() else {
         return false;
     };
@@ -1064,39 +1165,92 @@ async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool
 }
 
 /// §15 leg A: decide whether a `status:"deleted"` tombstone should DROP local state.
-/// Dual-path: with the require-signed flag OFF (default) ANY tombstone drops — the
-/// legacy behavior, byte-for-byte unchanged. With it ON, drop ONLY on an owner-signed
-/// tombstone (`tombstone_sig`/`tombstone_signer` in the body) that verifies against the
-/// vault's fold-owner set; a server flipping `status` without a valid owner signature is
-/// then REJECTED (parked), not obeyed. NEVER acts on a bare 401 (that path parks
-/// upstream) — this only gates an explicit deleted-status body.
+/// Every vault with a keyset drops ONLY on an owner-signed tombstone
+/// (`tombstone_sig` / `tombstone_signer` in the body): on a shared (v2) keyset the
+/// signer must be an admin in the vault's verified fold; on a personal (v1)
+/// keyset, the paired account whose key was pinned at pairing. A server flipping
+/// `status` without a valid owner signature is refused (parked), never obeyed.
+/// A vault with no local keyset holds nothing to protect and drops. NEVER acts on
+/// a bare 401 (that path parks upstream): this only gates an explicit
+/// deleted-status body.
 fn tombstone_should_drop(state_dir: &Path, vault: &str, body: &serde_json::Value) -> bool {
-    if !crate::principal_ledger::require_signed_tombstone() {
-        return true; // legacy dual-path: unsigned deletes still drop until the P6 flip
+    let dir = state_dir.join("vaults").join(vault);
+    let per_item = dir.join("vault.per-item.json");
+    if per_item.exists() {
+        // A store that exists but can't be read fails CLOSED: never wipe on an
+        // unsigned delete because the local copy is damaged.
+        return match pv_store::read_per_item(&per_item) {
+            Ok(Some(pv)) => tombstone_verified_for(&pv, vault, body, active::account_uik_pub()),
+            _ => {
+                tracing::warn!(vault = %vault, "tombstone: the local store is unreadable; NOT dropping");
+                false
+            }
+        };
     }
-    // No per-item keyset at all (a pure legacy fmt1 vault, or one never synced here) → no
-    // fold-owner to verify against and no fmt2 K/blob to protect → keep the legacy drop
-    // (F3: require-signed must never STRAND a legacy delete, only harden fmt2).
-    let Some(pv) = read_per_item_store(state_dir, vault) else {
-        return true;
-    };
-    if pv.is_legacy_nouik(vault) {
-        return true; // legacy NoUik vault: no signed owner set → legacy drop
+    if dir.join("vault.dat").exists() {
+        // A whole-blob vault holds credentials too: only the paired account's
+        // signature drops it.
+        let (Some(sig), Some(signer)) = (
+            body.get("tombstone_sig").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+            body.get("tombstone_signer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+        ) else {
+            tracing::warn!(vault = %vault, "tombstone: the delete carries no owner signature; NOT dropping");
+            return false;
+        };
+        return personal_tombstone_verified(vault, signer, sig, active::account_uik_pub());
     }
-    // fmt2 vault: require a verified owner tombstone; an unsigned/forged delete parks.
+    // Nothing local to protect.
+    true
+}
+
+/// [`tombstone_should_drop`] for a vault with a keyset (unit-testable).
+fn tombstone_verified_for(
+    pv: &sealed_vault::PerItemVault,
+    vault: &str,
+    body: &serde_json::Value,
+    account_pub: Option<[u8; 32]>,
+) -> bool {
     let (Some(sig), Some(signer)) = (
         body.get("tombstone_sig").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
         body.get("tombstone_signer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
     ) else {
-        tracing::warn!(vault = %vault, "tombstone: require-signed ON but the delete carries no owner signature; NOT dropping");
+        tracing::warn!(vault = %vault, "tombstone: the delete carries no owner signature; NOT dropping");
         return false;
     };
-    if pv.tombstone_verified(vault, signer, sig) {
-        true
+    let verified = if pv.keyset.uik.is_some() {
+        pv.tombstone_verified(vault, signer, sig)
     } else {
+        personal_tombstone_verified(vault, signer, sig, account_pub)
+    };
+    if !verified {
         tracing::warn!(vault = %vault, signer = %signer, "tombstone: owner signature did NOT verify; NOT dropping (possible server-forged delete)");
-        false
     }
+    verified
+}
+
+/// A personal (v1 keyset) vault's tombstone: signed by the paired account
+/// (`signer` = the pinned `account_uik`, verified under its pinned key).
+fn personal_tombstone_verified(
+    vault: &str,
+    signer: &str,
+    sig_b64: &str,
+    account_pub: Option<[u8; 32]>,
+) -> bool {
+    use base64::Engine as _;
+    let Some(pk) = account_pub else {
+        return false;
+    };
+    if crate::identity::derive_id(crate::identity::IdKind::User, &pk) != signer {
+        return false;
+    }
+    let Some(sig) = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .ok()
+        .and_then(|v| <[u8; 64]>::try_from(v.as_slice()).ok())
+    else {
+        return false;
+    };
+    crate::identity::verify(&pk, &crate::identity::vault_tombstone_input(vault), &sig)
 }
 
 /// After a runtime pull wrote a new `vault.dat`, refresh the in-memory cache
@@ -1297,147 +1451,6 @@ async fn recover_after_conflict(
     true
 }
 
-/// Fetch the account-level agent-key hash-set (`/api/vault/agents/hashes`,
-/// device-key authed). Returns None on any failure (caller keeps the prior
-/// set). The hashes are sha256(token) hex — the broker validates a presented
-/// key by re-hashing and checking membership; the cloud never sees plaintext.
-async fn fetch_agent_key_hashes(
-    client: &reqwest::Client,
-    cloud: &str,
-    device_key: &str,
-) -> Option<std::collections::HashSet<String>> {
-    let url = format!("{}/api/vault/agents/hashes", cloud.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .bearer_auth(device_key)
-        .dik_pop("GET", &url, &[])
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    let keys = body.get("keys")?.as_array()?;
-    Some(
-        keys.iter()
-            .filter_map(|k| {
-                k.get("hash")
-                    .and_then(|h| h.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect(),
-    )
-}
-
-/// One-shot refresh of the broker's agent-key hash-set. Best-effort + gated
-/// like the blob sync (no-op for a local-only/unpaired daemon). Call once
-/// before serving so the broker accepts account agent-keys from the start.
-pub async fn sync_agent_keys_once(state: &Arc<AppState>) {
-    sync_agent_keys_with_timeout(state, Duration::from_secs(15)).await;
-}
-
-async fn sync_agent_keys_with_timeout(state: &Arc<AppState>, timeout: Duration) {
-    let cfg = match active::load() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
-        return;
-    };
-    let Some(dk) = device_key() else {
-        return;
-    };
-    let client = match crate::cli::egress_proxy::client(timeout) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    if let Some(hashes) = fetch_agent_key_hashes(&client, cloud, &dk).await {
-        let n = hashes.len();
-        // Log only when the set actually moved — this runs on a 30s loop, and
-        // an unconditional line here is the daemon's loudest idle chatter.
-        if state.set_agent_key_hashes(hashes) {
-            tracing::info!(count = n, "agent-key hash-set updated");
-        }
-    }
-}
-
-/// One serialized refresh on an agent-key AUTH MISS. A key minted seconds ago
-/// (`sc agent add` prints the agent's env → the agent uses it immediately)
-/// would otherwise sit invalid for up to the 30s loop interval — the exact
-/// window the install flow now hits. The tokio Mutex is held ACROSS the fetch:
-/// a concurrent miss WAITS for the in-flight refresh (then sees the fresh
-/// stamp) instead of being bounced to a reject, and a bad-key flood is capped
-/// at one outstanding backend call per 2s window. The short 3s timeout bounds
-/// the reject path's latency when the backend is down. Always returns true =
-/// "the hash-set is now as fresh as it gets — re-check membership".
-pub async fn refresh_agent_keys_on_miss(state: &Arc<AppState>) -> bool {
-    const DEBOUNCE: Duration = Duration::from_secs(2);
-    let mut last = state.agent_key_resync.lock().await;
-    if matches!(*last, Some(t) if t.elapsed() < DEBOUNCE) {
-        return true;
-    }
-    *last = Some(std::time::Instant::now());
-    sync_agent_keys_with_timeout(state, Duration::from_secs(3)).await;
-    true
-}
-
-/// Agent-hash poll cadence while the SSE stream is healthy (v1.1): the
-/// stream's `agent_hashes` event plus the resync-on-reconnect fire are the
-/// propagation path, so this poll is pure belt-and-suspenders — 600s keeps
-/// the documented bound ("revocation: instant, worst case 10 min"; Railway's
-/// ≤15-min rotation forces the reconnect resync regardless). Add-key latency
-/// is independent of the cadence either way: `refresh_agent_keys_on_miss`
-/// refetches on first sight of an unknown key.
-const AGENT_KEYS_CADENCE_STREAMED: Duration = Duration::from_secs(600);
-/// Stream down or `sync_stream=off`: the pre-v1.1 30s — degraded
-/// environments keep the poll as their ONLY propagation path.
-const AGENT_KEYS_CADENCE_POLL: Duration = Duration::from_secs(30);
-
-/// Cadence selection, factored for the unit test. The relaxed cadence needs
-/// PROOF the events can reach us (`agent_hash_events_live()`: live stream
-/// AND the backend declared the cap in hello) — bare stream health would
-/// relax the poll against a v1-only backend that never emits the event.
-fn agent_keys_cadence(agent_hash_events_live: bool) -> Duration {
-    if agent_hash_events_live {
-        AGENT_KEYS_CADENCE_STREAMED
-    } else {
-        AGENT_KEYS_CADENCE_POLL
-    }
-}
-
-/// Periodically refresh the agent-key hash-set so a dashboard revoke / a newly
-/// added agent takes effect on this daemon. Detached, best-effort. v1.1:
-/// event-driven — the SSE dispatcher fires the agent-hash notify on an
-/// `agent_hashes` stream event AND after every reconnect hello, either of
-/// which resyncs immediately; the sleep is the fallback bound, mode-sized by
-/// stream health. Logging stays inside `sync_agent_keys_once` (only on a
-/// hash-set CHANGE), so neither wake source adds idle chatter.
-pub async fn sync_agent_keys_loop(state: Arc<AppState>) {
-    /// ★ Storm floor, mirroring `refresh_agent_keys_on_miss`'s 2s debounce:
-    /// a chatty/buggy stream costs ≤1 hash-set fetch per 2s, never
-    /// RTT-speed refetching (each fetch builds a fresh client = TLS).
-    const FETCH_FLOOR: Duration = Duration::from_secs(2);
-    loop {
-        sync_agent_keys_once(&state).await;
-        let fetched = tokio::time::Instant::now();
-        // Arm AFTER the fetch: `notify_one` parks a permit, so an event that
-        // fired mid-fetch completes this wait instantly (one redundant
-        // cursor-cheap refetch at worst, never a lost revoke).
-        loop {
-            tokio::select! {
-                _ = crate::sync_stream::agent_hashes_notified() => break,
-                _ = tokio::time::sleep(agent_keys_cadence(crate::sync_stream::agent_hash_events_live())) => break,
-                // A health flip mid-sleep re-sizes the wait: a 600s streamed
-                // sleep must not ride across an Up→Down flip — the 30s
-                // Down-mode promise is per-mode, not per-cycle.
-                _ = crate::sync_stream::stream_health_edge() => continue,
-            }
-        }
-        tokio::time::sleep_until(fetched + FETCH_FLOOR).await;
-    }
-}
-
 // ── Audit shipper (de-daemon, DE_DAEMON.md §4) ──────────────────────────────
 // Local-first outbox: the daemon already writes every op to its per-vault
 // `audit.db` synchronously (offline-safe). This loop is the DELIVERY half — it
@@ -1470,7 +1483,17 @@ struct AuditEventWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>, // ceremony subject (key name / connection id)
     #[serde(skip_serializing_if = "Option::is_none")]
-    agent_id: Option<String>, // agent api-key PREFIX (= cloud api_keys.prefix)
+    agent_id: Option<String>, // requesting agent: its `ag_` id (legacy rows: api-key prefix)
+    /// Why a denied request was refused: its ScCode wire name only, never
+    /// the local free-text reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    /// Who approved: the passkey credential id (base64url) whose assertion
+    /// this daemon verified when it redeemed the grant. Only on an
+    /// `approved` row; the backend maps it to a vault member, never trusts a
+    /// name from here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approver_cid: Option<String>,
 }
 
 fn event_from_row(row: &crate::audit::ApprovalRow) -> AuditEventWire {
@@ -1490,6 +1513,15 @@ fn event_from_row(row: &crate::audit::ApprovalRow) -> AuditEventWire {
         action,
         target: row.target.clone(),
         agent_id: row.agent_prefix.clone(),
+        code: row.code.clone(),
+        // The local credential_id is written only by the approve path, after
+        // the grant's assertion verified; gate on the decision anyway so no
+        // other outcome can ever name an approver.
+        approver_cid: if row.status == crate::audit::STATUS_APPROVED {
+            row.credential_id.clone().filter(|c| !c.is_empty())
+        } else {
+            None
+        },
     }
 }
 
@@ -1803,22 +1835,11 @@ pub async fn watch_loop(
             // lifecycle authority (design doc) — the same trust as the blob
             // channel's body (authenticated TLS to our own backend), and an
             // explicit "deleted" stays the ONLY local-state destroyer.
-            if let Some((version, status)) = work.vault {
-                if status == VaultStatus::Deleted {
-                    // §15 leg A: the SSE vault EVENT carries no tombstone signature, so
-                    // it can direct-drop only under the legacy (flag-OFF) path. With
-                    // require-signed ON, do NOT drop/stop here — fall through so the
-                    // reconcile blob probe re-fetches the SIGNED tombstone body, which
-                    // `handle_blob_wake_body` gates against the fold-owner set.
-                    if !crate::principal_ledger::require_signed_tombstone() {
-                        drop_local_vault_locked(&state, &vault).await;
-                        tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
-                        // Task exit drops the sole strong ref to the cell; the
-                        // dispatcher prunes this vid from `?vids` at its next
-                        // reconnect.
-                        return;
-                    }
-                }
+            if let Some((version, _status)) = work.vault {
+                // §15 leg A: the SSE vault EVENT carries no tombstone signature, so
+                // a `deleted` status never drops here: the blob probe below
+                // re-fetches the SIGNED tombstone body, which
+                // `handle_blob_wake_body` verifies before any drop.
                 // ★ Cursor re-read from disk at use time, never cached across
                 // parks — the loop-top discipline the long-poll shape gets
                 // for free.
@@ -2405,17 +2426,30 @@ async fn pull_and_process(
     channel: &str,
 ) -> bool {
     let mut ok = true;
-    match pull_keys(state_dir, cloud, vault, dk).await {
-        Ok(n) if n > 0 => {
-            tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows")
+    let mut keys_pulled = false;
+    match pull_keys(state_dir, cloud, vault, dk, StoreLock::Take(state)).await {
+        Ok(n) => {
+            keys_pulled = true;
+            if n > 0 {
+                tracing::info!(vault = %vault, adopted = n, "cloud sync watch: pulled keyset rows")
+            }
         }
-        Ok(_) => {}
         Err(e) => {
             tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e);
             ok = false;
         }
     }
-    match pull_items(state_dir, cloud, vault, dk).await {
+    let key = state.cloned_state_key(vault);
+    let pulled = pull_items(
+        state_dir,
+        cloud,
+        vault,
+        dk,
+        key.as_deref().map(|m| &m[..]),
+        StoreLock::Take(state),
+    )
+    .await;
+    match pulled {
         Ok(n) if n > 0 => {
             // INFO parity with the keyset line above: item adoptions are the
             // content channel doing its job — their absence from the log was
@@ -2429,9 +2463,38 @@ async fn pull_and_process(
             ok = false;
         }
     }
+    if keys_pulled {
+        confirm_unreadable_after_refresh(state, vault).await;
+    }
+    // The console's install requests ride the same wake, whatever the pull
+    // adopted (a wake for an already-adopted row, or for an op that just
+    // resolved, still has a request to claim, finish or remove): a console
+    // Install is picked up within the wake, not on the next periodic tick.
+    crate::server::handlers::service_ops::requests::after_sync(state, vault);
     crate::auth::connect::process_vault_connects(state, vault, None).await;
     tracing::debug!(vault = %vault, channel = channel, "cloud sync watch: wake processed");
     ok
+}
+
+/// After a keyset refresh: record which rows this session's keys (of the
+/// keyset's current generation) cannot open, so a change may then go over
+/// them ([`PerItemVault::confirm_unreadable`]). Locked: nothing.
+async fn confirm_unreadable_after_refresh(state: &Arc<AppState>, vault_id: &str) {
+    let Some(k) = state.cloned_state_key(vault_id) else {
+        return;
+    };
+    let keys = item_layer::VaultKeys::from_material(&k);
+    let lock = state.vault_write_lock(vault_id);
+    let _guard = lock.lock().await;
+    let state_dir = &state.config.state_dir;
+    let Some(mut pv) = read_per_item_store(state_dir, vault_id) else {
+        return;
+    };
+    if pv.confirm_unreadable::<sudp::primitives::StdPrimitives>(keys, vault_id) {
+        if let Err(e) = write_per_item_store(state_dir, vault_id, &pv) {
+            tracing::warn!(vault = %vault_id, "unreadable rows not recorded: {}", e);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2451,14 +2514,16 @@ async fn pull_and_process(
 //
 // PULL adopts server truth (§5): a newer version replaces the local row, a
 // tombstone is stored (fold_view drops it), the cursor advances to max(seq).
-// PUSH is per-item CAS (§4); 409 → reconcile — re-apply on the fresh item if the
-// edit is independent, else write a conflict-copy (never last-writer-wins).
+// PUSH is per-item CAS (§4); 409 → reconcile under K (never last-writer-wins),
+// per the record's conflict policy in the rule table (`item::ITEM_RULES`):
+// keep_both, take_writer, owner_config. See `push_items_best_effort`.
 //
 // Backing HTTP is only exercised once the backend `/items` endpoints are live;
 // until then these are wired but a 404 leaves the local per-item store as the
 // authoritative content (stubbed[]).
 // ─────────────────────────────────────────────────────────────────────────
 
+use crate::storage::item as item_layer;
 use crate::storage::sealed_vault::{self as pv_store, PerItemVault};
 
 /// One row of a `/items` pull.
@@ -2466,7 +2531,6 @@ use crate::storage::sealed_vault::{self as pv_store, PerItemVault};
 struct ItemRow {
     item_id: String,
     version: u64,
-    #[allow(dead_code)]
     seq: u64,
     /// base64url-nopad of `suite‖nonce‖ct‖tag`.
     ct: String,
@@ -2496,29 +2560,104 @@ fn write_per_item_store(state_dir: &Path, vault: &str, pv: &PerItemVault) -> Res
 }
 
 /// Adopt a batch of pulled item rows into the local store (server-authoritative,
-/// §5): a strictly-newer `version` replaces the local row; the cursor advances
-/// to the max `seq` seen. Tombstones are stored like any other row — `fold_view`
-/// drops them at read time, and a later GC hard-deletes them. Returns the number
-/// of rows adopted.
-fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Result<usize, String> {
+/// §5): a strictly-newer `version` replaces a CLEAN local row (a dirty one is
+/// left for the push-side 409 reconcile); the cursor advances to the max
+/// `seq` seen. Tombstones are stored like any other row — `fold_view` drops
+/// them at read time, and a later GC hard-deletes them. Returns the number of
+/// rows adopted.
+///
+/// On a vault with a keyset, the owner-config the fold honors is kept: a
+/// replacement the fold would not honor (an unsigned tombstone over an
+/// owner-signed legacy row, say) or cannot read is held
+/// ([`PerItemVault::unhonored_replacement`], under `keys` = the unlocked
+/// session's). Without `keys` (locked) only a replacement of a row this
+/// device has read as a data record ([`pv_store::RowKind::Data`]) is
+/// adopted; any other replacement needs the key and is held. A held row
+/// never pins the cursor: it is kept in the store's `held` list with why,
+/// offered again here on every pull (and at unlock, [`catch_up_at_unlock`])
+/// until it is adopted, superseded by a newer row, or stale, and shown to the
+/// user meanwhile. With `keys`, rows not yet classified are classified.
+fn adopt_item_rows(
+    pv: &mut PerItemVault,
+    rows: &[ItemRow],
+    max_seq: u64,
+    keys: Option<(item_layer::VaultKeys<'_>, &str)>,
+) -> Result<usize, String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    let mut adopted = 0usize;
+    type S = sudp::primitives::StdPrimitives;
+    // What is offered: the held rows, then the pulled ones; per id the one
+    // the server wrote last (its `seq`). The version a row states is not
+    // compared here: a held row that cannot be read may state any version.
+    let mut offered: std::collections::BTreeMap<String, pv_store::HeldRow> =
+        std::mem::take(&mut pv.held);
     for row in rows {
-        // Only adopt a strictly-newer version (server is authoritative, but a
-        // stale replay must not clobber a fresher local row we already pushed).
-        let keep = pv
-            .get_item(&row.item_id)
-            .map(|s| row.version > s.version)
-            .unwrap_or(true);
-        if !keep {
-            continue;
-        }
         let ct = URL_SAFE_NO_PAD
             .decode(row.ct.as_bytes())
             .map_err(|e| format!("item ct not base64url: {}", e))?;
-        pv.put_raw_signed(row.item_id.clone(), row.version, ct, row.sig.clone(), row.signer.clone());
+        if offered.get(&row.item_id).is_some_and(|h| h.seq >= row.seq) {
+            continue;
+        }
+        offered.insert(
+            row.item_id.clone(),
+            pv_store::HeldRow {
+                version: row.version,
+                seq: row.seq,
+                ct,
+                sig: row.sig.clone(),
+                signer: row.signer.clone(),
+                reason: String::new(),
+            },
+        );
+    }
+    let mut adopted = 0usize;
+    for (id, mut row) in offered {
+        // Only adopt a strictly-newer version (server is authoritative, but a
+        // stale replay must not clobber a fresher local row we already pushed).
+        // NEVER adopt over a DIRTY local row (a local write not yet confirmed on
+        // the cloud): that would silently drop our edit. A dirty row is owned by
+        // the push side, whose 409 reconcile (`push_items_best_effort`) compares
+        // ours with theirs and keeps both / re-applies; while the vault is locked
+        // it stays dirty and is reconciled on the first push after unlock.
+        let local = pv.get_item(&id);
+        let replaces = local.is_some();
+        if local.is_some_and(|s| row.version <= s.version || s.version > s.synced_version) {
+            continue;
+        }
+        if replaces && pv.keyset.uik.is_some() && !item_layer::is_agent_wire_id(&id) {
+            let reason = match keys {
+                None => (pv.row_kinds.get(&id) != Some(&pv_store::RowKind::Data))
+                    .then_some(pv_store::HELD_LOCKED),
+                Some((keys, vault_id)) => {
+                    let incoming = pv_store::StoredItem {
+                        version: row.version,
+                        ct: row.ct.clone(),
+                        synced_version: row.version,
+                        tombstone: false,
+                        sig: row.sig.clone(),
+                        signer: row.signer.clone(),
+                        base: None,
+                        upgrade: false,
+                        generation: None,
+                        unreadable_confirmed: false,
+                    };
+                    pv.unhonored_replacement::<S>(keys, vault_id, &id, &incoming)
+                }
+            };
+            if let Some(reason) = reason {
+                if keys.is_some() && row.reason != reason {
+                    tracing::warn!(item = %id, version = row.version, "per-item pull: a replacement the fold would not honor is held; the honored owner-config is kept: {}", reason);
+                }
+                row.reason = reason.to_string();
+                pv.held.insert(id, row);
+                continue;
+            }
+        }
+        pv.put_raw_signed(id, row.version, row.ct, row.sig, row.signer);
         adopted += 1;
+    }
+    if let Some((keys, vault_id)) = keys {
+        pv.classify_rows::<S>(keys, vault_id);
     }
     if max_seq > pv.items_seq {
         pv.items_seq = max_seq;
@@ -2526,48 +2665,71 @@ fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Res
     Ok(adopted)
 }
 
-/// Pull item rows changed since the local `.items_seq` cursor and adopt them.
-/// Best-effort: a 404 (endpoint not live yet) or a missing local store is a
-/// no-op. Returns the number of rows adopted.
-pub async fn pull_items(
-    state_dir: &Path,
+/// Pages a single pull follows before it stops (a backend that pages its
+/// answer says `more`).
+const MAX_ITEM_PAGES: usize = 10_000;
+
+/// GET `/v/{vault}/items?since=<since>` → `Ok(Some((rows, max_seq)))`, or
+/// `Ok(None)` when the `/items` endpoint isn't live (404). `max_seq` is the
+/// cursor the caller should hold next (`since` unchanged when nothing is newer).
+/// `since = 0` is a full snapshot (the 409 reconcile reads THEIR current row
+/// from it, independent of the local cursor). An answer that says there is
+/// more (`more: true`, or a `next` cursor) is followed from its cursor until
+/// the last page.
+async fn fetch_item_rows(
     cloud: &str,
     vault: &str,
     device_key: &str,
-) -> Result<usize, String> {
-    // Personal build: a SHARED (team) vault's content is left to the official
-    // build; never lands on disk here (team-edition §9). Covers every caller.
-    if leave_shared_to_official(vault) {
-        return Ok(0);
-    }
-    let Some(mut pv) = read_per_item_store(state_dir, vault) else {
-        return Ok(0); // no per-item store yet (vault not enrolled per-item)
-    };
-    let url = format!(
-        "{}/v/{}/items?since={}",
-        cloud.trim_end_matches('/'),
-        vault,
-        pv.items_seq
-    );
+    since: u64,
+) -> Result<Option<(Vec<ItemRow>, u64)>, String> {
     let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(device_key)
-        .dik_pop("GET", &url, &[])
-        .send()
-        .await
-        .map_err(|e| format!("reach {}: {}", cloud, e))?;
-    match resp.status().as_u16() {
-        200 => {}
-        404 => return Ok(0), // /items not live yet — no-op (stubbed[])
-        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
-        other => return Err(format!("items GET HTTP {}", other)),
+    let mut rows: Vec<ItemRow> = Vec::new();
+    let mut cursor = since;
+    for _ in 0..MAX_ITEM_PAGES {
+        let url = format!(
+            "{}/v/{}/items?since={}",
+            cloud.trim_end_matches('/'),
+            vault,
+            cursor
+        );
+        let resp = client
+            .get(&url)
+            .bearer_auth(device_key)
+            .dik_pop("GET", &url, &[])
+            .send()
+            .await
+            .map_err(|e| format!("reach {}: {}", cloud, e))?;
+        match resp.status().as_u16() {
+            200 => {}
+            404 => return Ok(None), // /items not live yet — no-op (stubbed[])
+            401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
+            other => return Err(format!("items GET HTTP {}", other)),
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("parse items response: {}", e))?;
+        let (page, next) = parse_items_page(&body, cursor)?;
+        rows.extend(page);
+        match next {
+            Some(n) if n > cursor => cursor = n,
+            Some(_) => return Err("items GET: the next page does not advance".into()),
+            None => {
+                let max_seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(cursor);
+                return Ok(Some((rows, max_seq.max(cursor))));
+            }
+        }
     }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse items response: {}", e))?;
+    Err(format!("items GET: more than {} pages", MAX_ITEM_PAGES))
+}
+
+/// One `/items` answer: its rows, and the cursor of the next page when it
+/// says there is more (`more: true` → its `seq`; a numeric `next`).
+fn parse_items_page(
+    body: &serde_json::Value,
+    since: u64,
+) -> Result<(Vec<ItemRow>, Option<u64>), String> {
     let rows: Vec<ItemRow> = body
         .get("items")
         .cloned()
@@ -2575,15 +2737,203 @@ pub async fn pull_items(
         .transpose()
         .map_err(|e| format!("parse items array: {}", e))?
         .unwrap_or_default();
-    let max_seq = body
-        .get("seq")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(pv.items_seq);
-    let adopted = adopt_item_rows(&mut pv, &rows, max_seq)?;
-    if adopted > 0 || max_seq > 0 {
+    let seq = body.get("seq").and_then(|v| v.as_u64()).unwrap_or(since);
+    let next = match body.get("next") {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(serde_json::Value::Null) | None => None,
+        Some(_) => Some(seq),
+    };
+    let more = body.get("more").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok((rows, next.or(more.then_some(seq))))
+}
+
+/// How a sync write-back of a vault's local store is serialized with the
+/// vault's other writers. Every write of the store happens under the vault
+/// write lock ([`AppState::vault_write_lock`]); a pull reads its cursor, makes
+/// its network call without the lock, then re-reads the store and merges into
+/// that copy under the lock, so a local write made meanwhile is kept.
+#[derive(Clone, Copy)]
+pub(crate) enum StoreLock<'a> {
+    /// Take the vault write lock for the re-read, merge and write.
+    Take(&'a AppState),
+    /// The caller holds it (an approve: the unlock catch-up, the membership
+    /// self-heal).
+    Held,
+    /// Before the daemon serves: no other writer exists yet.
+    Boot,
+}
+
+impl StoreLock<'_> {
+    async fn acquire(self, vault: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        match self {
+            StoreLock::Take(state) => Some(state.vault_write_lock(vault).lock_owned().await),
+            StoreLock::Held | StoreLock::Boot => None,
+        }
+    }
+}
+
+/// The vault's local store for a keyset write-back: the stored one, or an
+/// empty one when there is none yet. A store that exists but cannot be read
+/// is an error, never replaced with an empty one.
+fn store_or_empty_keyset(state_dir: &Path, vault: &str) -> Result<PerItemVault, String> {
+    let path = state_dir
+        .join("vaults")
+        .join(vault)
+        .join("vault.per-item.json");
+    match pv_store::read_per_item(&path) {
+        Ok(Some(pv)) => Ok(pv),
+        Ok(None) => Ok(empty_keyset_store()),
+        Err(e) => Err(format!("the local store cannot be read: {}", e)),
+    }
+}
+
+/// Pull item rows changed since the local `.items_seq` cursor and adopt them
+/// ([`adopt_pulled_item_rows`]; `key`: the unlocked session's key material,
+/// if any). Best-effort: a 404 (endpoint not live yet) or a missing local
+/// store is a no-op. Returns the number of rows adopted.
+pub(crate) async fn pull_items(
+    state_dir: &Path,
+    cloud: &str,
+    vault: &str,
+    device_key: &str,
+    key: Option<&[u8]>,
+    lock: StoreLock<'_>,
+) -> Result<usize, String> {
+    // Personal build: a SHARED (team) vault's content is left to the official
+    // build; never lands on disk here (team-edition §9). Covers every caller.
+    if leave_shared_to_official(vault) {
+        return Ok(0);
+    }
+    let Some(since) = read_per_item_store(state_dir, vault).map(|pv| pv.items_seq) else {
+        return Ok(0); // no per-item store yet (vault not enrolled per-item)
+    };
+    let Some((rows, max_seq)) = fetch_item_rows(cloud, vault, device_key, since).await? else {
+        return Ok(0); // /items not live yet — no-op (stubbed[])
+    };
+    adopt_pulled_item_rows(state_dir, vault, lock, &rows, max_seq, key).await
+}
+
+/// The write-back of [`pull_items`]: under the vault write lock, re-read the
+/// store (a local write since the cursor was read is kept) and adopt the
+/// pulled rows into it ([`adopt_item_rows`]).
+async fn adopt_pulled_item_rows(
+    state_dir: &Path,
+    vault: &str,
+    lock: StoreLock<'_>,
+    rows: &[ItemRow],
+    max_seq: u64,
+    key: Option<&[u8]>,
+) -> Result<usize, String> {
+    let _guard = lock.acquire(vault).await;
+    let Some(mut pv) = read_per_item_store(state_dir, vault) else {
+        return Ok(0);
+    };
+    let before = (pv.held.clone(), pv.row_kinds.len(), pv.items_seq);
+    let keys = key.map(|m| (item_layer::VaultKeys::from_material(m), vault));
+    let adopted = adopt_item_rows(&mut pv, rows, max_seq, keys)?;
+    if adopted > 0 || (pv.held.clone(), pv.row_kinds.len(), pv.items_seq) != before {
         write_per_item_store(state_dir, vault, &pv)?;
     }
     Ok(adopted)
+}
+
+/// Offer the held rows of `vault` again under `key`, locally (no network).
+/// Returns the number adopted.
+fn reoffer_held(state_dir: &Path, vault: &str, key: &[u8]) -> Result<usize, String> {
+    let Some(mut pv) = read_per_item_store(state_dir, vault) else {
+        return Ok(0);
+    };
+    let before = (pv.held.clone(), pv.row_kinds.len());
+    let seq = pv.items_seq;
+    let keys = Some((item_layer::VaultKeys::from_material(key), vault));
+    let adopted = adopt_item_rows(&mut pv, &[], seq, keys)?;
+    if adopted > 0 || (pv.held.clone(), pv.row_kinds.len()) != before {
+        write_per_item_store(state_dir, vault, &pv)?;
+    }
+    Ok(adopted)
+}
+
+/// How long unlock waits for its pull before it serves.
+const UNLOCK_PULL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// At unlock, before the vault serves: offer every held row again under the
+/// vault key, then pull (the held rows again, and anything newer). Returns
+/// whether rows were adopted (the caller folds again) and the pull's error,
+/// if it failed (the caller keeps retrying in the background,
+/// [`retry_pull_after_unlock`]). A daemon with no cloud pulls nothing. The
+/// caller (the unlock approve) holds the vault write lock.
+pub(crate) async fn catch_up_at_unlock(
+    state: &Arc<AppState>,
+    vault_id: &str,
+    key: &[u8],
+) -> (bool, Option<String>) {
+    let state_dir = &state.config.state_dir;
+    let mut adopted = match reoffer_held(state_dir, vault_id, key) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, "unlock: held rows not offered again: {}", e);
+            0
+        }
+    };
+    let Ok(cfg) = active::load() else {
+        return (adopted > 0, None);
+    };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return (adopted > 0, None);
+    };
+    let Some(dk) = device_key() else {
+        return (adopted > 0, Some("this daemon is not paired".into()));
+    };
+    let pulled = tokio::time::timeout(
+        UNLOCK_PULL_TIMEOUT,
+        pull_items(state_dir, cloud, vault_id, &dk, Some(key), StoreLock::Held),
+    )
+    .await;
+    match pulled {
+        Ok(Ok(n)) => {
+            adopted += n;
+            state.record_cloud_contact(vault_id);
+            (adopted > 0, None)
+        }
+        Ok(Err(e)) => (adopted > 0, Some(e)),
+        Err(_) => (
+            adopted > 0,
+            Some(format!(
+                "the cloud did not answer within {}s",
+                UNLOCK_PULL_TIMEOUT.as_secs()
+            )),
+        ),
+    }
+}
+
+/// After an unlock whose pull failed: keep pulling in the background (2 s,
+/// doubling to 60 s) until one succeeds or the vault locks again, and report
+/// it meanwhile ([`AppState::note_catch_up`], shown by `sc status`).
+pub(crate) fn retry_pull_after_unlock(state: Arc<AppState>, vault_id: String, error: String) {
+    tracing::warn!(vault = %vault_id, "unlock: the pull of changes from the cloud failed ({}); retrying in the background", error);
+    state.note_catch_up(&vault_id, &error);
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(2);
+        loop {
+            tokio::time::sleep(delay).await;
+            if state.cloned_state_key(&vault_id).is_none() {
+                // Locked again: the next unlock pulls before it serves.
+                state.clear_catch_up(&vault_id);
+                return;
+            }
+            match pull_items_now(&state, &vault_id).await {
+                Ok(()) => {
+                    state.clear_catch_up(&vault_id);
+                    tracing::info!(vault = %vault_id, "unlock: changes from the cloud pulled");
+                    return;
+                }
+                Err(e) => {
+                    state.note_catch_up(&vault_id, &e);
+                    delay = (delay * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
+    });
 }
 
 /// Push a single item to the cloud with per-item CAS (§4). `base_version` is the
@@ -2593,12 +2943,27 @@ pub async fn pull_items(
 ///
 /// `PushOutcome::EndpointMissing` (a 404) means the backend `/items` route isn't
 /// live yet — the caller treats it as a no-op (stubbed[]).
+/// `PushOutcome::Rejected` is a TERMINAL refusal ([`is_terminal_put_status`]):
+/// the same bytes can never land, so retrying them is pointless.
+/// `PushOutcome::KeysetChanged` (a 409 `SC_KEYSET_CHANGED`): the row was
+/// sealed under another keyset generation than the vault's current one.
 pub enum PushOutcome {
     Ok { version: u64, seq: u64 },
     Conflict { current_version: u64 },
     EndpointMissing,
+    Rejected { status: u16, error: String },
+    KeysetChanged,
 }
 
+/// A non-2xx item PUT status the server returns for the write ITSELF (bad
+/// request, plan freeze 402, owner-only / agent / record-signature gates 403,
+/// too large, unprocessable): retrying the same bytes never lands. Everything
+/// else non-2xx (5xx, 503 `agent_authz_unavailable`, 429 …) is transient.
+fn is_terminal_put_status(status: u16) -> bool {
+    matches!(status, 400 | 402 | 403 | 413 | 422)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn push_item(
     cloud: &str,
     vault: &str,
@@ -2607,6 +2972,7 @@ pub async fn push_item(
     base_version: Option<u64>,
     version: u64,
     ct_b64: &str,
+    generation: Option<u64>,
 ) -> Result<PushOutcome, String> {
     let url = format!(
         "{}/v/{}/items/{}",
@@ -2619,6 +2985,11 @@ pub async fn push_item(
     let mut body = serde_json::json!({ "version": version, "ct": ct_b64 });
     if let Some(bv) = base_version {
         body["base_version"] = serde_json::json!(bv);
+    }
+    // The keyset generation the row was sealed under: a vault with a keyset
+    // takes a row only at its current one.
+    if let Some(g) = generation {
+        body["generation"] = serde_json::json!(g);
     }
     let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
@@ -2640,16 +3011,35 @@ pub async fn push_item(
             })
         }
         409 => {
+            // Backend: `{conflict, currentVersion}` (0 = the row is gone). Read
+            // `currentVersion ?? version` like the console.
             let b: serde_json::Value = resp.json().await.unwrap_or_default();
+            if b.get("code").and_then(|v| v.as_str()) == Some("SC_KEYSET_CHANGED")
+                || b.get("error").and_then(|v| v.as_str()) == Some("keyset_changed")
+            {
+                return Ok(PushOutcome::KeysetChanged);
+            }
             let current = b
                 .get("currentVersion")
                 .and_then(|v| v.as_u64())
+                .or_else(|| b.get("version").and_then(|v| v.as_u64()))
                 .unwrap_or(version);
             Ok(PushOutcome::Conflict {
                 current_version: current,
             })
         }
         404 => Ok(PushOutcome::EndpointMissing),
+        other if is_terminal_put_status(other) => {
+            let b: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(PushOutcome::Rejected {
+                status: other,
+                error: b
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        }
         other => Err(format!("item PUT HTTP {}", other)),
     }
 }
@@ -2687,21 +3077,1167 @@ pub async fn gc_item(
     }
 }
 
-/// Push every LOCAL item whose version is ahead of what the cloud last confirmed
-/// (tracked by the per-item store's own rows). Each row is pushed with CAS; a
-/// 409 is reconciled per §4:
-///   - independent edit (the cloud's newer row is a DIFFERENT logical item, i.e.
-///     our push targeted a row the cloud doesn't have or has at a lower version)
-///     → adopt the cloud row and retry with the fresh base;
-///   - genuine same-item conflict (both wrote the same id) → leave theirs, write
-///     OURS as a conflict-copy (deterministic id via `conflict_copy_id`, so a
-///     retry can't spawn a second) — needs `K`, so it runs only for an UNLOCKED
-///     vault; a locked vault defers the conflict-copy to the next unlock.
+/// One DIRTY local row (`version > synced_version`) snapshotted for a push, so
+/// the store isn't held across awaits.
+#[derive(Clone)]
+struct DirtyRow {
+    id: String,
+    version: u64,
+    synced_version: u64,
+    ct: Vec<u8>,
+    tombstone: bool,
+    /// The digest of the body our change was made from, when known
+    /// ([`pv_store::StoredItem::base`]).
+    base: Option<String>,
+    /// Written by SafeClaw's automatic upgrade ([`pv_store::StoredItem::upgrade`]).
+    upgrade: bool,
+    /// The keyset generation it was sealed under ([`pv_store::StoredItem::generation`]).
+    generation: Option<u64>,
+}
+
+/// `base_version` to push a dirty row with: the last version KNOWN to be on the
+/// cloud (`synced_version`), so several local bumps between pushes still CAS
+/// against the row the cloud actually holds instead of 409ing on themselves.
+/// `synced_version == 0` ("never confirmed": a fresh local create, or a row from
+/// a store that predates the tracking) is a CREATE: if the cloud has the row,
+/// that 409s into the reconcile. Guessing `version - 1` instead could CAS-match
+/// another device's row and silently overwrite its content.
+fn push_base_version(synced_version: u64) -> Option<u64> {
+    (synced_version > 0).then_some(synced_version)
+}
+
+/// How a same-item 409 resolves (§4). Never last-writer-wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictAction {
+    /// Theirs already says what ours says (same live body, or both deleted):
+    /// adopt theirs, write nothing.
+    Adopt,
+    /// Keep both: theirs stays at the canonical id, ours is written as a
+    /// conflict copy; the local store converges to theirs + the copy.
+    KeepBoth,
+    /// Re-apply ours on top of theirs (CAS on their version), or re-create it
+    /// when their row is gone.
+    Reapply,
+    /// Owner-config: never overwritten, never re-sealed. Theirs stays, ours
+    /// is set aside locally ([`set_aside_fixes`]) and the user is told it
+    /// changed elsewhere meanwhile.
+    SetAside,
+}
+
+/// The §4 decision for OUR dirty row vs THEIR current row (`None` = gone),
+/// per the record's conflict policy in the rule table
+/// ([`item_layer::conflict_policy`]; the console applies the same):
+///   - an equal live body (normalized) is a no-op adopt, both deleted too;
+///   - `keep_both`: theirs stays, ours becomes the conflict copy (their
+///     delete vs our edit: the delete stands, ours is the copy); their body
+///     equal to our `base` (normalized; e.g. they only copied it during a
+///     migration) is no conflict: ours is re-applied. Our delete vs their
+///     edit: the delete is re-applied;
+///   - `take_writer`: ours is re-applied (a delete too);
+///   - `owner_config`: ours is set aside, never written over theirs.
 ///
-/// NOTE: the full conflict-copy branch requires K + the item's (ns,name), which
-/// we recover by unsealing the local row. Where the vault is locked, the row is
-/// left ahead and retried next unlock (documented in stubbed[]).
+/// Their row gone → ours is re-created.
+fn decide_conflict(
+    ours: &item_layer::ItemPayload,
+    theirs: Option<&item_layer::ItemPayload>,
+    base: Option<&str>,
+) -> ConflictAction {
+    use item_layer::Conflict;
+    let Some(theirs) = theirs else {
+        return ConflictAction::Reapply;
+    };
+    let policy = item_layer::conflict_policy(ours.ns, &ours.name);
+    if ours.is_tombstone() {
+        return if theirs.is_tombstone() {
+            ConflictAction::Adopt
+        } else if policy == Conflict::OwnerConfig {
+            ConflictAction::SetAside
+        } else {
+            ConflictAction::Reapply
+        };
+    }
+    let their_digest = (!theirs.is_tombstone() && theirs.ns == ours.ns && theirs.name == ours.name)
+        .then(|| item_layer::body_digest_hex(theirs.ns, &theirs.name, &theirs.body));
+    if their_digest.is_some()
+        && their_digest == Some(item_layer::body_digest_hex(ours.ns, &ours.name, &ours.body))
+    {
+        return ConflictAction::Adopt;
+    }
+    match policy {
+        Conflict::KeepBoth if their_digest.is_some() && their_digest.as_deref() == base => {
+            ConflictAction::Reapply
+        }
+        Conflict::KeepBoth => ConflictAction::KeepBoth,
+        Conflict::TakeWriter => ConflictAction::Reapply,
+        Conflict::OwnerConfig => ConflictAction::SetAside,
+    }
+}
+
+/// A local-store change produced by the push loop, applied after it to a
+/// FRESHLY re-read store (see [`apply_local_fixes`]).
+enum LocalFix {
+    /// Our push landed at `version` → the row is clean.
+    Synced { id: String, version: u64 },
+    /// Replace the row at `id` with `row` iff it is still at version `expect`
+    /// (theirs adopted, or ours re-sealed at a fresh version and landed).
+    Replace {
+        id: String,
+        expect: u64,
+        row: pv_store::StoredItem,
+    },
+    /// A row known to be on the cloud (a conflict copy) → stored iff the
+    /// local row is absent, or clean and older (as a pull adopts it).
+    Mirror {
+        id: String,
+        row: pv_store::StoredItem,
+    },
+    /// Drop our row at `id` iff it is still at version `expect` (a dirty row
+    /// this device cannot read, with no row of theirs to take).
+    Drop { id: String, expect: u64 },
+    /// Keep `ours` as its conflict copy, a dirty record of its own name
+    /// placed against the local store ([`PerItemVault::keep_conflict_copy`]).
+    /// When no copy may be written, the fixes for the row `of` are not
+    /// applied: ours stays dirty and the refusal is reported.
+    KeepCopy {
+        of: String,
+        ours: item_layer::ItemPayload,
+    },
+}
+
+/// A clean row exactly as the cloud holds it (`synced_version == version`).
+fn clean_row(
+    version: u64,
+    ct: Vec<u8>,
+    tombstone: bool,
+    sig: Option<String>,
+    signer: Option<String>,
+) -> pv_store::StoredItem {
+    pv_store::StoredItem {
+        version,
+        ct,
+        synced_version: version,
+        tombstone,
+        sig,
+        signer,
+        base: None,
+        upgrade: false,
+        generation: None,
+        unreadable_confirmed: false,
+    }
+}
+
+/// What [`apply_local_fixes`] did: whether the store changed, whether a row's
+/// sealed content was replaced or added (the unlocked cache needs a refresh),
+/// and the conflict copies refused, each `(row id, why)`.
+#[derive(Debug, Default)]
+struct Applied {
+    changed: bool,
+    content_changed: bool,
+    refused: Vec<(String, String)>,
+}
+
+/// Apply the push loop's [`LocalFix`]es. Every change is version-guarded so a
+/// writer that raced the push (bumped a row meanwhile) is never clobbered: its
+/// newer row stays dirty and goes out on the next push. A conflict copy needs
+/// `keys`; one that cannot be written keeps ours dirty (the other fixes for
+/// that row are skipped).
+fn apply_local_fixes(
+    pv: &mut PerItemVault,
+    fixes: Vec<LocalFix>,
+    keys: Option<(item_layer::VaultKeys<'_>, &str)>,
+) -> Applied {
+    type S = sudp::primitives::StdPrimitives;
+    let mut out = Applied::default();
+    let mut blocked: std::collections::BTreeSet<String> = Default::default();
+    for fix in fixes {
+        match fix {
+            LocalFix::Synced { id, version } => {
+                if let Some(s) = pv.items.get_mut(&id) {
+                    if s.version == version && s.synced_version < version {
+                        s.synced_version = version;
+                        out.changed = true;
+                    }
+                }
+            }
+            LocalFix::Replace { id, expect, row } => {
+                if blocked.contains(&id) {
+                    continue;
+                }
+                let current = pv.items.get(&id).map(|s| (s.version, s.synced_version));
+                if current
+                    .is_some_and(|(v, synced)| v == expect && !is_rollback(row.version, synced))
+                {
+                    pv.items.insert(id, row);
+                    out.changed = true;
+                    out.content_changed = true;
+                }
+            }
+            LocalFix::Drop { id, expect } => {
+                if pv.items.get(&id).is_some_and(|s| s.version == expect) {
+                    pv.items.remove(&id);
+                    out.changed = true;
+                }
+            }
+            LocalFix::Mirror { id, row } => {
+                let take = pv.items.get(&id).is_none_or(|s| {
+                    s.version < row.version && s.version <= s.synced_version
+                });
+                if take {
+                    pv.items.insert(id, row);
+                    out.changed = true;
+                    out.content_changed = true;
+                }
+            }
+            LocalFix::KeepCopy { of, ours } => {
+                let kept = match keys {
+                    Some((keys, vault_id)) => pv.keep_conflict_copy::<S>(keys, vault_id, &ours),
+                    None => Err(crate::error::AppError::Internal(
+                        "a conflict copy needs the vault key".into(),
+                    )),
+                };
+                match kept {
+                    Ok(Some(_)) => {
+                        out.changed = true;
+                        out.content_changed = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        out.refused.push((of.clone(), e.to_string()));
+                        blocked.insert(of);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// THEIR rows for the 409 reconcile: one full `/items` snapshot, fetched lazily
+/// on the first resolvable conflict of a push and shared by the rest.
+enum TheirRows {
+    Unfetched,
+    Fetched(std::collections::HashMap<String, ItemRow>),
+    Unavailable,
+}
+
+/// Outcome of reconciling one 409.
+enum Resolved {
+    /// Resolved on the cloud; apply these to the local store.
+    Fixed(Vec<LocalFix>),
+    /// Not resolvable now (unreadable row, network error, raced again): the row
+    /// stays dirty and is reconciled on the next push.
+    LeaveDirty,
+    /// `/items` is not live (404): stop the push.
+    EndpointMissing,
+    /// THEIR row stays canonical and OURS is set aside ([`set_aside_fixes`]):
+    /// apply the fixes and tell the user `record` changed elsewhere meanwhile.
+    SetAside {
+        fixes: Vec<LocalFix>,
+        record: String,
+    },
+    /// Ours cannot be kept as a conflict copy (a row it would go over cannot
+    /// be read, or the last copy level is taken): the row stays dirty and
+    /// the user is told why.
+    Refused(String),
+    /// THEIR row cannot be opened with this device's keys: it was changed
+    /// under a vault key this device does not have. It is not written over
+    /// before a keyset refresh: it is taken locally as it is (the fixes), so
+    /// ours is no longer sent, and ours is set aside; the user is told with
+    /// `note`. `overwrite`: ours, to go over theirs if, after a keyset refresh,
+    /// theirs still opens under no key a current member holds
+    /// ([`overwrite_unreadable`]); `None` when ours is the row that cannot be
+    /// read.
+    NotReadable {
+        fixes: Vec<LocalFix>,
+        note: String,
+        overwrite: Option<Overwrite>,
+    },
+    /// The cloud refused ours for good ([`rejection_fixes`]): `fixes` (none:
+    /// ours stays dirty, unsent), and the user is told with `note`
+    /// ([`rejection_note`]); never reverted silently.
+    Rejected { fixes: Vec<LocalFix>, note: String },
+}
+
+/// What the user is told of a change of `ours` the cloud refused for good
+/// (`status`, `error`), and what became of it (`fixes`, as
+/// [`rejection_fixes`] made them): kept as its conflict copy, kept unsent,
+/// or not applied while the vault's version stays.
+fn rejection_note(ours: &item_layer::ItemPayload, status: u16, error: &str, fixes: &[LocalFix]) -> String {
+    let error: String = crate::util::terminal_safe(error).chars().take(80).collect();
+    let why = if error.is_empty() {
+        format!("HTTP {}", status)
+    } else {
+        format!("HTTP {}: {}", status, error)
+    };
+    let what = if fixes.iter().any(|f| matches!(f, LocalFix::KeepCopy { .. })) {
+        format!(
+            "the vault keeps its version; yours is kept on this device as \"{}\" and is sent once the cloud takes it",
+            item_layer::conflict_copy_name(&ours.name)
+        )
+    } else if fixes.is_empty() {
+        "it is kept on this device, unsent".to_string()
+    } else {
+        "the vault keeps its version; re-run it once the cloud takes it".to_string()
+    };
+    format!("{}: the cloud refused this change ({}); {}", conflict_record(ours), why, what)
+}
+
+/// [`rejection_fixes`] as a [`Resolved::Rejected`], said to the user.
+fn rejected(
+    ours_row: &DirtyRow,
+    ours: &item_layer::ItemPayload,
+    theirs: Option<TheirItem>,
+    status: u16,
+    error: &str,
+) -> Resolved {
+    let fixes = rejection_fixes(ours_row, ours, theirs).unwrap_or_default();
+    let note = rejection_note(ours, status, error, &fixes);
+    Resolved::Rejected { fixes, note }
+}
+
+/// Ours, to write over THEIR row that cannot be read ([`Resolved::NotReadable`]).
+struct Overwrite {
+    /// The version their row is at (ours goes at the next one).
+    their_version: u64,
+    ours: item_layer::ItemPayload,
+}
+
+/// What the user is told when a row of `record` cannot be opened here
+/// ([`Resolved::NotReadable`]): the same sentence a local write refused over
+/// such a row says ([`pv_store::unreadable_refusal`]).
+fn not_readable_note(record: &str) -> String {
+    pv_store::unreadable_refusal(record)
+}
+
+/// Replace our dirty row with THEIR row (clean), guarded on our version.
+fn adopt_fix(ours: &DirtyRow, theirs: &ItemRow, ct: Vec<u8>, tombstone: bool) -> LocalFix {
+    LocalFix::Replace {
+        id: ours.id.clone(),
+        expect: ours.version,
+        row: clean_row(
+            theirs.version,
+            ct,
+            tombstone,
+            theirs.sig.clone(),
+            theirs.signer.clone(),
+        ),
+    }
+}
+
+/// THEIR current row opened under `K`: `(row, raw ct, payload)`.
+type TheirItem = (ItemRow, Vec<u8>, item_layer::ItemPayload);
+
+/// Open OUR dirty row and read THEIR current row (`None` = gone) from the full
+/// `/items` snapshot (fetched once per push, shared via [`TheirRows`]).
+/// `current_version == Some(0)` (a 409 on a GC'd row) skips the fetch. `Err`
+/// says how to leave the row (unreadable, snapshot unavailable, endpoint gone).
+async fn load_conflict_pair(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: item_layer::VaultKeys<'_>,
+    their_rows: &mut TheirRows,
+    ours_row: &DirtyRow,
+    current_version: Option<u64>,
+) -> Result<(item_layer::ItemPayload, Option<TheirItem>), Resolved> {
+    let theirs_row: Option<ItemRow> = if current_version == Some(0) {
+        None
+    } else {
+        if matches!(their_rows, TheirRows::Unfetched) {
+            *their_rows = match fetch_item_rows(cloud, vault_id, dk, 0).await {
+                Ok(Some((rows, _))) => {
+                    TheirRows::Fetched(rows.into_iter().map(|r| (r.item_id.clone(), r)).collect())
+                }
+                Ok(None) => return Err(Resolved::EndpointMissing),
+                Err(e) => {
+                    tracing::warn!(vault = %vault_id, "per-item reconcile: snapshot fetch failed ({}); rows left dirty", e);
+                    TheirRows::Unavailable
+                }
+            };
+        }
+        match &*their_rows {
+            TheirRows::Fetched(map) => map.get(&ours_row.id).cloned(),
+            _ => return Err(Resolved::LeaveDirty),
+        }
+    };
+    open_conflict_pair(keys, vault_id, ours_row, theirs_row)
+}
+
+/// A fetched row older than the version this device last saw synced for the
+/// same item is a rollback: never adopted (the one anti-rollback rule of the
+/// sync; nothing else is stored for it).
+fn is_rollback(fetched_version: u64, synced_version: u64) -> bool {
+    fetched_version < synced_version
+}
+
+/// Open OUR dirty row and THEIR row (`None` = gone) for the reconcile. THEIR
+/// row below the version we last saw synced ([`is_rollback`]) is not taken:
+/// warned, ours left dirty. An unreadable row: left dirty.
+fn open_conflict_pair(
+    keys: item_layer::VaultKeys<'_>,
+    vault_id: &str,
+    ours_row: &DirtyRow,
+    theirs_row: Option<ItemRow>,
+) -> Result<(item_layer::ItemPayload, Option<TheirItem>), Resolved> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
+    // Ours is this device's own change: it opens under any key it holds.
+    let ours = match item_layer::open_own_wire_item::<S>(
+        keys,
+        vault_id,
+        &ours_row.id,
+        ours_row.version,
+        &ours_row.ct,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open our row ({}); not sent, set aside", e);
+            return Err(unreadable_ours(keys, vault_id, ours_row, theirs_row));
+        }
+    };
+    let theirs = match theirs_row {
+        None => None,
+        Some(r) if is_rollback(r.version, ours_row.synced_version) => {
+            tracing::warn!(
+                vault = %vault_id, item = %ours_row.id, their_version = r.version, synced_version = ours_row.synced_version,
+                "per-item reconcile: the cloud returned an older version than this device synced; not adopted, left dirty"
+            );
+            return Err(Resolved::LeaveDirty);
+        }
+        Some(r) => {
+            let opened = URL_SAFE_NO_PAD
+                .decode(r.ct.as_bytes())
+                .map_err(|e| e.to_string())
+                .and_then(|ct| {
+                    item_layer::open_wire_item::<S>(keys, vault_id, &r.item_id, r.version, &ct)
+                        .map(|p| (ct, p))
+                        .map_err(|e| e.to_string())
+                });
+            match opened {
+                Ok((ct, p)) => Some((r, ct, p)),
+                Err(e) => {
+                    // Changed under a key this device lacks: never written
+                    // over. Theirs is taken as it is, ours set aside.
+                    let Ok(ct) = URL_SAFE_NO_PAD.decode(r.ct.as_bytes()) else {
+                        tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: their row is not base64url ({}); left dirty", e);
+                        return Err(Resolved::LeaveDirty);
+                    };
+                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item reconcile: can't open their row ({}); theirs kept, ours set aside", e);
+                    return Err(Resolved::NotReadable {
+                        fixes: vec![adopt_fix(ours_row, &r, ct, false)],
+                        note: not_readable_note(&conflict_record(&ours)),
+                        overwrite: Some(Overwrite {
+                            their_version: r.version,
+                            ours: ours.clone(),
+                        }),
+                    });
+                }
+            }
+        }
+    };
+    Ok((ours, theirs))
+}
+
+/// OUR dirty row cannot be opened here (sealed under a key this device no
+/// longer holds, or under a retired key that does not list it): it is never
+/// sent. THEIR row, when there is one, is taken as it is; with none, ours is
+/// dropped locally. Either way it stops being offered, and the user is told
+/// ([`not_readable_note`]). Their row older than what this device synced
+/// ([`is_rollback`]) is not taken: left dirty.
+fn unreadable_ours(
+    keys: item_layer::VaultKeys<'_>,
+    vault_id: &str,
+    ours_row: &DirtyRow,
+    theirs_row: Option<ItemRow>,
+) -> Resolved {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
+    let (fix, record) = match theirs_row {
+        Some(r) if is_rollback(r.version, ours_row.synced_version) => return Resolved::LeaveDirty,
+        Some(r) => {
+            let Ok(ct) = URL_SAFE_NO_PAD.decode(r.ct.as_bytes()) else {
+                return Resolved::LeaveDirty;
+            };
+            let theirs = item_layer::open_wire_item::<S>(keys, vault_id, &r.item_id, r.version, &ct).ok();
+            let tombstone = theirs.as_ref().is_some_and(|p| p.is_tombstone());
+            (
+                adopt_fix(ours_row, &r, ct, tombstone),
+                theirs.as_ref().map(conflict_record),
+            )
+        }
+        None => (
+            LocalFix::Drop {
+                id: ours_row.id.clone(),
+                expect: ours_row.version,
+            },
+            None,
+        ),
+    };
+    let record = record.unwrap_or_else(|| format!("item {}", ours_row.id));
+    Resolved::NotReadable {
+        fixes: vec![fix],
+        note: not_readable_note(&record),
+        overwrite: None,
+    }
+}
+
+/// Local fixes for a TERMINAL rejection of OUR dirty row
+/// ([`is_terminal_put_status`]). The server will never take these bytes, and
+/// the pull cursor has already moved past THEIR row (a pull never adopts over a
+/// dirty row), so just leaving ours dirty would pin the canonical id to a value
+/// only this device holds and re-offer it forever. Instead THEIR row becomes
+/// the canonical one locally and, for a differing live value in a keep-both
+/// namespace, OURS is kept as its conflict copy, a dirty record of its own
+/// name ([`LocalFix::KeepCopy`]): it is offered on every push and lands once
+/// the entitlement returns (e.g. the plan is unfrozen). A refused delete, an
+/// equal value, or another namespace just takes theirs. `None` = nothing to
+/// take (no row of theirs: a refused create), so ours stays dirty where it is.
+fn rejection_fixes(
+    ours_row: &DirtyRow,
+    ours: &item_layer::ItemPayload,
+    theirs: Option<TheirItem>,
+) -> Option<Vec<LocalFix>> {
+    let (r, ct, p) = theirs?;
+    let mut fixes = Vec::new();
+    if decide_conflict(ours, Some(&p), ours_row.base.as_deref()) == ConflictAction::KeepBoth {
+        fixes.push(LocalFix::KeepCopy {
+            of: ours_row.id.clone(),
+            ours: ours.clone(),
+        });
+    }
+    fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
+    Some(fixes)
+}
+
+/// The server's refusal of an unsigned version over a row it holds signed (an
+/// owner-config record keeps its type and owner signature). This process never
+/// signs, so the same row can never land: a conflict, not a retryable error.
+fn is_signed_row_refusal(status: u16, error: &str) -> bool {
+    status == 403 && error == "record_write_forbidden"
+}
+
+/// The record a set-aside change concerns, as the user knows it
+/// ([`item_layer::record_label`]).
+fn conflict_record(p: &item_layer::ItemPayload) -> String {
+    item_layer::record_label(p)
+}
+
+/// Local fixes for OUR dirty row when THEIR row carries a signature this
+/// process cannot produce for a new version (it signs nothing), or is
+/// owner-config: ours must never replace it. THEIR row stays canonical and
+/// untouched on the cloud. OURS, when it is a live value that differs from
+/// theirs in a keep-both namespace, is kept as its conflict copy
+/// ([`LocalFix::KeepCopy`]); otherwise it is not kept, and the caller reports
+/// it for a re-run. `None` = no row of theirs to take (left dirty).
+fn set_aside_fixes(
+    ours_row: &DirtyRow,
+    ours: &item_layer::ItemPayload,
+    theirs: Option<TheirItem>,
+) -> Option<Vec<LocalFix>> {
+    let (r, ct, p) = theirs?;
+    let mut fixes = Vec::new();
+    let same = !p.is_tombstone()
+        && item_layer::body_digest(p.ns, &p.name, &p.body)
+            == item_layer::body_digest(ours.ns, &ours.name, &ours.body);
+    if !ours.is_tombstone()
+        && !same
+        && item_layer::conflict_policy(ours.ns, &ours.name) == item_layer::Conflict::KeepBoth
+    {
+        fixes.push(LocalFix::KeepCopy {
+            of: ours_row.id.clone(),
+            ours: ours.clone(),
+        });
+    }
+    fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
+    Some(fixes)
+}
+
+/// How a set-aside change of `record` is reported: one SafeClaw's automatic
+/// upgrade wrote (`upgrade`) as the upgrade pausing and retrying, any other
+/// as the person's change set aside.
+fn set_aside_note(record: String, upgrade: bool) -> crate::state::SyncNote {
+    if upgrade {
+        crate::state::SyncNote::UpgradePaused(record)
+    } else {
+        crate::state::SyncNote::ChangedElsewhere(record)
+    }
+}
+
+/// [`set_aside_fixes`] as a [`Resolved`].
+fn set_aside(
+    ours_row: &DirtyRow,
+    ours: &item_layer::ItemPayload,
+    theirs: Option<TheirItem>,
+) -> Resolved {
+    match set_aside_fixes(ours_row, ours, theirs) {
+        Some(fixes) => Resolved::SetAside {
+            fixes,
+            record: conflict_record(ours),
+        },
+        None => Resolved::LeaveDirty,
+    }
+}
+
+/// Reconcile a TERMINAL rejection of OUR dirty row: see [`rejection_fixes`];
+/// a refusal over a signed row (`signed_row`) is a conflict ([`set_aside`]).
+#[allow(clippy::too_many_arguments)]
+async fn resolve_rejection(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: item_layer::VaultKeys<'_>,
+    their_rows: &mut TheirRows,
+    ours_row: &DirtyRow,
+    status: u16,
+    error: &str,
+) -> Resolved {
+    let (ours, theirs) =
+        match load_conflict_pair(cloud, vault_id, dk, keys, their_rows, ours_row, None).await {
+            Ok(pair) => pair,
+            Err(r) => return r,
+        };
+    if is_signed_row_refusal(status, error) {
+        return set_aside(ours_row, &ours, theirs);
+    }
+    rejected(ours_row, &ours, theirs, status, error)
+}
+
+/// Warn ONCE per (vault, item, version, status) about a terminal rejection: a
+/// row the server keeps refusing (a refused create on a frozen plan) is
+/// re-offered on every push and must not flood the log.
+fn warn_rejected_once(vault_id: &str, item: &str, version: u64, status: u16, error: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{}/{}@{}:{}", vault_id, item, version, status);
+    let first = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(key))
+        .unwrap_or(true);
+    if first {
+        tracing::warn!(
+            vault = %vault_id, item = %item, version, status, error = %error,
+            "per-item push: rejected by the server (not retryable); theirs kept canonical, ours kept as a local conflict copy where possible"
+        );
+    } else {
+        tracing::debug!(vault = %vault_id, item = %item, version, status, "per-item push: rejected again");
+    }
+}
+
+/// Reconcile one 409 on OUR dirty row (§4) under `K` (`keys`): open ours, read
+/// THEIR current row from the full snapshot, then per [`decide_conflict`]:
+///   - `Adopt`    → take theirs locally;
+///   - `SetAside` → owner-config: theirs stays, ours is set aside
+///     ([`set_aside_fixes`]) and reported; nothing is written;
+///   - `KeepBoth` → write ours as the conflict copy (CREATE at version 1 under
+///     `conflict_copy_id(id_seed, ns, name, their_version)`; a 409 on it means
+///     an earlier attempt already wrote it), then take theirs locally;
+///   - `Reapply`  → re-seal ours at `their_version + 1` and CAS on their version
+///     (their row gone → re-create ours as-is). Their row signed → never: an
+///     unsigned re-seal could only clear the signature, so ours is set aside
+///     ([`set_aside_fixes`]) and the cloud row is left as it is.
+///
+/// A terminal rejection of the extra write falls back to [`rejection_fixes`]
+/// (a refusal over a signed row: [`set_aside_fixes`]).
+/// At most ONE extra write per item per push: a second 409 leaves the row dirty
+/// for the next push (bounded, no loop). Nothing local changes unless the cloud
+/// write it depends on landed (or was refused for good), so a retry re-derives
+/// the same decision and the same copy id (idempotent).
+#[allow(clippy::too_many_arguments)]
+async fn resolve_conflict(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: item_layer::VaultKeys<'_>,
+    their_rows: &mut TheirRows,
+    ours_row: &DirtyRow,
+    current_version: u64,
+    session_generation: Option<u64>,
+) -> Resolved {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
+
+    let (ours, theirs) = match load_conflict_pair(
+        cloud,
+        vault_id,
+        dk,
+        keys,
+        their_rows,
+        ours_row,
+        Some(current_version),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(r) => return r,
+    };
+
+    match decide_conflict(
+        &ours,
+        theirs.as_ref().map(|(_, _, p)| p),
+        ours_row.base.as_deref(),
+    ) {
+        ConflictAction::Adopt => {
+            let Some((r, ct, p)) = theirs else {
+                return Resolved::LeaveDirty;
+            };
+            Resolved::Fixed(vec![adopt_fix(ours_row, &r, ct, p.is_tombstone())])
+        }
+        ConflictAction::KeepBoth => {
+            let Some((r, ct, p)) = theirs else {
+                return Resolved::LeaveDirty;
+            };
+            // OURS is kept as its conflict copy, an ordinary record of its own
+            // name, placed against the cloud's rows (the snapshot).
+            let TheirRows::Fetched(snapshot) = &*their_rows else {
+                return Resolved::LeaveDirty;
+            };
+            let slot = item_layer::conflict_copy_slot::<S>(keys.id_seed, &ours, |wire| {
+                match snapshot.get(wire) {
+                    None => item_layer::RowAt::Absent,
+                    Some(c) => match URL_SAFE_NO_PAD.decode(c.ct.as_bytes()) {
+                        Ok(cct) => item_layer::row_at::<S>(
+                            keys,
+                            vault_id,
+                            wire,
+                            Some((c.version, cct.as_slice())),
+                        ),
+                        Err(_) => item_layer::RowAt::Unreadable,
+                    },
+                }
+            });
+            let mut fixes = Vec::new();
+            match slot {
+                Err(e) => return Resolved::Refused(e.to_string()),
+                Ok(item_layer::CopySlot::Same { wire }) => {
+                    // Already on the cloud: mirror it.
+                    if let Some(c) = snapshot.get(&wire) {
+                        if let Ok(cct) = URL_SAFE_NO_PAD.decode(c.ct.as_bytes()) {
+                            fixes.push(LocalFix::Mirror {
+                                id: wire.clone(),
+                                row: clean_row(c.version, cct, false, c.sig.clone(), c.signer.clone()),
+                            });
+                        }
+                    }
+                }
+                Ok(item_layer::CopySlot::Write {
+                    payload,
+                    wire,
+                    base_version,
+                }) => {
+                    let version = base_version.map_or(1, |v| v + 1);
+                    let copy_ct =
+                        match item_layer::seal_wire_item::<S>(keys, vault_id, &wire, version, &payload) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: seal conflict copy failed ({}); left dirty", e);
+                                return Resolved::LeaveDirty;
+                            }
+                        };
+                    match push_item(
+                        cloud,
+                        vault_id,
+                        dk,
+                        &wire,
+                        base_version,
+                        version,
+                        &URL_SAFE_NO_PAD.encode(&copy_ct),
+                        session_generation,
+                    )
+                    .await
+                    {
+                        Ok(PushOutcome::Ok { .. }) => fixes.push(LocalFix::Mirror {
+                            id: wire.clone(),
+                            row: clean_row(version, copy_ct, false, None, None),
+                        }),
+                        // Raced, or the vault key changed: the next push places it again.
+                        Ok(PushOutcome::Conflict { .. } | PushOutcome::KeysetChanged) => {
+                            return Resolved::LeaveDirty
+                        }
+                        Ok(PushOutcome::EndpointMissing) => return Resolved::EndpointMissing,
+                        Ok(PushOutcome::Rejected { status, error }) => {
+                            // The copy itself is refused for good (a NEW item on a
+                            // frozen plan): keep it locally, dirty, and take theirs.
+                            warn_rejected_once(vault_id, &wire, version, status, &error);
+                            return rejected(ours_row, &ours, Some((r, ct, p)), status, &error);
+                        }
+                        Err(e) => {
+                            tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: conflict copy write failed ({}); left dirty", e);
+                            return Resolved::LeaveDirty;
+                        }
+                    }
+                    tracing::info!(
+                        vault = %vault_id, item = %ours_row.id, copy = %wire, their_version = r.version,
+                        "per-item 409: kept both (theirs canonical, ours as its conflict copy)"
+                    );
+                }
+            }
+            fixes.push(adopt_fix(ours_row, &r, ct, p.is_tombstone()));
+            Resolved::Fixed(fixes)
+        }
+        ConflictAction::SetAside => {
+            tracing::info!(vault = %vault_id, item = %ours_row.id, "per-item 409: owner-config changed elsewhere; ours set aside");
+            set_aside(ours_row, &ours, theirs)
+        }
+        ConflictAction::Reapply => {
+            if theirs.as_ref().is_some_and(|(r, _, _)| r.sig.is_some()) {
+                tracing::info!(vault = %vault_id, item = %ours_row.id, "per-item 409: their row is signed; ours set aside");
+                return set_aside(ours_row, &ours, theirs);
+            }
+            let (base, version, ct, generation) = match &theirs {
+                // Their row is gone (GC'd): re-create ours as-is, at OUR version
+                // with its existing ct (sealed at that version, so the AAD
+                // matches). The backend takes a create at any version
+                // (`coalesce(p_version, 1)`); re-creating at 1 like the console
+                // would be ignored by a device still holding the GC'd row at a
+                // higher version (a pull adopts strictly-newer only).
+                None => (None, ours_row.version, ours_row.ct.clone(), ours_row.generation),
+                Some((r, _, _)) => {
+                    let v = r.version + 1;
+                    match item_layer::seal_wire_item::<S>(keys, vault_id, &ours_row.id, v, &ours) {
+                        Ok(ct) => (Some(r.version), v, ct, session_generation),
+                        Err(e) => {
+                            tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: re-seal failed ({}); left dirty", e);
+                            return Resolved::LeaveDirty;
+                        }
+                    }
+                }
+            };
+            match push_item(
+                cloud,
+                vault_id,
+                dk,
+                &ours_row.id,
+                base,
+                version,
+                &URL_SAFE_NO_PAD.encode(&ct),
+                generation,
+            )
+            .await
+            {
+                Ok(PushOutcome::Ok { .. }) => {
+                    let fix = if version == ours_row.version {
+                        LocalFix::Synced {
+                            id: ours_row.id.clone(),
+                            version,
+                        }
+                    } else {
+                        LocalFix::Replace {
+                            id: ours_row.id.clone(),
+                            expect: ours_row.version,
+                            row: clean_row(version, ct, ours.is_tombstone(), None, None),
+                        }
+                    };
+                    Resolved::Fixed(vec![fix])
+                }
+                // Raced again, or the vault key changed: one retry per item per
+                // push; the next push reconciles.
+                Ok(PushOutcome::Conflict { .. } | PushOutcome::KeysetChanged) => Resolved::LeaveDirty,
+                Ok(PushOutcome::EndpointMissing) => Resolved::EndpointMissing,
+                Ok(PushOutcome::Rejected { status, error })
+                    if is_signed_row_refusal(status, &error) =>
+                {
+                    set_aside(ours_row, &ours, theirs)
+                }
+                Ok(PushOutcome::Rejected { status, error }) => {
+                    warn_rejected_once(vault_id, &ours_row.id, version, status, &error);
+                    rejected(ours_row, &ours, theirs, status, &error)
+                }
+                Err(e) => {
+                    tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: re-apply failed ({}); left dirty", e);
+                    Resolved::LeaveDirty
+                }
+            }
+        }
+    }
+}
+
+/// What a push's rows resolved to, gathered for the store write-back and the
+/// notes ([`push_items_best_effort`]).
+#[derive(Default)]
+struct PushTally {
+    fixes: Vec<LocalFix>,
+    set_aside_rows: Vec<(String, String, bool)>,
+    refused_rows: Vec<(String, String)>,
+    left_dirty: usize,
+    endpoint_missing: bool,
+}
+
+impl PushTally {
+    /// Take what `row` resolved to. `false`: stop the push (`/items` is gone).
+    fn take(&mut self, row: &DirtyRow, r: Resolved) -> bool {
+        match r {
+            Resolved::Fixed(f) => self.fixes.extend(f),
+            Resolved::SetAside { fixes, record } => {
+                self.fixes.extend(fixes);
+                self.set_aside_rows.push((row.id.clone(), record, row.upgrade));
+            }
+            Resolved::Refused(why) => {
+                self.left_dirty += 1;
+                self.refused_rows.push((row.id.clone(), why));
+            }
+            Resolved::NotReadable { fixes, note, .. } => {
+                self.fixes.extend(fixes);
+                self.refused_rows.push((row.id.clone(), note));
+            }
+            Resolved::Rejected { fixes, note } => {
+                if fixes.is_empty() {
+                    self.left_dirty += 1;
+                }
+                self.fixes.extend(fixes);
+                self.refused_rows.push((row.id.clone(), note));
+            }
+            Resolved::LeaveDirty => self.left_dirty += 1,
+            Resolved::EndpointMissing => {
+                self.endpoint_missing = true;
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The keyset state a push checks its rows against, read from the store.
+struct PushGens {
+    /// The generation the vault's keyset is at (`None`: no keyset, unchecked).
+    keyset: Option<u64>,
+    /// The generation this session's keys seal under (`None`: locked, or
+    /// keys of an earlier generation).
+    session: Option<u64>,
+}
+
+fn push_gens(state_dir: &Path, vault_id: &str, keys: Option<item_layer::VaultKeys<'_>>) -> PushGens {
+    let pv = read_per_item_store(state_dir, vault_id);
+    PushGens {
+        keyset: pv.as_ref().and_then(|pv| pv.keyset_generation()),
+        session: match (pv.as_ref(), keys) {
+            (Some(pv), Some(k)) => pv.seal_generation(k),
+            _ => None,
+        },
+    }
+}
+
+/// How a dirty row stands against the keyset before it is sent.
+enum Gen {
+    /// Sealed at the keyset's generation (or the vault has no keyset): sent
+    /// as is.
+    Send,
+    /// Sealed under another generation (or one not recorded), and this
+    /// session holds the current key: the change re-sealed under it at the
+    /// same version, and the local fix that keeps it so.
+    Redone(DirtyRow, LocalFix),
+    /// Sealed under another generation, and this session does not hold the
+    /// current key (locked, or unlocked before the key changed): kept,
+    /// unsent, until `sc unlock`.
+    NeedsUnlock,
+    /// This device cannot read it under any key it holds.
+    Unreadable,
+}
+
+/// Check `row` against the keyset state `gens` before it is sent
+/// ([`Gen`]). A row of this device's own opens under any key it holds
+/// ([`item_layer::open_own_wire_item`]).
+fn check_generation(
+    gens: &PushGens,
+    keys: Option<item_layer::VaultKeys<'_>>,
+    vault_id: &str,
+    row: &DirtyRow,
+) -> Gen {
+    type S = sudp::primitives::StdPrimitives;
+    let readable = |k: item_layer::VaultKeys| {
+        item_layer::open_own_wire_item::<S>(k, vault_id, &row.id, row.version, &row.ct).ok()
+    };
+    let current = match gens.keyset {
+        Some(g) if row.generation != Some(g) => g,
+        // At the current generation, or no keyset: as is, if it reads.
+        _ => {
+            return match keys {
+                Some(k) if readable(k).is_none() => Gen::Unreadable,
+                _ => Gen::Send,
+            }
+        }
+    };
+    let Some(keys) = keys.filter(|_| gens.session == Some(current)) else {
+        return Gen::NeedsUnlock;
+    };
+    let Some(payload) = readable(keys) else {
+        return Gen::Unreadable;
+    };
+    let Ok(ct) = item_layer::seal_wire_item::<S>(keys, vault_id, &row.id, row.version, &payload)
+    else {
+        return Gen::NeedsUnlock;
+    };
+    let redone = DirtyRow {
+        ct: ct.clone(),
+        generation: Some(current),
+        ..row.clone()
+    };
+    let fix = LocalFix::Replace {
+        id: row.id.clone(),
+        expect: row.version,
+        row: pv_store::StoredItem {
+            version: row.version,
+            ct,
+            synced_version: row.synced_version,
+            tombstone: row.tombstone,
+            sig: None,
+            signer: None,
+            base: row.base.clone(),
+            upgrade: row.upgrade,
+            generation: Some(current),
+            unreadable_confirmed: false,
+        },
+    };
+    Gen::Redone(redone, fix)
+}
+
+/// The record a dirty row of this device's own changes, as the user knows
+/// it; `item <id>` when it cannot be read here.
+fn own_record(keys: Option<item_layer::VaultKeys<'_>>, vault_id: &str, row: &DirtyRow) -> String {
+    keys.and_then(|k| {
+        item_layer::open_own_wire_item::<sudp::primitives::StdPrimitives>(
+            k,
+            vault_id,
+            &row.id,
+            row.version,
+            &row.ct,
+        )
+        .ok()
+    })
+    .map(|p| conflict_record(&p))
+    .unwrap_or_else(|| format!("item {}", row.id))
+}
+
+/// What the user is told about a change of `record` this device made and
+/// this session cannot send ([`Gen::NeedsUnlock`]): kept, sent after
+/// `sc unlock`. `generation`: the keyset generation the change was sealed
+/// under. A change from before the generation was recorded (`None`) is
+/// not said to be under a changed key: that is not known.
+fn needs_unlock_note(record: &str, generation: Option<u64>) -> String {
+    match generation {
+        Some(_) => format!(
+            "{}: the vault key changed since this change was made on this device; run `sc unlock`, and it is sent under the new key",
+            record
+        ),
+        None => format!(
+            "{}: this change was made on this device before an update and is not sent yet; run `sc unlock`, and it is sent",
+            record
+        ),
+    }
+}
+
+/// Write ours over THEIR row that cannot be read ([`Overwrite`]), at their
+/// next version under the current key, CAS on their version. The fix that
+/// keeps it locally when it landed; `None` otherwise (theirs stands).
+async fn overwrite_unreadable(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: item_layer::VaultKeys<'_>,
+    row: &DirtyRow,
+    o: &Overwrite,
+    generation: Option<u64>,
+) -> Option<LocalFix> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    type S = sudp::primitives::StdPrimitives;
+    let version = o.their_version + 1;
+    let ct = item_layer::seal_wire_item::<S>(keys, vault_id, &row.id, version, &o.ours).ok()?;
+    let pushed = push_item(
+        cloud,
+        vault_id,
+        dk,
+        &row.id,
+        Some(o.their_version),
+        version,
+        &URL_SAFE_NO_PAD.encode(&ct),
+        generation,
+    )
+    .await;
+    match pushed {
+        Ok(PushOutcome::Ok { .. }) => {
+            tracing::info!(vault = %vault_id, item = %row.id, version, "per-item push: a row no current member can read was written over");
+            Some(LocalFix::Replace {
+                id: row.id.clone(),
+                expect: row.version,
+                row: clean_row(version, ct, o.ours.is_tombstone(), None, None),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A dirty row this device cannot read ([`Gen::Unreadable`]): never sent;
+/// theirs taken if there is one ([`unreadable_ours`]). Locked: left dirty.
+async fn set_aside_unreadable(
+    cloud: &str,
+    vault_id: &str,
+    dk: &str,
+    keys: Option<item_layer::VaultKeys<'_>>,
+    their_rows: &mut TheirRows,
+    row: &DirtyRow,
+) -> Resolved {
+    let Some(keys) = keys else {
+        return Resolved::LeaveDirty;
+    };
+    match load_conflict_pair(cloud, vault_id, dk, keys, their_rows, row, None).await {
+        Err(r) => r,
+        Ok(_) => Resolved::LeaveDirty,
+    }
+}
+
+/// Push every LOCAL item whose version is ahead of what the cloud last confirmed
+/// (`version > synced_version`), each with per-item CAS against the last version
+/// known to be on the cloud ([`push_base_version`]). Writes go before deletes.
+///
+/// A 409 (someone else wrote the same item) is reconciled inline by
+/// [`resolve_conflict`], never last-writer-wins, per the record's conflict
+/// policy in the rule table ([`decide_conflict`]):
+///   - an equal body (normalized): adopt theirs;
+///   - keep_both (`secret`, `connection`, `service`): theirs stays at the
+///     canonical id, ours is written as a conflict copy (`"<name> (conflict
+///     copy)"`, version 1, id `conflict_copy_id(id_seed, ns, name,
+///     their_version)`, byte-identical to the console's `putConflictCopy`),
+///     and the local store converges to theirs + the copy; their body equal
+///     to the base ours was made from is no conflict (ours is re-applied);
+///   - take_writer (`connecting`): re-apply ours on their fresh version;
+///   - owner_config: ours is set aside, never written over theirs;
+///   - our tombstone vs their edit: delete wins (our tombstone is re-applied),
+///     except over owner-config.
+///
+/// A TERMINAL rejection (400/402/403/413/422) is reconciled by
+/// [`resolve_rejection`]: theirs is taken at the canonical id and ours, where it
+/// differs, is kept as a LOCAL dirty conflict copy (warned once).
+///
+/// A row of theirs that is signed is never replaced by an unsigned version of
+/// ours (a 409 on it, or the server's `record_write_forbidden`): ours is set
+/// aside ([`set_aside_fixes`]) and the conflict is kept for the user
+/// ([`AppState::note_sync`], shown by `sc sync` and `sc status`)
+/// until a later push of that row lands.
+///
+/// A row of theirs this device cannot open (changed under a vault key it
+/// does not have) is never written over: it is taken as it is, ours is set
+/// aside and the user is told to sync and re-run ([`Resolved::NotReadable`]).
+///
+/// Every row is sent with the keyset generation it was sealed under, checked
+/// first against the keyset this device holds ([`check_generation`]): one
+/// sealed under another generation is re-sealed under the current key when
+/// this session holds it, else kept unsent with a note to run `sc unlock`.
+/// A `SC_KEYSET_CHANGED` refusal pulls the keyset (keys and membership) and
+/// does the same once; nothing is dropped.
+///
+/// Reconciling needs `K` (open ours/theirs, seal the copy), taken from the
+/// unlocked session ([`AppState::cloned_state_key`]). A LOCKED vault leaves the
+/// row dirty (nothing dropped, nothing copied); the pull side never adopts over
+/// a dirty row, so it is reconciled on the first push after unlock. One
+/// conflict never stops the loop for the other items.
 pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
     let Ok(cfg) = active::load() else { return };
     let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
         return;
@@ -2717,21 +4253,22 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     // the store across awaits. Clean rows (already confirmed on the cloud) are
     // skipped outright — re-offering them cost one 409 round-trip PER ROW on
     // EVERY sync (the "sc sync is slow and nothing even changed" bug).
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    let mut rows: Vec<(String, u64, String, bool)> = pv
+    let mut rows: Vec<DirtyRow> = pv
         .items
         .iter()
         .filter(|(_, s)| s.version > s.synced_version)
-        .map(|(id, s)| {
-            (
-                id.clone(),
-                s.version,
-                URL_SAFE_NO_PAD.encode(&s.ct),
-                s.tombstone,
-            )
+        .map(|(id, s)| DirtyRow {
+            id: id.clone(),
+            version: s.version,
+            synced_version: s.synced_version,
+            ct: s.ct.clone(),
+            tombstone: s.tombstone,
+            base: s.base.clone(),
+            upgrade: s.upgrade,
+            generation: s.generation,
         })
         .collect();
+    drop(pv);
     if rows.is_empty() {
         return;
     }
@@ -2741,65 +4278,285 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     // in one batch; if the tombstone reached the cloud first, a syncing console
     // would briefly see the connect withdrawn with no connection yet ("not
     // configured"). Ordering the delete last means every intermediate snapshot
-    // is either still-connecting or fully-connected, never a dangling gap.
-    rows.sort_by_key(|(_, _, _, tombstone)| *tombstone);
+    // is either still-connecting or fully-connected, never a dangling gap. A
+    // 409 is reconciled inline, so the ordering holds for re-applied rows too.
+    rows.sort_by_key(|r| r.tombstone);
+
+    // K for the 409 reconcile — present only while the vault is unlocked.
+    let k = state.cloned_state_key(vault_id);
+    let keys = k
+        .as_ref()
+        .map(|m| item_layer::VaultKeys::from_material(m.as_slice()));
+    // The keyset as this device holds it now: the generation every row is
+    // sent at, and whether this session holds that generation's key.
+    let mut gens = push_gens(state_dir, vault_id, keys);
+    let mut keyset_pulled = false;
 
     // A conflict/error on ONE item says nothing about the others (each item_id
     // is independent), so we NEVER stop the loop early — doing so would strand
-    // every item ordered after the first conflict. We push what we can, adopt
-    // server truth for the conflicting items with a single pull afterward, and
-    // leave any genuine same-item conflict to `reconcile_conflicts_after_pull`
-    // at unlock (needs K + (ns,name)).
-    let mut conflicted = false;
-    let mut endpoint_missing = false;
-    let mut pushed: Vec<(String, u64)> = Vec::new();
-    for (id, version, ct_b64, _tombstone) in rows {
-        // base_version = version-1 for an update; a version-1 row is a create.
-        let base_version = if version > 1 { Some(version - 1) } else { None };
-        match push_item(cloud, vault_id, &dk, &id, base_version, version, &ct_b64).await {
-            Ok(PushOutcome::Ok { .. }) => pushed.push((id, version)),
+    // every item ordered after the first conflict.
+    let mut their_rows = TheirRows::Unfetched;
+    let mut tally = PushTally::default();
+    for row in &rows {
+        // Checked against the latest keyset state before it is sent: a row
+        // sealed under another generation is redone under the current key, or
+        // waits for `sc unlock`; one this device cannot read is never sent.
+        let row = match check_generation(&gens, keys, vault_id, row) {
+            Gen::Send => row.clone(),
+            Gen::Redone(redone, fix) => {
+                tally.fixes.push(fix);
+                redone
+            }
+            Gen::NeedsUnlock => {
+                tally.left_dirty += 1;
+                tally.refused_rows.push((
+                    row.id.clone(),
+                    needs_unlock_note(&own_record(keys, vault_id, row), row.generation),
+                ));
+                continue;
+            }
+            Gen::Unreadable => {
+                let r = set_aside_unreadable(cloud, vault_id, &dk, keys, &mut their_rows, row).await;
+                if !tally.take(row, r) {
+                    break;
+                }
+                continue;
+            }
+        };
+        let row = &row;
+        let base_version = push_base_version(row.synced_version);
+        let ct_b64 = URL_SAFE_NO_PAD.encode(&row.ct);
+        match push_item(
+            cloud,
+            vault_id,
+            &dk,
+            &row.id,
+            base_version,
+            row.version,
+            &ct_b64,
+            row.generation,
+        )
+        .await
+        {
+            Ok(PushOutcome::Ok { .. }) => tally.fixes.push(LocalFix::Synced {
+                id: row.id.clone(),
+                version: row.version,
+            }),
             Ok(PushOutcome::EndpointMissing) => {
-                endpoint_missing = true;
+                tally.endpoint_missing = true;
                 break; // the whole /items endpoint is down — nothing more to try
             }
+            Ok(PushOutcome::KeysetChanged) => {
+                // The vault's keyset moved past this device's: take it (keys
+                // and membership), then redo the change once under the new
+                // key if this session holds it; else it waits for `sc unlock`.
+                // Never dropped.
+                if !keyset_pulled {
+                    keyset_pulled = true;
+                    if let Err(e) = pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state)).await {
+                        tracing::warn!(vault = %vault_id, "per-item push: keyset pull failed: {}", e);
+                    }
+                    gens = push_gens(state_dir, vault_id, keys);
+                }
+                match check_generation(&gens, keys, vault_id, row) {
+                    Gen::Redone(redone, fix) => {
+                        tally.fixes.push(fix);
+                        let pushed = push_item(
+                            cloud,
+                            vault_id,
+                            &dk,
+                            &redone.id,
+                            push_base_version(redone.synced_version),
+                            redone.version,
+                            &URL_SAFE_NO_PAD.encode(&redone.ct),
+                            redone.generation,
+                        )
+                        .await;
+                        match pushed {
+                            Ok(PushOutcome::Ok { .. }) => tally.fixes.push(LocalFix::Synced {
+                                id: redone.id.clone(),
+                                version: redone.version,
+                            }),
+                            Ok(PushOutcome::EndpointMissing) => {
+                                tally.endpoint_missing = true;
+                                break;
+                            }
+                            // Kept, re-sealed: the next push reconciles it.
+                            _ => tally.left_dirty += 1,
+                        }
+                    }
+                    Gen::NeedsUnlock => {
+                        tally.left_dirty += 1;
+                        tally.refused_rows.push((
+                            row.id.clone(),
+                            needs_unlock_note(&own_record(keys, vault_id, row), row.generation),
+                        ));
+                    }
+                    Gen::Unreadable => {
+                        let r = set_aside_unreadable(cloud, vault_id, &dk, keys, &mut their_rows, row).await;
+                        if !tally.take(row, r) {
+                            break;
+                        }
+                    }
+                    // The keyset as pulled says the row's generation is the
+                    // current one: the pull did not land; the next push retries.
+                    Gen::Send => tally.left_dirty += 1,
+                }
+            }
             Ok(PushOutcome::Conflict { current_version }) => {
-                tracing::debug!(
-                    vault = %vault_id, item = %id, current_version,
-                    "per-item push: 409 conflict; skipping item, adopting server truth after loop"
-                );
-                conflicted = true;
+                let Some(keys) = keys else {
+                    tracing::debug!(
+                        vault = %vault_id, item = %row.id, current_version,
+                        "per-item push: 409 on a locked vault; left dirty until unlock"
+                    );
+                    tally.left_dirty += 1;
+                    continue;
+                };
+                let r = resolve_conflict(
+                    cloud,
+                    vault_id,
+                    &dk,
+                    keys,
+                    &mut their_rows,
+                    row,
+                    current_version,
+                    gens.session,
+                )
+                .await;
+                // Their row cannot be read: refresh the keyset first; if this
+                // session then holds the current generation's key, their row
+                // opens under no key a current member holds, and ours may go
+                // over it (a record this process may write). Never before.
+                let r = match r {
+                    Resolved::NotReadable {
+                        fixes: f,
+                        note,
+                        overwrite: Some(o),
+                    } => {
+                        if !keyset_pulled {
+                            keyset_pulled = true;
+                            if let Err(e) = pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state)).await {
+                                tracing::warn!(vault = %vault_id, "per-item push: keyset pull failed: {}", e);
+                            }
+                            gens = push_gens(state_dir, vault_id, Some(keys));
+                        }
+                        let current = gens.keyset.unwrap_or(0);
+                        let may = gens.session == Some(current)
+                            && crate::storage::item::device_may_write(
+                                o.ours.ns,
+                                &o.ours.name,
+                                gens.keyset.is_some(),
+                                o.ours.is_tombstone(),
+                            );
+                        let landed = if may {
+                            overwrite_unreadable(cloud, vault_id, &dk, keys, row, &o, Some(current)).await
+                        } else {
+                            None
+                        };
+                        match landed {
+                            Some(fix) => Resolved::Fixed(vec![fix]),
+                            None => Resolved::NotReadable {
+                                fixes: f,
+                                note,
+                                overwrite: None,
+                            },
+                        }
+                    }
+                    r => r,
+                };
+                if !tally.take(row, r) {
+                    break;
+                }
+            }
+            Ok(PushOutcome::Rejected { status, error }) => {
+                // Terminal (400/402/403/413/422): these bytes never land. Take
+                // theirs, keep ours as a local dirty conflict copy (see
+                // `rejection_fixes`); over a signed row, set ours aside (see
+                // `set_aside_fixes`); locked (no K) → left dirty.
+                let signed_row = is_signed_row_refusal(status, &error);
+                if !signed_row {
+                    warn_rejected_once(vault_id, &row.id, row.version, status, &error);
+                }
+                let Some(keys) = keys else {
+                    tally.left_dirty += 1;
+                    continue;
+                };
+                let r = resolve_rejection(
+                    cloud,
+                    vault_id,
+                    &dk,
+                    keys,
+                    &mut their_rows,
+                    row,
+                    status,
+                    &error,
+                )
+                .await;
+                if !tally.take(row, r) {
+                    break;
+                }
             }
             Err(e) => {
                 // Transient — skip this item, keep trying the others.
-                tracing::warn!(vault = %vault_id, item = %id, "per-item push failed: {}", e);
+                tracing::warn!(vault = %vault_id, item = %row.id, "per-item push failed: {}", e);
             }
         }
     }
-    // Mark what landed as clean — re-read the store (a writer may have raced us)
-    // and only stamp rows still at the exact version we pushed; a row bumped
+    let PushTally {
+        fixes,
+        set_aside_rows,
+        mut refused_rows,
+        left_dirty,
+        endpoint_missing,
+    } = tally;
+    // A push of a row that landed settles an earlier conflict on it; a row set
+    // aside now is one for the user to re-run, or (written by SafeClaw's
+    // automatic upgrade) one the upgrade retries.
+    for f in &fixes {
+        if let LocalFix::Synced { id, .. } = f {
+            state.clear_sync_conflict(vault_id, id);
+        }
+    }
+    for (id, record, upgrade) in set_aside_rows {
+        tracing::warn!(vault = %vault_id, item = %id, record = %record, upgrade, "per-item push: changed elsewhere meanwhile; ours set aside, theirs kept");
+        state.note_sync(vault_id, &id, set_aside_note(record, upgrade));
+    }
+    // Apply what landed — re-read the store (a writer may have raced us); every
+    // change is guarded on the exact version we pushed, so a row bumped
     // meanwhile stays dirty and goes out on the next sync.
-    if !pushed.is_empty() {
+    let mut content_changed = false;
+    if !fixes.is_empty() {
+        let lock = state.vault_write_lock(vault_id);
+        let _guard = lock.lock().await;
         if let Some(mut pv) = read_per_item_store(state_dir, vault_id) {
-            let mut changed = false;
-            for (id, version) in &pushed {
-                if let Some(s) = pv.items.get_mut(id) {
-                    if s.version == *version && s.synced_version < *version {
-                        s.synced_version = *version;
-                        changed = true;
+            let applied = apply_local_fixes(&mut pv, fixes, keys.map(|k| (k, vault_id)));
+            refused_rows.extend(applied.refused);
+            if applied.changed {
+                match write_per_item_store(state_dir, vault_id, &pv) {
+                    Ok(()) => content_changed = applied.content_changed,
+                    Err(e) => {
+                        tracing::warn!(vault = %vault_id, "per-item push: local write-back failed: {}", e)
                     }
                 }
             }
-            if changed {
-                if let Err(e) = write_per_item_store(state_dir, vault_id, &pv) {
-                    tracing::warn!(vault = %vault_id, "per-item push: synced-version write-back failed: {}", e);
-                }
-            }
         }
     }
-    if conflicted && !endpoint_missing {
-        let _ = pull_items(state_dir, cloud, vault_id, &dk).await;
+    // Ours not sent, not applied or set aside: said so (kept where it can be).
+    for (id, why) in refused_rows {
+        tracing::warn!(vault = %vault_id, item = %id, "per-item push: {}; ours left unsent", why);
+        state.note_sync(vault_id, &id, crate::state::SyncNote::Refused(why));
     }
-    tracing::debug!(vault = %vault_id, "per-item push: dirty items pushed");
+    // Adopted theirs / added a conflict copy → serve it without a re-unlock.
+    if content_changed {
+        refresh_after_item_pull(state, vault_id);
+    }
+    // A push completing is a sync completing: an install request whose op
+    // just applied (this push carried the definitions) is removed now.
+    crate::server::handlers::service_ops::requests::after_sync(state, vault_id);
+    tracing::debug!(
+        vault = %vault_id, left_dirty, endpoint_missing,
+        "per-item push: dirty items pushed"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2876,9 +4633,9 @@ struct KeyRowData {
     /// HPKE ciphertext = `Seal(K)` to `uik_enc_pub`.
     #[serde(default)]
     uik_k_ct: Option<String>,
-    /// This member's role (`"owner"` / `"member"`), an owner-signed attribute on
-    /// the cred (design/identity-uik-aik.md §4.3). Absent on a legacy row ⇒
-    /// defaults to `Member` (least privilege) on adopt.
+    /// This member's role (`"admin"` / `"member"`; a legacy `"owner"` is an admin),
+    /// an admin-signed attribute on the cred (design/identity-uik-aik.md §4.3).
+    /// Absent on a legacy row ⇒ defaults to `Member` (least privilege) on adopt.
     #[serde(default)]
     uik_role: Option<crate::storage::plaintext::MemberRole>,
     /// The CREATOR's Ed25519 signature over
@@ -2888,6 +4645,12 @@ struct KeyRowData {
     /// (F3-b generation-binding). Absent on a legacy row ⇒ the cred is not an owner.
     #[serde(default)]
     uik_role_sig: Option<String>,
+    /// The vault's previous content keys, sealed under the current one (std
+    /// base64; set by an owner on each member's row at a re-key and on an
+    /// invite). Kept on the cred entry as sealed and written back with the
+    /// row; never made here.
+    #[serde(default)]
+    uik_prev_content_ct: Option<String>,
     /// The vault's ROOT owner (creator) UIK signing pubkey (base64, raw 32 bytes).
     /// Keyset-LEVEL but carried REDUNDANTLY on every row (like `uik_generation`).
     /// TOFU-pinned SET-ONCE by the daemon on adopt — first-seen wins, a non-empty
@@ -2910,7 +4673,7 @@ struct KeyRowData {
     /// since the last checkpoint) — keyset-LEVEL, carried REDUNDANTLY on every row like
     /// the anchor + generation. JSON array of `DelegationEvent` (sig as STANDARD b64).
     /// Adopted as an append-only UNION (`adopt_delegation_meta`); the authoritative
-    /// owner-set is re-derived from signatures in `fold_owner_set`. Absent on a
+    /// owner-set is re-derived from signatures in `fold_roles`. Absent on a
     /// gen-0 / no-delegation vault.
     #[serde(default)]
     uik_delegation_log: Option<serde_json::Value>,
@@ -2935,26 +4698,26 @@ struct KeyRowData {
 ///
 /// Best-effort: a 404 (endpoint not live yet) is a no-op. Returns the number of
 /// rows adopted.
-pub async fn pull_keys(
+pub(crate) async fn pull_keys(
     state_dir: &Path,
     cloud: &str,
     vault: &str,
     device_key: &str,
+    lock: StoreLock<'_>,
 ) -> Result<usize, String> {
     // Personal build: a SHARED (team) vault's keyset is left to the official
     // build; never lands on disk here (team-edition §9). Covers every caller.
     if leave_shared_to_official(vault) {
         return Ok(0);
     }
-    // Create an empty per-item store on demand so a device that pulls keys
-    // before it has ever seeded items still ends up with a keyset on disk.
-    let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
+    // The cursor only: the store is read again for the write-back.
+    let since = read_per_item_store(state_dir, vault).map_or(0, |pv| pv.keyset_seq);
 
     let url = format!(
         "{}/v/{}/keys?since={}",
         cloud.trim_end_matches('/'),
         vault,
-        pv.keyset_seq
+        since
     );
     let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
@@ -2971,7 +4734,7 @@ pub async fn pull_keys(
         // fmt>=2 vault: the backend serves the end-to-end verify(anchor, members, proof)
         // TRIPLE at /membership, not row-shaped /keys. Route there. Legacy fmt=1 personal
         // vaults keep the row path below (single request, unchanged).
-        409 => return pull_membership(state_dir, cloud, vault, device_key, false).await,
+        409 => return pull_membership(state_dir, cloud, vault, device_key, false, lock).await,
         401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
         other => return Err(format!("keys GET HTTP {}", other)),
     }
@@ -2986,13 +4749,26 @@ pub async fn pull_keys(
         .transpose()
         .map_err(|e| format!("parse keys array: {}", e))?
         .unwrap_or_default();
-    let max_seq = body
-        .get("seq")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(pv.keyset_seq);
-    let adopted = adopt_key_rows(&mut pv, vault, &rows)?;
-    if max_seq > pv.keyset_seq {
-        pv.keyset_seq = max_seq;
+    let seq = body.get("seq").and_then(|v| v.as_u64());
+    adopt_pulled_key_rows(state_dir, vault, lock, &rows, seq).await
+}
+
+/// The write-back of [`pull_keys`]: under the vault write lock, re-read the
+/// store (an empty one created on demand, so a device that pulls keys before
+/// it has ever seeded items still ends up with a keyset on disk) and adopt
+/// the pulled rows into it; the cursor advances to `seq`.
+async fn adopt_pulled_key_rows(
+    state_dir: &Path,
+    vault: &str,
+    lock: StoreLock<'_>,
+    rows: &[KeyRow],
+    seq: Option<u64>,
+) -> Result<usize, String> {
+    let _guard = lock.acquire(vault).await;
+    let mut pv = store_or_empty_keyset(state_dir, vault)?;
+    let adopted = adopt_key_rows(&mut pv, vault, rows)?;
+    if let Some(seq) = seq.filter(|s| *s > pv.keyset_seq) {
+        pv.keyset_seq = seq;
     }
     // Persist even a zero-adopt pull so the advanced cursor sticks.
     write_per_item_store(state_dir, vault, &pv)?;
@@ -3012,13 +4788,15 @@ async fn pull_membership(
     vault: &str,
     device_key: &str,
     force_full: bool,
+    lock: StoreLock<'_>,
 ) -> Result<usize, String> {
     // Personal build: a SHARED (team) vault's membership triple is left to the
     // official build; never lands on disk here (team-edition §9).
     if leave_shared_to_official(vault) {
         return Ok(0);
     }
-    let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
+    // The cursor only: the store is read again for the write-back.
+    let pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
     // The `keyset_seq` cursor is per-FORMAT: the v1 `/keys` sequence and the v2
     // `/membership` `keyset_seq` are DIFFERENT counters. On a fmt1→fmt2 MIGRATION the
     // local cursor is still the v1 value (often far ahead of the fresh membership's
@@ -3058,6 +4836,21 @@ async fn pull_membership(
         .json()
         .await
         .map_err(|e| format!("parse membership response: {}", e))?;
+    adopt_pulled_membership(state_dir, vault, lock, &body).await
+}
+
+/// The write-back of [`pull_membership`]: under the vault write lock, re-read
+/// the store (an empty one created on demand) and adopt the pulled triple
+/// into it; the cursor advances to its `keyset_seq`.
+async fn adopt_pulled_membership(
+    state_dir: &Path,
+    vault: &str,
+    lock: StoreLock<'_>,
+    body: &serde_json::Value,
+) -> Result<usize, String> {
+    let _guard = lock.acquire(vault).await;
+    let mut pv = store_or_empty_keyset(state_dir, vault)?;
+    let first_v2 = pv.keyset.uik.is_none();
     let max_seq = body
         .get("keyset_seq")
         .and_then(|v| v.as_u64())
@@ -3065,7 +4858,7 @@ async fn pull_membership(
     // A since-delta "nothing new" reply carries only keyset_seq; a pre-bootstrap vault
     // carries a null anchor. Either way there is no triple to adopt — just advance the cursor.
     let adopted = match body.get("anchor").and_then(|v| v.as_str()) {
-        Some(anchor) if !anchor.is_empty() => adopt_membership_triple(&mut pv, vault, anchor, &body)?,
+        Some(anchor) if !anchor.is_empty() => adopt_membership_triple(&mut pv, vault, anchor, body)?,
         _ => 0,
     };
     if first_v2 {
@@ -3102,8 +4895,16 @@ fn adopt_membership_triple(
     // seal under these cids so the grant's credential_id resolves at v2 unlock.
     let mut cids_by_member: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // Other members' passkeys served as approval-verification material only
+    // (`approver: true`: a vault admin's cid, identity_id, x, y). Adopted after the
+    // members below, never as the caller's own.
+    let mut approvers: Vec<&serde_json::Value> = Vec::new();
     if let Some(creds) = body.get("credentials").and_then(|v| v.as_array()) {
         for c in creds {
+            if c.get("approver").and_then(|v| v.as_bool()) == Some(true) {
+                approvers.push(c);
+                continue;
+            }
             if let (Some(cid), Some(idid)) = (
                 c.get("cid").and_then(|v| v.as_str()),
                 c.get("identity_id").and_then(|v| v.as_str()),
@@ -3161,16 +4962,44 @@ fn adopt_membership_triple(
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         let role_sig = m.get("role_sig").and_then(|v| v.as_str()).unwrap_or("");
+        // The member entry's sealed previous content keys (the row form's
+        // `uik_prev_content_ct`), kept on every cred entry of the member.
+        let prev_content_ct = m.get("prev_content_ct").and_then(|v| v.as_str());
         // Key the OWN member under its credential cid(s); OTHER members under their us_id.
         let keys: Vec<String> = match cids_by_member.get(id) {
             Some(cids) if !cids.is_empty() => cids.clone(),
             _ => vec![id.clone()],
         };
         for key in keys {
-            pv.set_uik_cred_b64(&key, id, sig_pub, enc_pub, k_encapped, k_ct, role, role_sig)
-                .map_err(|e| format!("adopt uik seal {}: {}", id, e))?;
+            pv.set_uik_cred_b64(
+                &key,
+                id,
+                sig_pub,
+                enc_pub,
+                k_encapped,
+                k_ct,
+                role,
+                role_sig,
+                prev_content_ct,
+            )
+            .map_err(|e| format!("adopt uik seal {}: {}", id, e))?;
         }
         adopted += 1;
+    }
+
+    // An admin's passkey: its pubkey into the registry and its cid → identity label, so
+    // this daemon can verify the admin approving its op. Who is an admin stays the
+    // verified role fold; a malformed entry is skipped, never failing the pull.
+    for c in approvers {
+        let field = |k: &str| c.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let (Some(cid), Some(idid), Some(x), Some(y)) =
+            (field("cid"), field("identity_id"), field("x"), field("y"))
+        else {
+            continue;
+        };
+        if let Err(e) = pv.set_approver_credential(cid, idid, x, y) {
+            tracing::warn!(vault = %vault_id, cid, "approver credential not adopted: {}", e);
+        }
     }
 
     // Keyset-level delegation state + re-key meta (reused helpers, SAME order as adopt_key_rows:
@@ -3205,6 +5034,8 @@ fn empty_keyset_store() -> PerItemVault {
         items: std::collections::BTreeMap::new(),
         items_seq: 0,
         keyset_seq: 0,
+        held: Default::default(),
+        row_kinds: Default::default(),
     }
 }
 
@@ -3262,8 +5093,18 @@ fn adopt_key_rows(pv: &mut PerItemVault, vault_id: &str, rows: &[KeyRow]) -> Res
             // non-owner (fails `resolve_membership_trust`'s verify).
             let role = row.data.uik_role.unwrap_or_default();
             let role_sig = row.data.uik_role_sig.as_deref().unwrap_or("");
-            pv.set_uik_cred_b64(&row.cid, uid, sig, enc, encapped, ct, role, role_sig)
-                .map_err(|e| format!("adopt uik seal {}: {}", row.cid, e))?;
+            pv.set_uik_cred_b64(
+                &row.cid,
+                uid,
+                sig,
+                enc,
+                encapped,
+                ct,
+                role,
+                role_sig,
+                row.data.uik_prev_content_ct.as_deref(),
+            )
+            .map_err(|e| format!("adopt uik seal {}: {}", row.cid, e))?;
         }
         // The vault's ROOT owner (creator) anchor — keyset-LEVEL, carried per row.
         // TOFU-pinned SET-ONCE (first-seen wins; never overwrite a non-empty pin).
@@ -3341,7 +5182,7 @@ fn adopt_creator_pin(
 /// copy and NEVER shrinks it, so a colluding server serving a stale/shorter set can't
 /// roll back the owner-set — rollback-safety BY CONSTRUCTION. Unlike `generation`
 /// (a stored scalar gating K selection, hence verify-before-ratchet), the owner-set is
-/// RE-DERIVED from signatures every fold ([`SealedVault::fold_owner_set`] /
+/// RE-DERIVED from signatures every fold ([`SealedVault::fold_roles`] /
 /// `resolve_current_root`), so a forged event/cert adopted here is simply INERT — the
 /// fold ignores it. Adopt only screens for well-formedness (32-byte pubkeys / 64-byte
 /// sigs) + de-duplicates, to keep a re-delivered row from growing the log unboundedly.
@@ -3403,24 +5244,7 @@ fn adopt_delegation_meta(
             {
                 continue;
             }
-            let Ok(sig) = <[u8; 64]>::try_from(e.sig.as_slice()) else {
-                continue;
-            };
-            let role_tok = if e.op == "remove" {
-                ""
-            } else {
-                crate::storage::sealed_vault::role_str(e.role)
-            };
-            let input = crate::identity::delegation_event_input(
-                vault_id,
-                &e.op,
-                &e.subject_id,
-                role_tok,
-                &e.granter_id,
-                e.seq,
-                e.role_epoch,
-            );
-            if !crate::identity::verify(&granter_pub, &input, &sig) {
+            if !e.signature_verifies(vault_id, &granter_pub) {
                 continue; // signature does not self-verify → junk, do not store
             }
             let dup = uik.delegation_log.iter().any(|x| {
@@ -3445,7 +5269,7 @@ fn adopt_delegation_meta(
 /// strictly-higher proposed generation `G` advances the local monotonic
 /// generation (and stores the proof) ONLY when the accompanying proof is present,
 /// is FOR `G`, and is signed by an OWNER in the current folded owner-set
-/// ([`PerItemVault::fold_owner_set`]) with a valid signature over
+/// ([`PerItemVault::fold_roles`]) with a valid signature over
 /// [`crate::identity::rekey_sig_input`]. Otherwise the higher generation is
 /// IGNORED (neither `generation` nor `rekey_proof` change) — this is what stops a
 /// current member forging `uik_generation: 999` with no valid owner proof from
@@ -3530,8 +5354,8 @@ fn adopt_rekey_meta(
     // the two-counter model, so the owner-set is folded at the current role_epoch
     // (checkpoint ∘ delegation_log), NOT re-derived at the proposed `generation`. A
     // member's self-signed proof fails here (a member is not an owner).
-    if pv.fold_owner_set(vault_id).get(&signer_id)
-        != Some(&crate::storage::plaintext::MemberRole::Owner)
+    if pv.fold_roles(vault_id).get(&signer_id)
+        != Some(&crate::storage::plaintext::MemberRole::Admin)
     {
         return Ok(());
     }
@@ -3576,9 +5400,9 @@ fn adopt_rekey_meta(
 }
 
 /// Push the daemon's keyset credentials ahead of the cloud after a daemon-side
-/// mutation of the acting credential (a Write rotates its `prf_salt`/`wrapped_key`
-/// via `replace_after_write`; a connect re-seals through the same `K`). Mirrors
-/// `push_items_best_effort`'s 409/adopt handling — NEVER clobber: on a 409 we
+/// keyset mutation (e.g. an Enroll / add-passkey; a connect re-seals through the
+/// same `K`). Like
+/// `push_items_best_effort`, NEVER clobber: on a 409 we
 /// adopt the cloud's rows (via `pull_keys`) and stop rather than force-overwrite.
 ///
 /// The daemon keeps no on-disk per-cred version, so we CAS with `base_version` =
@@ -3638,6 +5462,12 @@ fn key_row_data_for(
         data["uik_role"] = serde_json::to_value(entry.role).unwrap_or(serde_json::Value::Null);
         if !entry.role_sig.is_empty() {
             data["uik_role_sig"] = serde_json::Value::String(STANDARD.encode(&entry.role_sig));
+        }
+        // The previous content keys ride with the row they were adopted from: a
+        // write of the row never drops it.
+        if !entry.prev_content_ct.is_empty() {
+            data["uik_prev_content_ct"] =
+                serde_json::Value::String(STANDARD.encode(&entry.prev_content_ct));
         }
     }
     // Keyset-LEVEL role anchor + DP-S1 re-key metadata (both emitted REDUNDANTLY on
@@ -3733,9 +5563,14 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     vault = %vault_id, cid = %cid_b64, current_version,
                     "keyset push: 409 conflict; adopting cloud keyset row (no clobber)"
                 );
-                let _ = pull_keys(state_dir, cloud, vault_id, &dk).await;
+                let _ = pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state)).await;
                 return;
             }
+            Ok(PushOutcome::Rejected { status, error }) => {
+                tracing::warn!(vault = %vault_id, cid = %cid_b64, "keyset push rejected: HTTP {} {}", status, error);
+                return;
+            }
+            Ok(PushOutcome::KeysetChanged) => return,
             Err(e) => {
                 tracing::warn!(vault = %vault_id, cid = %cid_b64, "keyset push failed: {}", e);
                 return;
@@ -3842,6 +5677,48 @@ mod peritem_tests {
     use crate::storage::sealed_vault::PerItemVault;
     use sudp::primitives::StdPrimitives;
 
+    /// §15 W1: a vault with a keyset drops only on a VERIFIED owner tombstone.
+    /// Unsigned or forged deletes never drop, on a personal (v1) keyset (signed
+    /// by the paired account's pinned key) or a shared (v2) one (an admin of
+    /// the verified fold).
+    #[test]
+    fn an_unsigned_tombstone_on_a_keyset_vault_never_drops() {
+        use base64::Engine as _;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let vid = "vault-tomb";
+        let me = crate::identity::SigningIdentity::from_seed(&[0x41u8; 32]);
+        let other = crate::identity::SigningIdentity::from_seed(&[0x42u8; 32]);
+        let input = crate::identity::vault_tombstone_input(vid);
+        let signed = |who: &crate::identity::SigningIdentity| {
+            serde_json::json!({
+                "status": "deleted",
+                "tombstone_sig": b64(&who.sign(&input)),
+                "tombstone_signer": who.user_id(),
+            })
+        };
+        let unsigned = serde_json::json!({ "status": "deleted" });
+
+        // Personal (v1 keyset): the paired account's key.
+        let pv = empty_pv();
+        let pin = Some(me.public_bytes());
+        assert!(!tombstone_verified_for(&pv, vid, &unsigned, pin), "unsigned");
+        assert!(tombstone_verified_for(&pv, vid, &signed(&me), pin), "the account");
+        assert!(!tombstone_verified_for(&pv, vid, &signed(&other), pin), "someone else");
+        assert!(!tombstone_verified_for(&pv, vid, &signed(&me), None), "no pinned key");
+        assert!(!tombstone_verified_for(&pv, "vault-other", &signed(&me), pin), "another vault");
+
+        // Shared (v2 keyset): an admin of the verified fold.
+        let (svid, creator, _b, _cid, _bid, spv) =
+            crate::storage::sealed_vault::tests::role_fixture_creator_cred();
+        let sinput = crate::identity::vault_tombstone_input(svid);
+        let admin = serde_json::json!({
+            "tombstone_sig": b64(&creator.signing().sign(&sinput)),
+            "tombstone_signer": creator.user_id(),
+        });
+        assert!(!tombstone_verified_for(&spv, svid, &unsigned, None), "unsigned");
+        assert!(tombstone_verified_for(&spv, svid, &admin, None), "the admin");
+    }
+
     fn empty_pv() -> PerItemVault {
         PerItemVault::build_initial(
             b"c".to_vec(),
@@ -3872,6 +5749,8 @@ mod peritem_tests {
                 &crate::storage::item::ItemPayload::secret_live("A", "local"),
             )
             .unwrap();
+        // ...confirmed on the cloud (clean): only a clean row is adoptable.
+        pv.items.get_mut(&id).unwrap().synced_version = 2;
 
         // A stale row (version 1) must NOT replace it.
         let stale = ItemRow {
@@ -3882,7 +5761,7 @@ mod peritem_tests {
             sig: None,
             signer: None,
         };
-        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&stale), 5).unwrap();
+        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&stale), 5, None).unwrap();
         assert_eq!(n, 0, "stale version ignored");
         assert_eq!(pv.get_item(&id).unwrap().version, 2);
         assert_eq!(pv.items_seq, 5, "cursor still advances to max seq");
@@ -3899,11 +5778,1204 @@ mod peritem_tests {
             sig: None,
             signer: None,
         };
-        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&newer), 9).unwrap();
+        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&newer), 9, None).unwrap();
         assert_eq!(n, 1);
         assert_eq!(pv.get_item(&id).unwrap().version, 3);
         assert_eq!(pv.get_item(&id).unwrap().ct, vec![1u8, 2, 3, 4]);
         assert_eq!(pv.items_seq, 9);
+    }
+
+    /// A pull NEVER adopts over a DIRTY local row (an unpushed local write):
+    /// that silently dropped our edit. The push-side 409 reconcile owns it; the
+    /// cursor still advances.
+    #[test]
+    fn adopt_never_clobbers_dirty_row() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let k = [0x42u8; 32];
+        let mut pv = empty_pv();
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                VaultKeys::single(&k),
+                "v",
+                ItemNs::Secret,
+                "A",
+                2,
+                &crate::storage::item::ItemPayload::secret_live("A", "ours"),
+            )
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 1; // v2 = local edit, not pushed
+        let ours_ct = pv.get_item(&id).unwrap().ct.clone();
+        let theirs = ItemRow {
+            item_id: id.clone(),
+            version: 3,
+            seq: 9,
+            ct: URL_SAFE_NO_PAD.encode([9u8; 4]),
+            sig: None,
+            signer: None,
+        };
+        let n = adopt_item_rows(&mut pv, std::slice::from_ref(&theirs), 9, None).unwrap();
+        assert_eq!(n, 0, "dirty row is left to the push reconcile");
+        assert_eq!(pv.get_item(&id).unwrap().version, 2);
+        assert_eq!(pv.get_item(&id).unwrap().ct, ours_ct);
+        assert_eq!(pv.items_seq, 9, "cursor still advances");
+    }
+
+    /// A pulled row as the cloud serves it: `payload` sealed at `version`
+    /// under `k` at its own address (sidecar-signed by `by`, as type `ty`).
+    fn cloud_row(
+        k: &[u8; 32],
+        vault: &str,
+        payload: &crate::storage::item::ItemPayload,
+        version: u64,
+        seq: u64,
+        by: Option<(&crate::crypto::vault_key::UikRoot, &str)>,
+    ) -> ItemRow {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        let ctx = crate::storage::item::ItemCtx::for_item::<StdPrimitives>(
+            k,
+            vault,
+            payload.ns,
+            &payload.name,
+            version,
+        )
+        .unwrap();
+        let ct = crate::storage::item::seal_item::<StdPrimitives>(k, &ctx, payload).unwrap();
+        let (sig, signer) = match by {
+            Some((s, ty)) => {
+                let input = crate::identity::record_signature_input(
+                    ty,
+                    ctx.id_bytes(),
+                    version,
+                    vault,
+                    &ct,
+                    !payload.is_tombstone(),
+                    &s.user_id(),
+                );
+                (
+                    Some(STANDARD.encode(s.signing().sign(&input))),
+                    Some(s.user_id()),
+                )
+            }
+            None => (None, None),
+        };
+        ItemRow {
+            item_id: ctx.item_id_b64(),
+            version,
+            seq,
+            ct: URL_SAFE_NO_PAD.encode(&ct),
+            sig,
+            signer,
+        }
+    }
+
+    /// On a vault with a keyset a pull keeps the honored owner-config: an
+    /// unsigned tombstone over an owner-signed legacy `aux:policy` is held,
+    /// with why, in the store's persisted held list, and the cursor moves
+    /// past it. Every later pull offers it again; a newer owner-signed row
+    /// supersedes it. Locked: a replacement of a row read as a data record is
+    /// adopted; owner-config, and a row not yet read with the key, is held
+    /// until the key is there (unlock), where it is offered again.
+    #[test]
+    fn held_rows_never_pin_the_cursor_and_are_offered_again() {
+        use crate::storage::item::ItemPayload;
+        use crate::storage::sealed_vault::tests::{in_body_signed, role_fixture_creator_cred};
+        use crate::storage::sealed_vault::{RowKind, HELD_LOCKED, HELD_NOT_OWNER_SIGNED};
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let (vault, creator, _, _, _, mut pv) = role_fixture_creator_cred();
+        let policy = serde_json::json!({ "timeout": 7 });
+        let legacy = ItemPayload::live(
+            ItemNs::Aux,
+            "policy",
+            in_body_signed(vault, &creator, "policy", 1, &policy),
+        );
+        let id = pv
+            .plant::<StdPrimitives>(keys, vault, ItemNs::Aux, "policy", 1, &legacy)
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 1;
+        let s_id = pv
+            .plant::<StdPrimitives>(keys, vault, ItemNs::Secret, "S", 1, &ItemPayload::secret_live("S", "one"))
+            .unwrap();
+        pv.items.get_mut(&s_id).unwrap().synced_version = 1;
+        pv.items_seq = 3;
+        let view = |pv: &PerItemVault| pv.fold_view::<StdPrimitives>(keys, vault).unwrap();
+        let timeout = |pv: &PerItemVault| view(pv).aux.policy.and_then(|p| p.timeout);
+        assert_eq!(timeout(&pv), Some(7));
+
+        // Unlocked: held, the cursor moves past it.
+        let tomb = ItemPayload::tombstone(ItemNs::Aux, "policy");
+        let unsigned = cloud_row(&k, vault, &tomb, 2, 5, None);
+        let n = adopt_item_rows(&mut pv, &[unsigned], 6, Some((keys, vault))).unwrap();
+        assert_eq!(n, 0, "not adopted");
+        assert_eq!(timeout(&pv), Some(7), "the honored value stays");
+        assert_eq!(pv.items_seq, 6, "the cursor is not pinned");
+        assert_eq!(pv.held[&id].version, 2);
+        assert_eq!(pv.held[&id].reason, HELD_NOT_OWNER_SIGNED);
+        // What each row addresses is recorded with the key.
+        assert_eq!(pv.row_kinds[&s_id], RowKind::Data);
+        assert_eq!(pv.row_kinds[&id], RowKind::Guarded);
+        // Persisted with the store.
+        let back: PerItemVault = serde_json::from_str(&serde_json::to_string(&pv).unwrap()).unwrap();
+        assert_eq!(back.held, pv.held);
+        assert_eq!(back.row_kinds, pv.row_kinds);
+        // The next pull (nothing new) offers it again: still held.
+        assert_eq!(adopt_item_rows(&mut pv, &[], 6, Some((keys, vault))).unwrap(), 0);
+        assert!(pv.held.contains_key(&id));
+
+        // Locked: a data record's replacement lands, a new row lands, the
+        // owner-config replacement waits for the key.
+        let s2 = cloud_row(&k, vault, &ItemPayload::secret_live("S", "two"), 2, 7, None);
+        let new_secret = cloud_row(&k, vault, &ItemPayload::secret_live("NEW", "v1"), 1, 8, None);
+        let n = adopt_item_rows(&mut pv, &[s2, new_secret], 8, None).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(pv.items_seq, 8);
+        assert_eq!(pv.held[&id].reason, HELD_LOCKED);
+        assert_eq!(view(&pv).native_secrets["S"], b"two");
+        // A row not yet read with the key, replaced while locked: held.
+        let new2 = cloud_row(&k, vault, &ItemPayload::secret_live("NEW", "v2"), 2, 9, None);
+        let new_id = new2.item_id.clone();
+        assert_eq!(adopt_item_rows(&mut pv, &[new2], 9, None).unwrap(), 0);
+        assert_eq!(pv.held[&new_id].reason, HELD_LOCKED);
+        assert_eq!(pv.items_seq, 9);
+
+        // Unlock: offered again under the key. The data row lands; the
+        // unsigned tombstone is held again, as not owner-signed.
+        assert_eq!(adopt_item_rows(&mut pv, &[], 9, Some((keys, vault))).unwrap(), 1);
+        assert_eq!(view(&pv).native_secrets["NEW"], b"v2");
+        assert_eq!(pv.held.len(), 1);
+        assert_eq!(pv.held[&id].reason, HELD_NOT_OWNER_SIGNED);
+
+        // A newer owner-signed tombstone (its migration) supersedes it.
+        let signed = cloud_row(&k, vault, &tomb, 3, 10, Some((&creator, "policy")));
+        let n = adopt_item_rows(&mut pv, &[signed], 10, Some((keys, vault))).unwrap();
+        assert_eq!(n, 1);
+        assert!(pv.held.is_empty());
+        assert_eq!(pv.items_seq, 10);
+        assert_eq!(timeout(&pv), None);
+    }
+
+    /// A held row is replaced by a row the server wrote after it (a higher
+    /// `seq`), whatever version either states: a held row that cannot be
+    /// read, stating the highest version there is, never hides a later row.
+    #[test]
+    fn a_held_row_is_replaced_by_a_later_row_of_the_server() {
+        use crate::storage::item::ItemPayload;
+        use crate::storage::sealed_vault::tests::{in_body_signed, role_fixture_creator_cred};
+        use crate::storage::sealed_vault::{HeldRow, HELD_UNREADABLE};
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let (vault, creator, _, _, _, mut pv) = role_fixture_creator_cred();
+        let policy = serde_json::json!({ "timeout": 7 });
+        let legacy = ItemPayload::live(
+            ItemNs::Aux,
+            "policy",
+            in_body_signed(vault, &creator, "policy", 1, &policy),
+        );
+        let id = pv
+            .plant::<StdPrimitives>(keys, vault, ItemNs::Aux, "policy", 1, &legacy)
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 1;
+        let timeout = |pv: &PerItemVault| {
+            pv.fold_view::<StdPrimitives>(keys, vault)
+                .unwrap()
+                .aux
+                .policy
+                .and_then(|p| p.timeout)
+        };
+        // Held: a row this device cannot read, stating the highest version.
+        let unreadable = HeldRow {
+            version: u64::MAX,
+            seq: 5,
+            ct: vec![1, 2, 3],
+            sig: None,
+            signer: None,
+            reason: HELD_UNREADABLE.to_string(),
+        };
+        pv.held.insert(id.clone(), unreadable.clone());
+        let tomb = ItemPayload::tombstone(ItemNs::Aux, "policy");
+        // A row the server wrote before it (seq 4) does not replace it.
+        let older = cloud_row(&k, vault, &tomb, 2, 4, Some((&creator, "policy")));
+        assert_eq!(adopt_item_rows(&mut pv, &[older], 6, Some((keys, vault))).unwrap(), 0);
+        assert_eq!(pv.held[&id], unreadable);
+        assert_eq!(timeout(&pv), Some(7));
+        // One it wrote after (seq 9) does, at a lower stated version, and is
+        // adopted (owner-signed).
+        let later = cloud_row(&k, vault, &tomb, 3, 9, Some((&creator, "policy")));
+        assert_eq!(adopt_item_rows(&mut pv, &[later], 9, Some((keys, vault))).unwrap(), 1);
+        assert!(pv.held.is_empty());
+        assert_eq!(pv.get_item(&id).unwrap().version, 3);
+        assert_eq!(timeout(&pv), None);
+    }
+
+    /// A change SafeClaw's automatic upgrade wrote that is set aside after a
+    /// 409 is said as the upgrade pausing and retrying, never as the
+    /// person's change set aside; a person's change is said as theirs.
+    #[test]
+    fn a_set_aside_upgrade_write_is_said_as_the_upgrade_pausing() {
+        let upgrade = set_aside_note("policy".into(), true).sentence().unwrap();
+        assert!(
+            upgrade.contains("SafeClaw's automatic upgrade of this vault paused")
+                && upgrade.contains("retries")
+                && upgrade.contains("policy")
+                && !upgrade.contains("your change"),
+            "{upgrade}"
+        );
+        assert_eq!(
+            set_aside_note("policy".into(), false),
+            crate::state::SyncNote::ChangedElsewhere("policy".into())
+        );
+        // `sc sync` words the person's case itself.
+        assert!(set_aside_note("policy".into(), false).sentence().is_none());
+    }
+
+    /// A paged `/items` answer is followed from its cursor: `more: true`
+    /// continues from its `seq`, a numeric `next` from that; neither is the
+    /// last page.
+    #[test]
+    fn a_paged_items_answer_is_followed() {
+        let row = serde_json::json!({ "item_id": "a", "version": 1, "seq": 4, "ct": "AA" });
+        let (rows, next) =
+            parse_items_page(&serde_json::json!({ "items": [row], "seq": 4, "more": true }), 0)
+                .unwrap();
+        assert_eq!((rows.len(), next), (1, Some(4)));
+        let (_, next) =
+            parse_items_page(&serde_json::json!({ "items": [], "seq": 4, "next": 9 }), 0).unwrap();
+        assert_eq!(next, Some(9));
+        let (_, next) =
+            parse_items_page(&serde_json::json!({ "items": [row], "seq": 4 }), 0).unwrap();
+        assert_eq!(next, None);
+        let (_, next) = parse_items_page(
+            &serde_json::json!({ "items": [], "seq": 4, "more": false, "next": null }),
+            0,
+        )
+        .unwrap();
+        assert_eq!(next, None);
+    }
+
+    /// Anti-rollback, one rule: a fetched row whose version is below the
+    /// version this device last saw synced for the item is never adopted. A
+    /// 409 whose snapshot serves an older row leaves ours dirty; a local fix
+    /// that would put an older row back is not applied.
+    #[test]
+    fn an_older_row_than_the_synced_one_is_never_adopted() {
+        use crate::storage::item::ItemPayload;
+        let k = [0x42u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "v";
+        let mut pv = empty_pv();
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                keys,
+                vid,
+                ItemNs::Secret,
+                "A",
+                6,
+                &ItemPayload::secret_live("A", "ours"),
+            )
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 5;
+        let s = pv.get_item(&id).unwrap();
+        let ours = DirtyRow {
+            id: id.clone(),
+            version: s.version,
+            synced_version: s.synced_version,
+            ct: s.ct.clone(),
+            tombstone: false,
+            base: None,
+            upgrade: false,
+            generation: None,
+        };
+        // A faked 409 whose snapshot holds version 3 of the row.
+        let older = cloud_row(&k, vid, &ItemPayload::secret_live("A", "old"), 3, 9, None);
+        assert!(matches!(
+            open_conflict_pair(keys, vid, &ours, Some(older.clone())),
+            Err(Resolved::LeaveDirty)
+        ));
+        // The synced version itself, or newer, is read.
+        let same = cloud_row(
+            &k,
+            vid,
+            &ItemPayload::secret_live("A", "theirs"),
+            5,
+            9,
+            None,
+        );
+        assert!(open_conflict_pair(keys, vid, &ours, Some(same)).is_ok());
+
+        // A fix that would put version 3 back over a row synced at 5.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let fix = adopt_fix(
+            &ours,
+            &older,
+            URL_SAFE_NO_PAD.decode(older.ct.as_bytes()).unwrap(),
+            false,
+        );
+        assert!(!apply_local_fixes(&mut pv, vec![fix], None).changed);
+        assert_eq!(pv.get_item(&id).unwrap().version, 6);
+    }
+
+    /// base_version = the last version known on the cloud, so N local bumps
+    /// between pushes CAS against the cloud's row (no self-inflicted 409 → no
+    /// spurious conflict copy). Never confirmed (0) is a CREATE, never a
+    /// `version - 1` guess that could CAS-clobber another device's row.
+    #[test]
+    fn push_base_version_uses_synced_version() {
+        assert_eq!(push_base_version(4), Some(4), "last confirmed version");
+        assert_eq!(push_base_version(0), None, "never confirmed → create");
+    }
+
+    /// Terminal status classification: only the server's refusals of the write
+    /// itself are terminal; 5xx / 503 / 429 / 401 stay transient.
+    #[test]
+    fn terminal_put_statuses() {
+        for s in [400u16, 402, 403, 413, 422] {
+            assert!(is_terminal_put_status(s), "{s}");
+        }
+        for s in [401u16, 404, 409, 429, 500, 502, 503] {
+            assert!(!is_terminal_put_status(s), "{s}");
+        }
+    }
+
+    /// A terminal rejection takes THEIRS at the canonical id and keeps OURS as
+    /// its conflict copy, a DIRTY record of its own name (re-offered on every
+    /// push); a refused create with no row of theirs stays dirty; a refused
+    /// delete just adopts. When no copy may be written (the copy's address
+    /// holds a row this key cannot open), nothing of ours is dropped: it
+    /// stays dirty and the refusal is returned.
+    #[test]
+    fn rejection_keeps_ours_as_local_dirty_copy() {
+        use crate::storage::item::{self as il, ItemPayload};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let k = [0x42u8; 32];
+        let vid = "v";
+        let keys = VaultKeys::single(&k);
+        let mut pv = empty_pv();
+        // Ours: local edit at v3 (cloud last confirmed v2).
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                keys,
+                vid,
+                ItemNs::Secret,
+                "A",
+                3,
+                &ItemPayload::secret_live("A", "ours"),
+            )
+            .unwrap();
+        pv.items.get_mut(&id).unwrap().synced_version = 2;
+        let s = pv.get_item(&id).unwrap().clone();
+        let dirty = DirtyRow {
+            id: id.clone(),
+            version: s.version,
+            synced_version: s.synced_version,
+            ct: s.ct.clone(),
+            tombstone: false,
+            base: None,
+            upgrade: false,
+            generation: None,
+        };
+        let ours = il::open_wire_item::<StdPrimitives>(keys, vid, &id, 3, &s.ct).unwrap();
+        // Theirs: v5 on the cloud with a different value.
+        let their_payload = ItemPayload::secret_live("A", "theirs");
+        let their_ct =
+            il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &their_payload).unwrap();
+        let their_row = ItemRow {
+            item_id: id.clone(),
+            version: 5,
+            seq: 9,
+            ct: URL_SAFE_NO_PAD.encode(&their_ct),
+            sig: None,
+            signer: None,
+        };
+
+        // Refused create (no row of theirs): nothing to take, ours stays dirty.
+        assert!(rejection_fixes(&dirty, &ours, None).is_none());
+
+        let theirs = || Some((their_row.clone(), their_ct.clone(), their_payload.clone()));
+        // The copy's address holds a row this key cannot open: refused, ours
+        // stays dirty where it is.
+        let copy_id =
+            il::wire_id_for::<StdPrimitives>(&k, ItemNs::Secret, &il::conflict_copy_name("A"))
+                .unwrap();
+        let mut blocked = pv.clone();
+        blocked.put_raw(copy_id.clone(), 2, vec![0u8; 40]);
+        let applied = apply_local_fixes(
+            &mut blocked,
+            rejection_fixes(&dirty, &ours, theirs()).unwrap(),
+            Some((keys, vid)),
+        );
+        assert_eq!(applied.refused.len(), 1);
+        assert!(applied.refused[0].1.contains("cannot be read"), "{:?}", applied.refused);
+        assert_eq!(blocked.get_item(&id).unwrap().version, 3, "ours still dirty");
+        assert_eq!(blocked.get_item(&copy_id).unwrap().ct, vec![0u8; 40], "not written over");
+
+        let applied = apply_local_fixes(
+            &mut pv,
+            rejection_fixes(&dirty, &ours, theirs()).unwrap(),
+            Some((keys, vid)),
+        );
+        assert!(applied.changed && applied.content_changed && applied.refused.is_empty());
+        // Canonical id = theirs, clean.
+        let canon = pv.get_item(&id).unwrap();
+        assert_eq!((canon.version, canon.synced_version), (5, 5));
+        assert_eq!(canon.ct, their_ct);
+        // Ours lives on as a DIRTY record of the copy's name, at its own id.
+        let copy = pv.get_item(&copy_id).expect("local conflict copy");
+        assert_eq!((copy.version, copy.synced_version), (1, 0));
+        let opened =
+            il::open_wire_item::<StdPrimitives>(keys, vid, &copy_id, copy.version, &copy.ct)
+                .unwrap();
+        assert_eq!(opened.name, il::conflict_copy_name("A"));
+        assert_eq!(opened.body, ours.body);
+        // Next push offers it as a create.
+        assert_eq!(push_base_version(copy.synced_version), None);
+
+        // A refused DELETE just adopts theirs (no copy of a tombstone).
+        let tomb = ItemPayload::tombstone(ItemNs::Secret, "A");
+        let fixes = rejection_fixes(&dirty, &tomb, theirs()).unwrap();
+        assert_eq!(fixes.len(), 1, "adopt only");
+
+        // Each refusal is said to the user, with what became of ours; none
+        // is reverted silently.
+        let Resolved::Rejected { fixes, note } = rejected(&dirty, &ours, theirs(), 413, "too_large") else {
+            panic!("said to the user");
+        };
+        assert!(fixes.iter().any(|f| matches!(f, LocalFix::KeepCopy { .. })));
+        assert!(
+            note.starts_with("secret A: the cloud refused this change (HTTP 413: too_large); the vault keeps its version; yours is kept on this device as \"A (conflict copy)\""),
+            "{}",
+            note
+        );
+        let Resolved::Rejected { fixes, note } = rejected(&dirty, &ours, None, 402, "") else {
+            panic!("said to the user");
+        };
+        assert!(fixes.is_empty());
+        assert!(note.ends_with("(HTTP 402); it is kept on this device, unsent"), "{}", note);
+        let Resolved::Rejected { note, .. } = rejected(&dirty, &tomb, theirs(), 413, "too_large") else {
+            panic!("said to the user");
+        };
+        assert!(note.ends_with("the vault keeps its version; re-run it once the cloud takes it"), "{}", note);
+    }
+
+    /// THEIR row on a 409 (or a terminal refusal) that this device cannot
+    /// open, changed under a vault key it does not have: never written over.
+    /// It is taken locally as it is, so ours is no longer sent, and ours is
+    /// set aside with a note saying why and what to do.
+    #[test]
+    fn a_row_of_theirs_this_device_cannot_open_sets_ours_aside() {
+        use crate::storage::item::{self as il, ItemPayload};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let (k, other) = ([0x42u8; 32], [0x43u8; 32]);
+        let vid = "v";
+        let keys = VaultKeys::single(&k);
+        let theirs_keys = VaultKeys {
+            id_seed: &k,
+            content: &other,
+            prev: &[],
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for terminal in [false, true] {
+            let mut pv = empty_pv();
+            let ours = ItemPayload::secret_live("API", "mine");
+            let id = pv
+                .seal_and_upsert::<StdPrimitives>(keys, vid, ItemNs::Secret, "API", 3, &ours)
+                .unwrap();
+            pv.items.get_mut(&id).unwrap().synced_version = 2;
+            let dirty = DirtyRow {
+                id: id.clone(),
+                version: 3,
+                synced_version: 2,
+                ct: pv.get_item(&id).unwrap().ct.clone(),
+                tombstone: false,
+                base: None,
+                upgrade: false,
+                generation: None,
+            };
+            let theirs = ItemPayload::secret_live("API", "theirs");
+            let their_ct =
+                il::seal_wire_item::<StdPrimitives>(theirs_keys, vid, &id, 5, &theirs).unwrap();
+            let their_row = ItemRow {
+                item_id: id.clone(),
+                version: 5,
+                seq: 9,
+                ct: URL_SAFE_NO_PAD.encode(&their_ct),
+                sig: None,
+                signer: None,
+            };
+            let mut fetched = TheirRows::Fetched([(id.clone(), their_row)].into_iter().collect());
+            let resolved = if terminal {
+                rt.block_on(resolve_rejection(
+                    "http://127.0.0.1:9",
+                    vid,
+                    "dk",
+                    keys,
+                    &mut fetched,
+                    &dirty,
+                    413,
+                    "too_large",
+                ))
+            } else {
+                rt.block_on(resolve_conflict(
+                    "http://127.0.0.1:9",
+                    vid,
+                    "dk",
+                    keys,
+                    &mut fetched,
+                    &dirty,
+                    5,
+                    Some(0),
+                ))
+            };
+            let Resolved::NotReadable { fixes, note, .. } = resolved else {
+                panic!("set aside, not left dirty");
+            };
+            assert!(note.starts_with("secret API: this item was changed with a vault key this device does not have"), "{}", note);
+            assert!(note.contains("run `sc sync` after the vault owner's console finishes, then re-run"), "{}", note);
+            apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
+            let row = pv.get_item(&id).unwrap();
+            assert_eq!((row.version, row.synced_version), (5, 5), "clean: no longer sent");
+            assert_eq!(row.ct, their_ct, "theirs as it is");
+            assert_eq!(pv.items.len(), 1, "ours is not kept");
+        }
+    }
+
+    /// Every row is sent with the keyset generation it was sealed under,
+    /// checked first against the keyset this device holds: at the current
+    /// generation it goes as is; under another (or one not recorded) it is
+    /// re-sealed under the current key at the same version when this session
+    /// holds it, else it waits for `sc unlock`; one this device cannot read
+    /// is never sent. A vault without a keyset is not checked.
+    #[test]
+    fn a_row_is_sent_at_the_keyset_generation_it_was_sealed_under() {
+        use crate::storage::item::{self as il, vault_key_bundle, ItemPayload};
+        let fx = crate::storage::sealed_vault::tests::rekeyed_fixture();
+        let vid = fx.vault;
+        let old = VaultKeys {
+            id_seed: &fx.id_seed,
+            content: &fx.c_old,
+            prev: &[],
+        };
+        // The session's material after unlock: the bundle and the earlier
+        // key its own keyset row carries.
+        let sealed_prev = il::seal_prev_content_keys::<StdPrimitives>(&fx.c_new, vid, 1, &[(&fx.c_old, &[])]);
+        let mut material = vault_key_bundle(&fx.id_seed, &fx.c_new);
+        material.extend_from_slice(
+            &il::open_prev_content_keys::<StdPrimitives>(&fx.c_new, vid, 1, &sealed_prev).unwrap(),
+        );
+        let current = VaultKeys::from_material(&material);
+        let old_bundle = vault_key_bundle(&fx.id_seed, &fx.c_old);
+        let stale_session = VaultKeys::from_material(&old_bundle);
+        // The keyset records what its own keys seal under.
+        let mut pv = fx.pv.clone();
+        assert_eq!(pv.keyset_generation(), Some(1));
+        assert_eq!(pv.seal_generation(current), Some(1));
+        assert_eq!(pv.seal_generation(stale_session), None);
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(current, vid, ItemNs::Secret, "S", 1, &ItemPayload::secret_live("S", "s"))
+            .unwrap();
+        assert_eq!(pv.items[&id].generation, Some(1));
+
+        let row = |keys: VaultKeys, generation: Option<u64>| {
+            let ctx = il::ItemCtx::for_item::<StdPrimitives>(&fx.id_seed, vid, ItemNs::Secret, "A", 2).unwrap();
+            DirtyRow {
+                id: ctx.item_id_b64(),
+                version: 2,
+                synced_version: 1,
+                ct: il::seal_item::<StdPrimitives>(keys.content, &ctx, &ItemPayload::secret_live("A", "a")).unwrap(),
+                tombstone: false,
+                base: None,
+                upgrade: false,
+                generation,
+            }
+        };
+        let gens = |keyset: Option<u64>, session: Option<u64>| PushGens { keyset, session };
+        // At the current generation: as is.
+        let at_current = row(current, Some(1));
+        assert!(matches!(check_generation(&gens(Some(1), Some(1)), Some(current), vid, &at_current), Gen::Send));
+        assert!(matches!(check_generation(&gens(Some(1), None), None, vid, &at_current), Gen::Send));
+        // Sealed under the earlier key, this session holding the current one:
+        // re-sealed under it, same version, kept by the fix.
+        let stale = row(old, Some(0));
+        let Gen::Redone(redone, fix) = check_generation(&gens(Some(1), Some(1)), Some(current), vid, &stale) else {
+            panic!("redone under the current key");
+        };
+        assert_eq!((redone.version, redone.synced_version, redone.generation), (2, 1, Some(1)));
+        let opened = il::open_wire_item::<StdPrimitives>(current, vid, &redone.id, 2, &redone.ct).unwrap();
+        assert_eq!(opened.body, serde_json::json!("a"));
+        assert!(matches!(fix, LocalFix::Replace { expect: 2, .. }));
+        // A generation not recorded is treated the same.
+        assert!(matches!(
+            check_generation(&gens(Some(1), Some(1)), Some(current), vid, &row(old, None)),
+            Gen::Redone(..)
+        ));
+        // Locked, or a session from before the key changed: waits for `sc unlock`.
+        assert!(matches!(check_generation(&gens(Some(1), None), None, vid, &stale), Gen::NeedsUnlock));
+        assert!(matches!(
+            check_generation(&gens(Some(1), None), Some(stale_session), vid, &stale),
+            Gen::NeedsUnlock
+        ));
+        assert!(matches!(check_generation(&gens(Some(1), None), None, vid, &row(old, None)), Gen::NeedsUnlock));
+        let changed = needs_unlock_note("secret A", Some(0));
+        assert!(changed.contains("the vault key changed") && changed.contains("run `sc unlock`"), "{changed}");
+        // A change from before the generation was recorded: not said to be
+        // under a changed key; sent after unlock.
+        let unrecorded = needs_unlock_note("secret A", None);
+        assert!(!unrecorded.contains("key changed") && unrecorded.contains("run `sc unlock`"), "{unrecorded}");
+        // Under no key this device holds: never sent.
+        let other = VaultKeys { content: &[0x99u8; 32], ..old };
+        assert!(matches!(
+            check_generation(&gens(Some(1), Some(1)), Some(current), vid, &row(other, Some(1))),
+            Gen::Unreadable
+        ));
+        // No keyset: not checked.
+        assert!(matches!(check_generation(&gens(None, Some(0)), None, vid, &stale), Gen::Send));
+    }
+
+    /// OUR dirty row that this device cannot read (sealed under a key it no
+    /// longer holds, or under a retired key that does not list it) is never
+    /// sent and stops being offered: theirs is taken as it is when there is
+    /// one, else ours is dropped locally; the user is told.
+    #[test]
+    fn a_dirty_row_this_device_cannot_read_is_set_aside() {
+        use crate::storage::item::{self as il, ItemPayload};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let (k, gone) = ([0x42u8; 32], [0x43u8; 32]);
+        let vid = "v";
+        let keys = VaultKeys::single(&k);
+        let ours_keys = VaultKeys {
+            id_seed: &k,
+            content: &gone,
+            prev: &[],
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for theirs_present in [true, false] {
+            let mut pv = empty_pv();
+            let ours = ItemPayload::secret_live("API", "mine");
+            let id = pv
+                .plant::<StdPrimitives>(ours_keys, vid, ItemNs::Secret, "API", 3, &ours)
+                .unwrap();
+            pv.items.get_mut(&id).unwrap().synced_version = 2;
+            let dirty = DirtyRow {
+                id: id.clone(),
+                version: 3,
+                synced_version: 2,
+                ct: pv.get_item(&id).unwrap().ct.clone(),
+                tombstone: false,
+                base: None,
+                upgrade: false,
+                generation: None,
+            };
+            let theirs = ItemPayload::secret_live("API", "theirs");
+            let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
+            let snapshot = if theirs_present {
+                vec![(
+                    id.clone(),
+                    ItemRow {
+                        item_id: id.clone(),
+                        version: 5,
+                        seq: 9,
+                        ct: URL_SAFE_NO_PAD.encode(&their_ct),
+                        sig: None,
+                        signer: None,
+                    },
+                )]
+            } else {
+                Vec::new()
+            };
+            let mut fetched = TheirRows::Fetched(snapshot.into_iter().collect());
+            let resolved = rt.block_on(load_conflict_pair(
+                "http://127.0.0.1:9",
+                vid,
+                "dk",
+                keys,
+                &mut fetched,
+                &dirty,
+                None,
+            ));
+            let Err(Resolved::NotReadable { fixes, note, .. }) = resolved else {
+                panic!("set aside, not left dirty");
+            };
+            assert!(note.contains("this item was changed with a vault key this device does not have"), "{}", note);
+            apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
+            if theirs_present {
+                assert!(note.starts_with("secret API: "), "{}", note);
+                let row = pv.get_item(&id).unwrap();
+                assert_eq!((row.version, row.synced_version, &row.ct), (5, 5, &their_ct));
+            } else {
+                assert!(note.starts_with(&format!("item {}: ", id)), "{}", note);
+                assert!(pv.get_item(&id).is_none(), "dropped: no longer offered");
+            }
+        }
+    }
+
+    /// Ours is set aside, never written over theirs: an owner-config record
+    /// on any conflict (also unsigned, on a vault without a keyset), and any
+    /// record whose row of theirs is signed (this process signs nothing), on
+    /// a 409 over it and on the server's `record_write_forbidden`. Theirs
+    /// stays canonical with its signature, nothing is pushed (the cloud URL
+    /// here is unreachable, so a push attempt would leave the row dirty
+    /// instead), ours is not kept (outside the keep-both namespaces) and the
+    /// record is reported.
+    #[test]
+    fn owner_config_and_signed_rows_are_never_replaced_ours_is_set_aside() {
+        use crate::storage::item::{self as il, ItemPayload};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let k = [0x42u8; 32];
+        let vid = "v";
+        let keys = VaultKeys::single(&k);
+        let connecting = |code: &str| serde_json::json!({ "service": "gmail", "oauth2": { "code": code, "code_verifier": "v" } });
+        let cases = [
+            // Owner-config, unsigned (no keyset): set aside by its policy.
+            (
+                ItemNs::Policy,
+                "",
+                serde_json::json!({ "timeout": 1 }),
+                serde_json::json!({ "timeout": 2 }),
+                false,
+                "policy",
+            ),
+            // A take-writer record whose row of theirs is signed.
+            (
+                ItemNs::Connecting,
+                "gmail",
+                connecting("ours"),
+                connecting("theirs"),
+                true,
+                "connecting gmail",
+            ),
+        ];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cloud = "http://127.0.0.1:9";
+        for (ns, name, ours_body, theirs_body, signed, want_record) in cases {
+            let mut pv = empty_pv();
+            // Ours: a local edit at v3 (cloud last confirmed v2).
+            let ours = ItemPayload::live(ns, name, ours_body);
+            let id = pv
+                .seal_and_upsert::<StdPrimitives>(keys, vid, ns, name, 3, &ours)
+                .unwrap();
+            pv.items.get_mut(&id).unwrap().synced_version = 2;
+            let dirty = DirtyRow {
+                id: id.clone(),
+                version: 3,
+                synced_version: 2,
+                ct: pv.get_item(&id).unwrap().ct.clone(),
+                tombstone: false,
+                base: None,
+                upgrade: false,
+                generation: None,
+            };
+            // Theirs: v5.
+            let theirs = ItemPayload::live(ns, name, theirs_body.clone());
+            let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
+            let their_row = ItemRow {
+                item_id: id.clone(),
+                version: 5,
+                seq: 9,
+                ct: URL_SAFE_NO_PAD.encode(&their_ct),
+                sig: signed.then(|| "c2ln".into()),
+                signer: signed.then(|| "us_owner".into()),
+            };
+            let fetched =
+                || TheirRows::Fetched([(id.clone(), their_row.clone())].into_iter().collect());
+            let on_409 = rt.block_on(resolve_conflict(
+                cloud,
+                vid,
+                "dk",
+                keys,
+                &mut fetched(),
+                &dirty,
+                5,
+                Some(0),
+            ));
+            let on_403 = rt.block_on(resolve_rejection(
+                cloud,
+                vid,
+                "dk",
+                keys,
+                &mut fetched(),
+                &dirty,
+                403,
+                "record_write_forbidden",
+            ));
+            for resolved in [on_409, on_403] {
+                let Resolved::SetAside { fixes, record } = resolved else {
+                    panic!("{want_record}: ours must be set aside, with nothing pushed");
+                };
+                assert_eq!(record, want_record);
+                let mut pv = pv.clone();
+                let n = pv.items.len();
+                let applied = apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
+                assert!(applied.changed && applied.content_changed);
+                assert_eq!(pv.items.len(), n, "no copy of a set-aside change");
+                // Theirs is canonical, clean, its signature kept.
+                let canon = pv.get_item(&id).unwrap();
+                assert_eq!(
+                    (canon.version, canon.synced_version, canon.sig.clone()),
+                    (5, 5, signed.then(|| "c2ln".to_string()))
+                );
+                assert_eq!(canon.ct, their_ct);
+                let view = pv.fold_view::<StdPrimitives>(keys, vid).unwrap();
+                match ns {
+                    ItemNs::Policy => assert_eq!(view.aux.policy.unwrap().timeout, Some(2)),
+                    _ => assert_eq!(
+                        serde_json::to_value(&view.aux.connecting[name]).unwrap()["oauth2"]["code"],
+                        "theirs"
+                    ),
+                }
+                assert_eq!(
+                    view.aux.connecting.len(),
+                    usize::from(ns == ItemNs::Connecting)
+                );
+            }
+            // A delete keeps no copy.
+            let their = || Some((their_row.clone(), their_ct.clone(), theirs.clone()));
+            let tomb = ItemPayload::tombstone(ns, name);
+            assert_eq!(
+                set_aside_fixes(&dirty, &tomb, their()).unwrap().len(),
+                1,
+                "adopt only"
+            );
+            assert!(set_aside_fixes(&dirty, &ours, None).is_none());
+        }
+
+        // In a keep-both namespace ours is kept as its conflict copy, a dirty
+        // record of its own name (pushed as a create).
+        let mut pv = empty_pv();
+        let secret = ItemPayload::secret_live("A", "ours");
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(keys, vid, ItemNs::Secret, "A", 3, &secret)
+            .unwrap();
+        let dirty = DirtyRow {
+            id: id.clone(),
+            version: 3,
+            synced_version: 2,
+            ct: pv.get_item(&id).unwrap().ct.clone(),
+            tombstone: false,
+            base: None,
+            upgrade: false,
+            generation: None,
+        };
+        let theirs = ItemPayload::secret_live("A", "theirs");
+        let their_ct = il::seal_wire_item::<StdPrimitives>(keys, vid, &id, 5, &theirs).unwrap();
+        let their_row = ItemRow {
+            item_id: id.clone(),
+            version: 5,
+            seq: 9,
+            ct: URL_SAFE_NO_PAD.encode(&their_ct),
+            sig: None,
+            signer: None,
+        };
+        let fixes = set_aside_fixes(&dirty, &secret, Some((their_row, their_ct, theirs))).unwrap();
+        assert!(matches!(&fixes[0], LocalFix::KeepCopy { of, .. } if of == &id));
+        let applied = apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
+        assert!(applied.refused.is_empty());
+        let copy_id =
+            il::wire_id_for::<StdPrimitives>(&k, ItemNs::Secret, &il::conflict_copy_name("A"))
+                .unwrap();
+        assert_eq!(pv.get_item(&copy_id).unwrap().synced_version, 0);
+        assert_eq!(conflict_record(&secret), "secret A");
+        assert_eq!(
+            conflict_record(&ItemPayload::live(
+                ItemNs::Policy,
+                "",
+                serde_json::json!({})
+            )),
+            "policy"
+        );
+    }
+
+    /// The §4 decision table, per the rule table's conflict policy (the
+    /// console applies the same): keep_both = secret, connection, service;
+    /// take_writer = connecting; owner_config = policy, stores, store order,
+    /// retention (native or legacy `aux`).
+    #[test]
+    fn decide_conflict_table() {
+        use crate::storage::item::{body_digest_hex, ItemPayload};
+        let live = |ns, name: &str, v: serde_json::Value| ItemPayload::live(ns, name, v);
+        let tomb = |ns, name: &str| ItemPayload::tombstone(ns, name);
+        let s_ours = live(ItemNs::Secret, "T", serde_json::json!("ours"));
+        let s_theirs = live(ItemNs::Secret, "T", serde_json::json!("theirs"));
+        let s_same = live(ItemNs::Secret, "T", serde_json::json!("ours"));
+
+        // Equal live body → adopt, no copy.
+        assert_eq!(
+            decide_conflict(&s_ours, Some(&s_same), None),
+            ConflictAction::Adopt
+        );
+        // Genuine same-item conflict in a keep-both record → keep both.
+        assert_eq!(
+            decide_conflict(&s_ours, Some(&s_theirs), None),
+            ConflictAction::KeepBoth
+        );
+        let c_ours = live(ItemNs::Connection, "gmail", serde_json::json!({"a": 1}));
+        let c_theirs = live(ItemNs::Connection, "gmail", serde_json::json!({"a": 2}));
+        assert_eq!(
+            decide_conflict(&c_ours, Some(&c_theirs), None),
+            ConflictAction::KeepBoth
+        );
+        let v_ours = live(ItemNs::Service, "acme", serde_json::json!({"service": "a"}));
+        let v_theirs = live(ItemNs::Service, "acme", serde_json::json!({"service": "b"}));
+        assert_eq!(
+            decide_conflict(&v_ours, Some(&v_theirs), None),
+            ConflictAction::KeepBoth
+        );
+        // Their body equal to our base (they only copied it): not a conflict,
+        // ours applies. Compared normalized: a plain-string service entry is
+        // `{service: <text>}`.
+        let v_copied = live(ItemNs::Service, "acme", serde_json::json!("b"));
+        let base = body_digest_hex(
+            ItemNs::Service,
+            "acme",
+            &serde_json::json!({"service": "b"}),
+        );
+        assert_eq!(
+            decide_conflict(&v_ours, Some(&v_copied), Some(&base)),
+            ConflictAction::Reapply
+        );
+        assert_eq!(
+            decide_conflict(&v_ours, Some(&v_theirs), Some(&base)),
+            ConflictAction::Reapply
+        );
+        let other_base = body_digest_hex(
+            ItemNs::Service,
+            "acme",
+            &serde_json::json!({"service": "x"}),
+        );
+        assert_eq!(
+            decide_conflict(&v_ours, Some(&v_theirs), Some(&other_base)),
+            ConflictAction::KeepBoth
+        );
+        let s_base = body_digest_hex(ItemNs::Secret, "T", &serde_json::json!("theirs"));
+        assert_eq!(
+            decide_conflict(&s_ours, Some(&s_theirs), Some(&s_base)),
+            ConflictAction::Reapply
+        );
+        // A plain-string entry equal to ours in object form: adopt.
+        let v_plain_same = live(ItemNs::Service, "acme", serde_json::json!("a"));
+        assert_eq!(
+            decide_conflict(&v_ours, Some(&v_plain_same), None),
+            ConflictAction::Adopt
+        );
+        // Their delete vs our edit (keep-both) → copy keeps ours, delete stands,
+        // whatever our base.
+        assert_eq!(
+            decide_conflict(&s_ours, Some(&tomb(ItemNs::Secret, "T")), Some(&s_base)),
+            ConflictAction::KeepBoth
+        );
+        // Take-writer: ours is re-applied on the fresh version.
+        let ours = live(ItemNs::Connecting, "g", serde_json::json!({"x": 1}));
+        let theirs = live(ItemNs::Connecting, "g", serde_json::json!({"x": 2}));
+        assert_eq!(
+            decide_conflict(&ours, Some(&theirs), None),
+            ConflictAction::Reapply
+        );
+        assert_eq!(
+            decide_conflict(&ours, Some(&ours.clone()), None),
+            ConflictAction::Adopt
+        );
+        // Owner-config (native or legacy address): never overwritten, also
+        // without a keyset; an equal body adopts.
+        let x = |n: u64| serde_json::json!({ "x": n });
+        for (ns, name, a, b) in [
+            (
+                ItemNs::Policy,
+                "",
+                serde_json::json!({"timeout": 1}),
+                serde_json::json!({"timeout": 2}),
+            ),
+            (ItemNs::Stores, "", x(1), x(2)),
+            (
+                ItemNs::StoreOrder,
+                "",
+                serde_json::json!(["a"]),
+                serde_json::json!(["b"]),
+            ),
+            (
+                ItemNs::AuditRetentionDays,
+                "",
+                serde_json::json!(1),
+                serde_json::json!(2),
+            ),
+            (ItemNs::Aux, "policy", x(1), x(2)),
+            (ItemNs::Aux, "stores", x(1), x(2)),
+            (ItemNs::Aux, "store_order", x(1), x(2)),
+            (ItemNs::Aux, "audit_retention_days", x(1), x(2)),
+        ] {
+            let ours = live(ns, name, a);
+            let theirs = live(ns, name, b);
+            assert_eq!(
+                decide_conflict(&ours, Some(&theirs), None),
+                ConflictAction::SetAside,
+                "{ns:?} {name}"
+            );
+            assert_eq!(
+                decide_conflict(&tomb(ns, name), Some(&theirs), None),
+                ConflictAction::SetAside,
+                "{ns:?} {name}: a delete is never written over theirs either"
+            );
+            assert_eq!(
+                decide_conflict(&ours, Some(&ours.clone()), None),
+                ConflictAction::Adopt
+            );
+        }
+        // The console and this process copying the same legacy row at once:
+        // the same content written two ways is equal (adopt theirs, nothing
+        // set aside or copied).
+        for (ns, name, console, daemon) in [
+            (
+                ItemNs::Policy,
+                "category:ai",
+                serde_json::json!({ "write": "ask", "ttl": null }),
+                serde_json::json!({ "write": "ask" }),
+            ),
+            (
+                ItemNs::Policy,
+                "",
+                serde_json::json!({ "default": { "read": "allow", "write": null }, "timeout": 60 }),
+                serde_json::json!({ "timeout": 60, "default": { "read": "allow" } }),
+            ),
+            (
+                ItemNs::Service,
+                "acme",
+                serde_json::json!({ "service": "a", "policy": null }),
+                serde_json::json!({ "service": "a" }),
+            ),
+            (
+                ItemNs::Service,
+                "acme",
+                serde_json::json!("a"),
+                serde_json::json!({ "service": "a" }),
+            ),
+        ] {
+            assert_eq!(
+                decide_conflict(
+                    &live(ns, name, daemon),
+                    Some(&live(ns, name, console)),
+                    None
+                ),
+                ConflictAction::Adopt,
+                "{ns:?}:{name}"
+            );
+        }
+        // Our delete vs their edit → delete wins (re-apply the tombstone).
+        assert_eq!(
+            decide_conflict(&tomb(ItemNs::Secret, "T"), Some(&s_theirs), None),
+            ConflictAction::Reapply
+        );
+        // Both deleted → adopt.
+        assert_eq!(
+            decide_conflict(
+                &tomb(ItemNs::Secret, "T"),
+                Some(&tomb(ItemNs::Secret, "T")),
+                None
+            ),
+            ConflictAction::Adopt
+        );
+        // Their row is gone → re-create ours.
+        assert_eq!(
+            decide_conflict(&s_ours, None, None),
+            ConflictAction::Reapply
+        );
+    }
+
+    /// Post-push local fixes are version-guarded: a row a writer bumped during
+    /// the push is never clobbered (it stays dirty for the next push), and a
+    /// copy known on the cloud is stored only over nothing or an older clean
+    /// row (idempotent on retry).
+    #[test]
+    fn apply_local_fixes_is_guarded_and_idempotent() {
+        let k = [0x42u8; 32];
+        let mut pv = empty_pv();
+        let put = |pv: &mut PerItemVault, name: &str, v: u64| {
+            pv.seal_and_upsert::<StdPrimitives>(
+                VaultKeys::single(&k),
+                "v",
+                ItemNs::Secret,
+                name,
+                v,
+                &crate::storage::item::ItemPayload::secret_live(name, "x"),
+            )
+            .unwrap()
+        };
+        let a = put(&mut pv, "A", 2);
+        let b = put(&mut pv, "B", 5); // raced: pushed at 4, bumped to 5 meanwhile
+        let c = put(&mut pv, "C", 3);
+
+        let fixes = vec![
+            // A: theirs adopted at v3 (we pushed/held v2).
+            LocalFix::Replace {
+                id: a.clone(),
+                expect: 2,
+                row: clean_row(3, vec![7u8; 4], false, None, None),
+            },
+            // B: adopt guarded on v4, but the row is now v5 → untouched.
+            LocalFix::Replace {
+                id: b.clone(),
+                expect: 4,
+                row: clean_row(6, vec![8u8; 4], false, None, None),
+            },
+            // C: our push landed.
+            LocalFix::Synced {
+                id: c.clone(),
+                version: 3,
+            },
+            // A conflict copy on the cloud, mirrored once.
+            LocalFix::Mirror {
+                id: "copy".into(),
+                row: clean_row(1, vec![1u8; 4], false, None, None),
+            },
+        ];
+        let applied = apply_local_fixes(&mut pv, fixes, None);
+        assert!(applied.changed && applied.content_changed);
+        let ra = pv.get_item(&a).unwrap();
+        assert_eq!(
+            (ra.version, ra.synced_version, ra.ct.clone()),
+            (3, 3, vec![7u8; 4])
+        );
+        let rb = pv.get_item(&b).unwrap();
+        assert_eq!(rb.version, 5);
+        assert!(rb.version > rb.synced_version, "raced row stays dirty");
+        let rc = pv.get_item(&c).unwrap();
+        assert_eq!(rc.synced_version, 3);
+        assert_eq!(pv.get_item("copy").unwrap().version, 1);
+
+        // Retry: the copy is already there → no-op; nothing else changes.
+        let again = apply_local_fixes(
+            &mut pv,
+            vec![LocalFix::Mirror {
+                id: "copy".into(),
+                row: clean_row(1, vec![2u8; 4], false, None, None),
+            }],
+            None,
+        );
+        assert!(!again.changed && !again.content_changed);
+        assert_eq!(pv.get_item("copy").unwrap().ct, vec![1u8; 4]);
+        // A newer version of it replaces the clean row.
+        let newer = apply_local_fixes(
+            &mut pv,
+            vec![LocalFix::Mirror {
+                id: "copy".into(),
+                row: clean_row(2, vec![3u8; 4], false, None, None),
+            }],
+            None,
+        );
+        assert!(newer.changed);
+        assert_eq!(pv.get_item("copy").unwrap().version, 2);
     }
 
     /// A `/keys` row `data` JSON shaped EXACTLY as the frontend writes it
@@ -4012,6 +7084,252 @@ mod peritem_tests {
         assert_eq!(back_cred.wrapped_key, wrapped_key_raw);
     }
 
+    /// A pull reads its cursor, makes its network call without the vault
+    /// write lock, then re-reads the store and merges into it under the lock:
+    /// a local write made meanwhile (every daemon write holds the lock) is
+    /// kept, never written over with the copy read before the call. Keys,
+    /// membership and items alike.
+    #[test]
+    fn a_pull_keeps_a_local_write_made_during_its_network_call() {
+        use crate::storage::item::{self as il, ItemNs, ItemPayload};
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let mut st = AppState::new(cfg);
+        st.vaults = crate::storage::vault_dir::VaultDir::new(dir.path());
+        let state = Arc::new(st);
+        let state_dir = dir.path().to_path_buf();
+        let vid = "v-interleave";
+        let k = [0x42u8; 32];
+        let keys = VaultKeys::single(&k);
+        write_per_item_store(&state_dir, vid, &empty_pv()).unwrap();
+        let read = || read_per_item_store(&state_dir, vid).unwrap();
+        let local_write = |name: &str| {
+            let mut pv = read();
+            pv.seal_and_upsert::<StdPrimitives>(
+                keys,
+                vid,
+                ItemNs::Secret,
+                name,
+                1,
+                &ItemPayload::secret_live(name, "local"),
+            )
+            .unwrap();
+            write_per_item_store(&state_dir, vid, &pv).unwrap();
+        };
+        let has = |name: &str| {
+            read()
+                .open_item::<StdPrimitives>(keys, vid, ItemNs::Secret, name)
+                .unwrap()
+                .is_some()
+        };
+
+        // What each call brings back.
+        let enc = |b: &[u8]| STANDARD.encode(b);
+        let cid_raw = vec![7u8; 8];
+        let key_row: KeyRow = serde_json::from_value(serde_json::json!({
+            "cid": URL_SAFE_NO_PAD.encode(&cid_raw), "version": 1, "seq": 7,
+            "data": {
+                "x": enc(&[0xAA; 32]), "y": enc(&[0xBB; 32]),
+                "prf_salt": enc(&[1; 32]), "wrapped_key": enc(&[2; 48]),
+            },
+        }))
+        .unwrap();
+        let triple = serde_json::json!({
+            "anchor": enc(&[7; 32]),
+            "members": { "us_m": { "role": "member", "k_encapped": enc(&[5; 32]), "k_ct": enc(&[6; 80]) } },
+            "identities": { "us_m": { "sig_pub": enc(&[3; 32]), "enc_pub": enc(&[4; 32]) } },
+            "proof": { "generation": 0 },
+            "keyset_seq": 3,
+        });
+        let pulled = ItemPayload::secret_live("PULLED", "cloud");
+        let ctx = il::ItemCtx::for_item::<StdPrimitives>(&k, vid, ItemNs::Secret, "PULLED", 1).unwrap();
+        let item_row = ItemRow {
+            item_id: ctx.item_id_b64(),
+            version: 1,
+            seq: 9,
+            ct: URL_SAFE_NO_PAD.encode(il::seal_item::<StdPrimitives>(&k, &ctx, &pulled).unwrap()),
+            sig: None,
+            signer: None,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for which in 0..3usize {
+                // A daemon write holds the lock as the call returns.
+                let guard = state.vault_write_lock(vid).lock_owned().await;
+                let (st, sd) = (state.clone(), state_dir.clone());
+                let (key_row, triple, item_row) = (key_row.clone(), triple.clone(), item_row.clone());
+                let task = tokio::spawn(async move {
+                    let lock = StoreLock::Take(&st);
+                    match which {
+                        0 => adopt_pulled_key_rows(&sd, vid, lock, &[key_row], Some(7)).await,
+                        1 => adopt_pulled_membership(&sd, vid, lock, &triple).await,
+                        _ => adopt_pulled_item_rows(&sd, vid, lock, &[item_row], 9, None).await,
+                    }
+                });
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert!(!task.is_finished(), "the write-back waits for the lock");
+                let name = format!("LOCAL{}", which);
+                local_write(&name);
+                drop(guard);
+                task.await.unwrap().unwrap();
+                assert!(has(&name), "the local write is kept ({})", which);
+            }
+        });
+        let pv = read();
+        assert!((0..3).all(|w| has(&format!("LOCAL{}", w))));
+        assert!(pv.keyset.credentials.iter().any(|c| c.credential_id == cid_raw));
+        assert!(pv.uik_cred("us_m").is_some());
+        assert!(has("PULLED"));
+        assert_eq!(pv.items_seq, 9);
+    }
+
+    /// The sealed previous content keys an owner puts on a member's keyset row
+    /// (`uik_prev_content_ct`; `prev_content_ct` on a membership triple's
+    /// member entry) are kept on the cred entry as sealed, written back with
+    /// the row, and kept when a later row of the same cred omits them.
+    #[test]
+    fn prev_content_keys_ride_the_keyset_row() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        let cid_raw = vec![0xDEu8, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4];
+        let cid = URL_SAFE_NO_PAD.encode(&cid_raw);
+        let sealed = vec![0xABu8; 73];
+        let enc = |b: &[u8]| STANDARD.encode(b);
+        let row = |version: u64, prev: Option<&[u8]>| -> KeyRow {
+            let mut data = serde_json::json!({
+                "x": enc(&[0xAA; 32]), "y": enc(&[0xBB; 32]),
+                "prf_salt": enc(&[1; 32]), "wrapped_key": enc(&[2; 48]),
+                "uik_user_id": "us_member", "uik_sig_pub": enc(&[3; 32]),
+                "uik_enc_pub": enc(&[4; 32]), "uik_k_encapped": enc(&[5; 32]),
+                "uik_k_ct": enc(&[6; 80]),
+            });
+            if let Some(p) = prev {
+                data["uik_prev_content_ct"] = serde_json::json!(enc(p));
+            }
+            serde_json::from_value(serde_json::json!({
+                "cid": cid, "version": version, "seq": version, "data": data,
+            }))
+            .unwrap()
+        };
+        let mut pv = empty_keyset_store();
+        adopt_key_rows(&mut pv, "v", &[row(1, Some(&sealed))]).unwrap();
+        assert_eq!(pv.uik_cred(&cid).unwrap().prev_content_ct, sealed);
+        // Written back with the row.
+        let cred = pv
+            .keyset
+            .credentials
+            .iter()
+            .find(|c| c.credential_id == cid_raw)
+            .unwrap()
+            .clone();
+        let data = key_row_data_for(&pv, &cred).unwrap();
+        assert_eq!(data["uik_prev_content_ct"], serde_json::json!(enc(&sealed)));
+        // A later row without it: kept.
+        adopt_key_rows(&mut pv, "v", &[row(2, None)]).unwrap();
+        assert_eq!(pv.uik_cred(&cid).unwrap().prev_content_ct, sealed);
+        let data = key_row_data_for(&pv, &cred).unwrap();
+        assert_eq!(data["uik_prev_content_ct"], serde_json::json!(enc(&sealed)));
+        // A row with another one: replaced.
+        adopt_key_rows(&mut pv, "v", &[row(3, Some(&[0xCD; 73]))]).unwrap();
+        assert_eq!(pv.uik_cred(&cid).unwrap().prev_content_ct, vec![0xCDu8; 73]);
+        // On disk.
+        let back: PerItemVault = serde_json::from_slice(&serde_json::to_vec(&pv).unwrap()).unwrap();
+        assert_eq!(back.uik_cred(&cid).unwrap().prev_content_ct, vec![0xCDu8; 73]);
+
+        // A membership triple's member entry, on every cred of the member.
+        let body = serde_json::json!({
+            "anchor": enc(&[7; 32]),
+            "members": { "us_member": {
+                "role": "member", "k_encapped": enc(&[5; 32]), "k_ct": enc(&[6; 80]),
+                "prev_content_ct": enc(&sealed),
+            } },
+            "proof": { "generation": 1 },
+            "identities": { "us_member": { "sig_pub": enc(&[3; 32]), "enc_pub": enc(&[4; 32]) } },
+            "credentials": [
+                { "cid": "cid-a", "identity_id": "us_member" },
+                { "cid": "cid-b", "identity_id": "us_member" },
+            ],
+        });
+        let mut pv = empty_keyset_store();
+        adopt_membership_triple(&mut pv, "v", &enc(&[7; 32]), &body).unwrap();
+        assert_eq!(pv.uik_cred("cid-a").unwrap().prev_content_ct, sealed);
+        assert_eq!(pv.uik_cred("cid-b").unwrap().prev_content_ct, sealed);
+    }
+
+    /// An admin's passkey served as approval material (`approver: true`): its
+    /// pubkey lands in the registry and its cid maps to the admin, while the
+    /// admin's seat stays keyed under their `us_…` and never reads as one of
+    /// this device's own (requester) identities. A seat an earlier adoption
+    /// keyed under the admin's cid is dropped. A malformed entry is skipped.
+    #[test]
+    fn approver_credentials_verify_but_are_never_own() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        let enc = |b: &[u8]| STANDARD.encode(b);
+        let body = serde_json::json!({
+            "anchor": enc(&[7; 32]),
+            "members": {
+                "us_me": { "role": "member", "k_encapped": enc(&[5; 32]), "k_ct": enc(&[6; 80]) },
+                "us_admin": { "role": "admin", "k_encapped": enc(&[5; 32]), "k_ct": enc(&[6; 80]) },
+            },
+            "identities": {
+                "us_me": { "sig_pub": enc(&[3; 32]), "enc_pub": enc(&[4; 32]) },
+                "us_admin": { "sig_pub": enc(&[8; 32]), "enc_pub": enc(&[9; 32]) },
+            },
+            "credentials": [
+                { "cid": "Yw", "identity_id": "us_me", "x": "mx", "y": "my" },
+                { "cid": "YWRtaW4", "identity_id": "us_admin", "x": "ax", "y": "ay", "approver": true },
+                { "cid": "YmFk", "identity_id": "us_admin", "approver": true },
+            ],
+        });
+        let mut pv = empty_keyset_store();
+        // A seat an older adoption keyed under the admin's cid.
+        pv.set_uik_cred(
+            "YWRtaW4".into(),
+            "us_admin".into(),
+            vec![8; 32],
+            vec![9; 32],
+            vec![5; 32],
+            vec![6; 80],
+            crate::storage::plaintext::MemberRole::Admin,
+            Vec::new(),
+        );
+        pv.set_registry_pubkey("YWRtaW4", "ax", "ay", "").unwrap();
+        assert!(pv.own_identities().contains("us_admin"), "the stale seat read as own");
+
+        adopt_membership_triple(&mut pv, "v", &enc(&[7; 32]), &body).unwrap();
+        let pk = crate::storage::sealed_vault::find_pubkey_in_registry(&pv.keyset.registry, "YWRtaW4")
+            .expect("the admin's pubkey verifies assertions");
+        assert_eq!((pk.x.as_str(), pk.y.as_str()), ("ax", "ay"));
+        assert_eq!(pv.credential_identity("YWRtaW4").as_deref(), Some("us_admin"));
+        assert!(pv.uik_cred("YWRtaW4").is_none(), "no seat under the admin's cid");
+        assert_eq!(pv.uik_cred("us_admin").unwrap().user_id, "us_admin");
+        assert_eq!(pv.uik_cred("Yw").unwrap().user_id, "us_me");
+        assert_eq!(pv.own_identities(), ["us_me".to_string()].into());
+        // No pubkey: nothing to verify with, not adopted.
+        assert!(pv.credential_identity("YmFk").is_none());
+        assert!(crate::storage::sealed_vault::find_pubkey_in_registry(&pv.keyset.registry, "YmFk").is_none());
+    }
+
     /// DP-S1 wire plumbing (Part 1): a re-keyed vault's keyset-LEVEL `generation`
     /// + owner-signed `rekey_proof` ride REDUNDANTLY on every `/keys` row's data.
     /// Emitting a row via `key_row_data_for` (the push side) and re-adopting it
@@ -4060,7 +7378,7 @@ mod peritem_tests {
             vec![8u8; 32],         // enc_pub
             vec![1u8; 48],         // k_encapped
             vec![2u8; 48],         // k_ct
-            MemberRole::Owner,
+            MemberRole::Admin,
             grant.clone(), // role_sig (creator-signed @gen)
         );
         {
@@ -4165,7 +7483,7 @@ mod peritem_tests {
                 vec![9u8; 32],
                 vec![1u8; 40],
                 vec![2u8; 40],
-                MemberRole::Owner,
+                MemberRole::Admin,
                 grant,
             );
             pv.keyset.uik.as_mut().unwrap().creator_sig_pub = owner_sig_pub.clone();
@@ -4297,7 +7615,7 @@ mod peritem_tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             creator_grant,
         );
         let member_grant = creator
@@ -4459,7 +7777,7 @@ mod peritem_tests {
                 vec![9u8; 32],
                 vec![1u8; 40],
                 vec![2u8; 40],
-                MemberRole::Owner,
+                MemberRole::Admin,
                 cg,
             );
             for (cid, who, id) in [("cid-a", &a, &a_id), ("cid-b", &b, &b_id)] {
@@ -4490,7 +7808,7 @@ mod peritem_tests {
                         sealed_vault::DelegationEvent {
                             op: "set".into(),
                             subject_id: subj.clone(),
-                            role: MemberRole::Owner,
+                            role: MemberRole::Admin,
                             granter_id: gid,
                             granter_sig_pub: gpub,
                             seq,
@@ -4504,15 +7822,15 @@ mod peritem_tests {
         };
 
         let source = build(true);
-        let src_owners = source.fold_owner_set(vault);
+        let src_owners = source.fold_roles(vault);
         assert_eq!(
             src_owners.get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "A owner @ source"
         );
         assert_eq!(
             src_owners.get(&b_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "B owner @ source"
         );
 
@@ -4528,14 +7846,14 @@ mod peritem_tests {
         // A fresh device that adopted only the CREDS (no log) sees just the creator.
         let mut fresh = build(false);
         assert!(
-            !fresh.fold_owner_set(vault).contains_key(&a_id),
+            !fresh.fold_roles(vault).contains_key(&a_id),
             "no log adopted yet → A is not an owner on the fresh device",
         );
 
         // Adopt the carried log → the fresh device reconstructs the FULL owner-set.
         adopt_delegation_meta(&mut fresh, vault, &Some(log_json.clone()), &None).unwrap();
         assert_eq!(
-            fresh.fold_owner_set(vault),
+            fresh.fold_roles(vault),
             src_owners,
             "delegation log syncs: the fresh device folds the SAME owner-set",
         );
@@ -4583,7 +7901,7 @@ mod peritem_tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             cg.clone(),
         );
         for (cid, who, id) in [("cid-a", &a, &a_id), ("cid-b", &b, &b_id)] {
@@ -4617,7 +7935,7 @@ mod peritem_tests {
                 .push(sealed_vault::DelegationEvent {
                     op: "set".into(),
                     subject_id: subj.clone(),
-                    role: MemberRole::Owner,
+                    role: MemberRole::Admin,
                     granter_id: gid,
                     granter_sig_pub: gpub,
                     seq,
@@ -4625,9 +7943,9 @@ mod peritem_tests {
                     sig,
                 });
         }
-        let src_owners = source.fold_owner_set(vault);
-        assert_eq!(src_owners.get(&a_id), Some(&MemberRole::Owner));
-        assert_eq!(src_owners.get(&b_id), Some(&MemberRole::Owner));
+        let src_owners = source.fold_roles(vault);
+        assert_eq!(src_owners.get(&a_id), Some(&MemberRole::Admin));
+        assert_eq!(src_owners.get(&b_id), Some(&MemberRole::Admin));
 
         // Build the EQUIVALENT triple (a GET /v/{vid}/membership body) from the SAME data.
         let enc = |bytes: &[u8]| STANDARD.encode(bytes);
@@ -4668,7 +7986,7 @@ mod peritem_tests {
         let mut fresh = empty_keyset_store();
         adopt_membership_triple(&mut fresh, vault, &anchor_b64, &body).unwrap();
         assert_eq!(
-            fresh.fold_owner_set(vault),
+            fresh.fold_roles(vault),
             src_owners,
             "the membership TRIPLE folds to the SAME owner-set as the /keys wire",
         );
@@ -4717,8 +8035,8 @@ mod peritem_tests {
         let mut pv = empty_keyset_store();
         adopt_membership_triple(&mut pv, vault, &anchor_b64, &body).unwrap();
         assert_eq!(
-            pv.fold_owner_set(vault).get(&m_id),
-            Some(&MemberRole::Owner),
+            pv.fold_roles(vault).get(&m_id),
+            Some(&MemberRole::Admin),
             "a checkpoint owner with a valid role_sig folds as owner even with no enc_pub/K",
         );
     }
@@ -4758,7 +8076,7 @@ mod peritem_tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             cg,
         );
         let mg = creator
@@ -4774,13 +8092,13 @@ mod peritem_tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             mg,
         );
         pv.keyset.uik.as_mut().unwrap().creator_sig_pub = creator_pub.clone();
         assert_eq!(
-            pv.fold_owner_set(vault).get(&member_id),
-            Some(&MemberRole::Owner),
+            pv.fold_roles(vault).get(&member_id),
+            Some(&MemberRole::Admin),
             "member is an owner @epoch 0",
         );
 
@@ -4808,10 +8126,10 @@ mod peritem_tests {
         // A fresh device with the SAME creds but no succession → member still owner.
         // Adopt the carried compaction → derived epoch is 1, the stale grant drops.
         adopt_delegation_meta(&mut pv, vault, &None, &Some(succ_json.clone())).unwrap();
-        let os = pv.fold_owner_set(vault);
+        let os = pv.fold_roles(vault);
         assert_eq!(
             os.get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the root stays an owner across compaction (genesis pin)",
         );
         assert!(
@@ -4883,13 +8201,95 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// v1.1 mode-dependent agent-hash cadence: 600s while the stream carries
-    /// the events (poll = belt-and-suspenders), the legacy 30s when the poll
-    /// is the only propagation path.
     #[test]
-    fn agent_keys_cadence_is_mode_dependent() {
-        assert_eq!(agent_keys_cadence(true), Duration::from_secs(600));
-        assert_eq!(agent_keys_cadence(false), Duration::from_secs(30));
+    fn an_unsigned_delete_never_drops_a_damaged_or_whole_blob_vault() {
+        let dir = tempdir().unwrap();
+        let deleted = serde_json::json!({ "status": "deleted" });
+        // Nothing local: nothing to protect.
+        assert!(tombstone_should_drop(dir.path(), "v0", &deleted));
+        // A per-item store that can't be read: fail closed.
+        let v1 = dir.path().join("vaults").join("v1");
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::write(v1.join("vault.per-item.json"), b"{ not json").unwrap();
+        assert!(!tombstone_should_drop(dir.path(), "v1", &deleted));
+        // A whole-blob vault: only the paired account's signature drops it.
+        let v2 = dir.path().join("vaults").join("v2");
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(v2.join("vault.dat"), b"sealed").unwrap();
+        assert!(!tombstone_should_drop(dir.path(), "v2", &deleted));
+    }
+
+    #[test]
+    fn an_audit_event_carries_the_refusal_code_and_no_reason() {
+        let row = crate::audit::ApprovalRow {
+            id: "op-1".into(),
+            created_at: 1,
+            decided_at: Some(2),
+            expires_at: 3,
+            status: crate::audit::STATUS_DENIED.into(),
+            act_kind: "use".into(),
+            service: Some("github".into()),
+            method: Some("GET".into()),
+            path: Some("/repos".into()),
+            target: Some("evil.example".into()),
+            reason: Some("free text".into()),
+            credential_id: None,
+            upstream_status: None,
+            agent_prefix: None,
+            code: Some("host_not_anchored".into()),
+        };
+        let v = serde_json::to_value(event_from_row(&row)).unwrap();
+        assert_eq!(v["decision"], "denied");
+        assert_eq!(v["code"], "host_not_anchored");
+        assert_eq!(v["target"], "evil.example");
+        assert_eq!(v["action"], "GET /repos");
+        assert!(v.get("reason").is_none());
+        assert!(v.get("approver_cid").is_none());
+    }
+
+    /// An approved row names its approver by the credential whose assertion
+    /// the daemon verified, and keeps the requesting agent; no other outcome
+    /// ever carries an approver.
+    #[test]
+    fn an_approved_event_carries_the_verified_credential_and_the_agent() {
+        let mut row = crate::audit::ApprovalRow {
+            id: "op-2".into(),
+            created_at: 1,
+            decided_at: Some(2),
+            expires_at: 3,
+            status: crate::audit::STATUS_APPROVED.into(),
+            act_kind: "custom:vault-unlock".into(),
+            service: None,
+            method: None,
+            path: None,
+            target: None,
+            reason: None,
+            credential_id: Some("cid_AbC-_1".into()),
+            upstream_status: None,
+            agent_prefix: Some("ag_zpunp24l3lvmdesy7aiyhntxgzcc7ere".into()),
+            code: None,
+        };
+        let v = serde_json::to_value(event_from_row(&row)).unwrap();
+        assert_eq!(v["decision"], "approved");
+        assert_eq!(v["approver_cid"], "cid_AbC-_1");
+        assert_eq!(v["agent_id"], "ag_zpunp24l3lvmdesy7aiyhntxgzcc7ere");
+
+        row.status = crate::audit::STATUS_REJECTED.into();
+        let v = serde_json::to_value(event_from_row(&row)).unwrap();
+        assert!(v.get("approver_cid").is_none());
+
+        row.status = crate::audit::STATUS_APPROVED.into();
+        row.credential_id = Some(String::new());
+        let v = serde_json::to_value(event_from_row(&row)).unwrap();
+        assert!(v.get("approver_cid").is_none());
+    }
+
+    #[test]
+    fn vault_format_gate_trips_only_above_supported() {
+        for f in 0..=SUPPORTED_VAULT_FORMAT {
+            assert!(!vault_format_too_new(f), "format {f} is readable");
+        }
+        assert!(vault_format_too_new(SUPPORTED_VAULT_FORMAT + 1));
     }
 
     /// The browser assembles the blob client-side; this guards that the exact

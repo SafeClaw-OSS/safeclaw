@@ -14,8 +14,9 @@ connection "hf_token"  →  phantom __sc__hf_token__
 
 Three rules keep this unambiguous:
 
-- **A secret belongs to at most one connection.** So a phantom resolves to
-  exactly one value, no guessing.
+- **A phantom resolves to exactly one value.** Each slot of a connection is
+  bound to one secret KEY, so there is no guessing. Two connections may bind
+  the same KEY; the approval that creates the second one says so.
 - **Hosts come from one source.** A catalog service declares its hosts; a
   custom connection anchors its own. Either way the agent can't move them.
 - **Host is a constraint, never a selector.** The broker validates the
@@ -29,7 +30,8 @@ secret shapes, OAuth wiring, and human-labeled policy rules. GitHub, OpenAI,
 Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, GitLab, npm,
 crates.io, Telegram and more are built in; agents discover what's connected
 with `sc connection ls`.
-Adding a service is a TOML file, not a plugin: [SERVICES.md](reference/services.md).
+Adding a service is a TOML file, not a plugin: `sc service add ./folder` or
+`sc service add github:owner/repo` ([services.md](reference/services.md)).
 
 ## Ways to connect
 
@@ -39,6 +41,30 @@ Adding a service is a TOML file, not a plugin: [SERVICES.md](reference/services.
 - **At the terminal**: `sc set HF_TOKEN --host huggingface.co` prompts for
   the value, takes one passkey approval, and the value never leaves your
   machine.
+- **`sc connection add`**: fills each secret slot from a new value
+  (`--from-literal SLOT=VALUE`) or from a secret already in the vault
+  (`--from-secret SLOT=KEY`, no value shown anywhere). With `--service`, a
+  slot is one of the service's secret roles; for a custom connection it is
+  the KEY itself (`--from-secret KEY`). A service's primary credential role
+  is required (prompted for on a terminal); its other roles, like
+  Cloudflare's account ID, are optional.
+
+  ```
+  sc connection add codex_work --service openai_codex \
+      --from-secret OPENAI_CODEX_REFRESH_TOKEN=WORK_REFRESH_TOKEN
+  sc connection add myapi --host api.example.com --from-literal API_TOKEN=…
+  ```
+
+  Your agent may run it to propose a connection. Nothing is written until you
+  approve with your passkey, and the approval lists every key the connection
+  binds (new or existing), every host it sends them to, and any other
+  connection already using the same key.
+
+  `sc connection rm <id>` deletes the secrets that connection wrote, unless
+  another connection uses them. A secret it was bound to with
+  `--from-secret` stays in the vault, and so does every secret of a
+  connection added before SafeClaw recorded which secrets a connection
+  writes; the command lists each kept key and why.
 - **Any other HTTPS API**: a custom connection with your own host anchor.
   The catalog is a convenience, not a boundary.
 - **External stores**: keep values in your own secret manager (e.g. GCP

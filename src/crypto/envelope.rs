@@ -50,6 +50,22 @@ pub fn grant_seal_info(op_id: &str) -> Vec<u8> {
     v
 }
 
+/// HPKE `info` prefix for sealing the VAULT KEY an admin delivers when
+/// approving another member's op (`k_enc`/`k_ct`). Its own domain, so a key
+/// seal never opens as a grant secret seal, or the reverse. Mirrors
+/// `grantKSealInfo` in the console's lib/hpke-client.ts.
+pub const GRANT_K_SEAL_INFO_PREFIX: &[u8] = b"safeclaw/v1/grant-k-seal";
+
+/// Build the vault-key grant-seal HPKE `info` bound to `op_id`:
+/// `GRANT_K_SEAL_INFO_PREFIX ‖ 0x1f ‖ op_id`.
+pub fn grant_k_seal_info(op_id: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(GRANT_K_SEAL_INFO_PREFIX.len() + 1 + op_id.len());
+    v.extend_from_slice(GRANT_K_SEAL_INFO_PREFIX);
+    v.push(0x1f);
+    v.extend_from_slice(op_id.as_bytes());
+    v
+}
+
 /// HPKE single-shot seal to a recipient public key. Returns
 /// `(encapped_key, ciphertext)`, both raw bytes. The daemon never needs to
 /// seal in production (it only `open`s the browser's seal); this exists for
@@ -183,6 +199,21 @@ mod tests {
         );
         assert_eq!(info[GRANT_SEAL_INFO_PREFIX.len()], 0x1f);
         assert_eq!(&info[GRANT_SEAL_INFO_PREFIX.len() + 1..], b"zz");
+    }
+
+    /// The vault-key seal's info is byte-exact with the console's
+    /// `grantKSealInfo` and is its own domain: neither seal opens as the other.
+    #[test]
+    fn grant_k_seal_info_shape_and_domain() {
+        let mut want = b"safeclaw/v1/grant-k-seal".to_vec();
+        want.push(0x1f);
+        want.extend_from_slice(b"op-1");
+        assert_eq!(grant_k_seal_info("op-1"), want);
+        let kp = ephemeral();
+        let (enc, ct) = seal_to(&kp.pk_bytes(), &[7u8; 32], &grant_k_seal_info("op-1"), b"").unwrap();
+        assert_eq!(kp.open(&enc, &ct, &grant_k_seal_info("op-1"), b"").unwrap(), vec![7u8; 32]);
+        assert!(kp.open(&enc, &ct, &grant_seal_info("op-1"), b"").is_err());
+        assert!(kp.open(&enc, &ct, &grant_k_seal_info("op-2"), b"").is_err());
     }
 }
 

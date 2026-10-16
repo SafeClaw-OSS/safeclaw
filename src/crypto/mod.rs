@@ -1,6 +1,7 @@
 //! SafeClaw cryptographic primitives.
 
 pub mod aead;
+pub mod batch;
 pub mod binding;
 pub mod canonical;
 pub mod envelope;

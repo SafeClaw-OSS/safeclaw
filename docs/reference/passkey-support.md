@@ -1,9 +1,6 @@
 # Passkey support
 
-SafeClaw seals every vault under a passkey, using the WebAuthn **PRF extension**
-to derive the encryption key on your device. Most modern setups support it; a
-few do not yet, notably Windows 10 and cross-device QR approval. This page is the
-lookup for what works, and what to do when yours doesn't.
+This page lists the passkey and browser combinations that can encrypt a SafeClaw vault. It also explains what to do when a setup does not support the WebAuthn **PRF extension**.
 
 > PRF is how the browser reaches the hardware-held secret that encrypts your
 > vault. This is **not** a browser-version problem: modern browsers support PRF.
@@ -11,7 +8,7 @@ lookup for what works, and what to do when yours doesn't.
 > **transport** carry it. See [Security model](../security-model.md) for why the
 > key never leaves your device.
 
-**Legend** — ✅ works · ⚠️ conditional, see note · ❌ no PRF
+**Legend**: ✅ works · ⚠️ conditional, see note · ❌ no PRF
 
 Support is expanding fast; the tables below are current as of 2026. When in
 doubt, open [passkeyprf.com](https://www.passkeyprf.com/) on the device: one tap
@@ -19,9 +16,9 @@ tells you whether that passkey can do PRF.
 
 ## Quick check
 
-1. **Who stores your passkey?** The provider decides — see the first table.
-2. **Your OS and browser** — the second table.
-3. **This device, or a QR from another?** Cross-device is the weak leg — the
+1. **Who stores your passkey?** The provider decides: see the first table.
+2. **Your OS and browser**: the second table.
+3. **This device, or a QR from another?** Cross-device is the weak leg: the
    third table.
 
 ## By passkey provider
@@ -51,11 +48,11 @@ accounts (see the provider note above).
 |---|:--:|:--:|:--:|
 | macOS 15.4+ | ✅ 132+ | ✅ 18.4+ | ✅ 139+ |
 | macOS 14 and earlier | ❌ built-in | ❌ built-in | ❌ built-in |
-| Windows 11 25H2+ | ✅ 147+ | — | ✅ 148+ |
-| Windows 11 (pre-25H2) / Windows 10 | ❌ | — | ❌ |
+| Windows 11 25H2+ | ✅ 147+ | N/A | ✅ 148+ |
+| Windows 11 (pre-25H2) / Windows 10 | ❌ | N/A | ❌ |
 | iOS / iPadOS 18.4+ | ✅ | ✅ | ❌ |
-| Android | ✅ | — | ❌ |
-| Linux | ⚠️ | — | ⚠️ |
+| Android | ✅ | N/A | ❌ |
+| Linux | ⚠️ | N/A | ⚠️ |
 
 This table is the **built-in / platform** path (iCloud Keychain through Safari,
 or the OS authenticator). A cross-platform provider adds PRF on top, independent

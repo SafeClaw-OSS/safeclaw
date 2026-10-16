@@ -21,6 +21,8 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Setup",
         &[
+            ("setup", "Set up this machine and one agent"),
+            ("skill", "Install or remove the agent skill"),
             ("login", "Pair this host to your vault"),
             ("logout", "Unpair this host"),
             ("up", "Start the daemon and unlock the vault"),
@@ -45,6 +47,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("connection", "Manage connections: add / ls / rm"),
             ("run", "Run a command through the credential proxy"),
             ("registry", "Show the service catalog"),
+            (
+                "service",
+                "Service definitions from sources: add / update / ls / rm",
+            ),
             ("store", "Manage connected external stores"),
         ],
     ),
@@ -69,7 +75,6 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("env", "Print shell exports for your shell"),
             ("config", "Read/write CLI preferences"),
             ("proxy", "Set the daemon's upstream egress proxy"),
-            ("service", "Work with service.toml definitions"),
             ("op", "Approval ops (e.g. op wait)"),
         ],
     ),

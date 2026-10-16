@@ -114,6 +114,15 @@ pub struct Connection {
     /// this — their `secrets` list IS the binding (role == KEY).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<BTreeMap<String, String>>,
+    /// The vault KEYs whose value this connection WROTE (created or
+    /// overwrote) when it was added, as opposed to keys it binds that already
+    /// held a value (`sc connection add --from-secret`, a console reuse). Only
+    /// these may be deleted with the connection (`connection_removal`), and
+    /// never one another connection still binds. `Some(empty)` = it wrote
+    /// nothing. `None` = unknown: a record from before this field existed, or
+    /// from a writer that does not record it; removal then deletes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<Vec<String>>,
 }
 
 /// An **in-flight** connect handshake — everything the daemon needs to redeem
@@ -209,14 +218,14 @@ pub fn secret_key_for(conn: Option<&Connection>, role: &str) -> String {
 
 impl Connection {
     /// The vault KEYs this connection's secrets live at: a service-backed
-    /// connection's declared roles bound via `keys`/identity (resolved through
-    /// `reg`), or a raw connection's explicit UPPERCASE `secrets` list. A
-    /// service unknown to `reg` (e.g. a per-vault custom def not loaded) yields
-    /// no service-role addresses — the recorded `keys` bindings still surface
-    /// through [`VaultAux::connection_claims`].
-    pub fn secret_addresses(&self, reg: &crate::service::ServiceRegistry) -> Vec<String> {
+    /// connection's declared roles bound via `keys`/identity (the service
+    /// resolved custom-first through `defs`, as the proxy does), or a raw
+    /// connection's explicit UPPERCASE `secrets` list. A service neither
+    /// defines yields no service-role addresses; the recorded `keys` bindings
+    /// still surface through [`connection_claims_in`].
+    pub fn secret_addresses(&self, defs: &crate::service::ServiceDefs) -> Vec<String> {
         match self.service.as_deref() {
-            Some(service) => match reg.get(service) {
+            Some(service) => match defs.get(service) {
                 Some(def) => def
                     .service
                     .secrets
@@ -239,49 +248,147 @@ impl Connection {
 impl VaultAux {
     /// Every vault KEY some connection (other than `exclude`) references, mapped
     /// to the referencing connection ids — the shared-pool guard every deletion
-    /// flow consults (CONNECTION_SCHEMA.md §3): connections REFERENCE keys, they
-    /// don't own them, so a key another connection still references is never
-    /// deleted with this one, and deleting a key never cascades into a
-    /// connection (it just turns unconfigured). Covers raw `secrets` lists,
-    /// service `keys`-map values, and each service's declared-role identity
-    /// bindings (resolved via `reg`; a per-vault CUSTOM service's identity roles
-    /// aren't in `reg`, but its recorded `keys` bindings still count).
+    /// flow consults (CONNECTION_SCHEMA.md §3). See [`connection_claims_in`];
+    /// this vault's own `aux.services` defs resolve custom-first.
     pub fn connection_claims(
         &self,
         reg: &crate::service::ServiceRegistry,
         exclude: &str,
     ) -> BTreeMap<String, Vec<String>> {
-        let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (id, rec) in &self.connections {
-            if id == exclude {
-                continue;
+        let (custom, _) = crate::service::vault_custom_services(
+            &self.services,
+            self.allows_installed_services(),
+            reg,
+        );
+        let defs = crate::service::ServiceDefs {
+            reg,
+            custom: &custom,
+        };
+        connection_claims_in(&self.connections, &defs, exclude)
+    }
+
+    /// The owner's switch for installed services (`policy:`
+    /// `allow_installed_services`); off when the vault has no policy.
+    pub fn allows_installed_services(&self) -> bool {
+        self.policy
+            .as_ref()
+            .is_some_and(|p| p.allow_installed_services)
+    }
+}
+
+/// Every vault KEY some connection (other than `exclude`) can use, mapped to
+/// those connection ids. Connections REFERENCE keys, they don't own them, so a
+/// key another connection can still use is never deleted with this one, and
+/// deleting a key never cascades into a connection (it just turns
+/// unconfigured). Counts:
+///   - each record's raw `secrets` list and `keys`-map values;
+///   - each service record's declared roles at their bound (or identity) key,
+///     the service resolved custom-first through `defs`;
+///   - the DEFAULT connection of every service `defs` knows that has no record
+///     of its own (the proxy brokers `__sc__<service>__` for it without one):
+///     its roles at their identity keys, claimed by the service id. Removing
+///     that service's own record (`exclude` == its id) removes this claim too.
+///
+/// Works over any connection map (the daemon's session snapshot as well as an
+/// opened vault's `aux.connections`).
+pub fn connection_claims_in<'a>(
+    connections: impl IntoIterator<Item = (&'a String, &'a Connection)>,
+    defs: &crate::service::ServiceDefs,
+    exclude: &str,
+) -> BTreeMap<String, Vec<String>> {
+    let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut add = |key: String, id: &str| {
+        let by = claims.entry(key).or_default();
+        if !by.iter().any(|b| b == id) {
+            by.push(id.to_string());
+        }
+    };
+    let mut recorded: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (id, rec) in connections {
+        recorded.insert(id.as_str());
+        if id == exclude {
+            continue;
+        }
+        match rec.service.as_deref() {
+            None => {
+                for k in rec.secrets.clone().unwrap_or_default() {
+                    add(k.to_ascii_uppercase(), id);
+                }
             }
-            let mut add = |key: String| {
-                let by = claims.entry(key).or_default();
-                if !by.contains(id) {
-                    by.push(id.clone());
-                }
-            };
-            match rec.service.as_deref() {
-                None => {
-                    for k in rec.secrets.clone().unwrap_or_default() {
-                        add(k.to_ascii_uppercase());
+            Some(service) => {
+                if let Some(def) = defs.get(service) {
+                    for role in &def.service.secrets {
+                        add(secret_key_for(Some(rec), &role.to_ascii_uppercase()), id);
                     }
                 }
-                Some(service) => {
-                    if let Some(def) = reg.get(service) {
-                        for role in &def.service.secrets {
-                            add(secret_key_for(Some(rec), &role.to_ascii_uppercase()));
-                        }
-                    }
-                    for k in rec.keys.clone().unwrap_or_default().into_values() {
-                        add(k);
-                    }
+                for k in rec.keys.clone().unwrap_or_default().into_values() {
+                    add(k, id);
                 }
             }
         }
-        claims
     }
+    for service in defs.ids() {
+        if service == exclude || recorded.contains(service) {
+            continue;
+        }
+        if let Some(def) = defs.get(service) {
+            for role in &def.service.secrets {
+                add(secret_key_for(None, &role.to_ascii_uppercase()), service);
+            }
+        }
+    }
+    claims
+}
+
+/// What removing a connection does to the native keys it binds. Only a key the
+/// connection WROTE (`Connection::written`) and no other connection binds is
+/// deleted; every other bound native key is kept, with the reason.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConnectionRemoval {
+    /// Written by this connection, bound by no other: deleted.
+    pub delete: Vec<String>,
+    /// Kept: other connections still bind it (`key`, their ids).
+    pub shared: Vec<(String, Vec<String>)>,
+    /// Kept: bound, but its value was already in the vault when the
+    /// connection was added (this connection did not write it).
+    pub referenced: Vec<String>,
+    /// Kept: the record does not say what it wrote (it predates
+    /// `Connection::written`), so the key may predate the connection.
+    pub untracked: Vec<String>,
+}
+
+/// Plan the removal of connection `id` (record `rec`) against the vault's
+/// connections and native keys. External-store keys are never listed: SafeClaw
+/// only reads them, so removal never deletes one.
+pub fn connection_removal(
+    id: &str,
+    rec: &Connection,
+    connections: &BTreeMap<String, Connection>,
+    native: &BTreeMap<String, Vec<u8>>,
+    defs: &crate::service::ServiceDefs,
+) -> ConnectionRemoval {
+    let claims = connection_claims_in(connections, defs, id);
+    let mut out = ConnectionRemoval::default();
+    let mut seen: Vec<String> = Vec::new();
+    for addr in rec.secret_addresses(defs) {
+        if seen.iter().any(|s| s.eq_ignore_ascii_case(&addr)) {
+            continue;
+        }
+        seen.push(addr.clone());
+        if !native.contains_key(&addr) {
+            continue;
+        }
+        if let Some(by) = claims.get(&addr) {
+            out.shared.push((addr, by.clone()));
+            continue;
+        }
+        match &rec.written {
+            None => out.untracked.push(addr),
+            Some(w) if w.iter().any(|k| k.eq_ignore_ascii_case(&addr)) => out.delete.push(addr),
+            Some(_) => out.referenced.push(addr),
+        }
+    }
+    out
 }
 
 /// Creation-time DEFAULT `keys` binding for a **named** connection's role:
@@ -313,20 +420,49 @@ pub fn suggested_secret_key(conn_id: &str, service_id: &str, role: &str) -> Stri
 }
 
 /// Membership role inside a shared vault. Two tiers by design (team §7.1/§5.15):
-/// `Owner` = manage (config, members, reveal, kill switch); `Member` = edit
-/// (content). Multiple owners are the norm; the LAST owner can never be removed
-/// or demoted (§7.9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// `Admin` = manage (config, members, reveal, approve anyone's request, kill
+/// switch); `Member` = edit (content). Several admins are the norm; the LAST
+/// admin can never be removed or demoted (§7.9). (The single billing "owner" of
+/// a team is a server-side product label held by one admin; it is not a role
+/// and never appears in signed data.)
+///
+/// Wire tokens: writers emit `"admin"` / `"member"`. Records signed before the
+/// rename carry `"owner"`, which reads as [`MemberRole::LegacyOwner`]: the SAME
+/// role as `Admin` (`==` treats them as equal, [`MemberRole::is_admin`] is
+/// true), but it keeps its spelling so a re-emitted record still carries the
+/// exact bytes its signature covers. Never construct `LegacyOwner` in new code.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberRole {
-    Owner,
+    Admin,
     /// The least-privilege default: a cred that loads without an explicit role
-    /// (legacy row, serde default) is a `Member`, never an `Owner`. This is the
-    /// fail-closed choice for the owner-authority anchor — a missing role can
-    /// never silently confer owner powers.
+    /// (legacy row, serde default) is a `Member`, never an `Admin`. This is the
+    /// fail-closed choice for the admin-authority anchor — a missing role can
+    /// never silently confer admin powers.
     #[default]
     Member,
+    /// The pre-rename spelling of [`MemberRole::Admin`] (`"owner"`), read from
+    /// records signed before the rename. Equal to `Admin` in every comparison.
+    #[serde(rename = "owner")]
+    LegacyOwner,
 }
+
+impl MemberRole {
+    /// Does this role carry admin authority? (`Admin`, or its legacy `"owner"`
+    /// spelling.)
+    pub fn is_admin(self) -> bool {
+        matches!(self, MemberRole::Admin | MemberRole::LegacyOwner)
+    }
+}
+
+/// Roles compare by MEANING, not spelling: a legacy `"owner"` record is an admin.
+impl PartialEq for MemberRole {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_admin() == other.is_admin()
+    }
+}
+
+impl Eq for MemberRole {}
 
 /// A single agent's reach mask — which connections of THIS vault the agent may
 /// use (design/team §8.1). The mask defaults OPEN and the console writes a
@@ -379,7 +515,7 @@ impl AgentMask {
 }
 
 /// One row of a vault's **authorized-agents table** — the item body under
-/// `aux:agent/<ag_id>` (design/agent-device-identity-mtls.md §11.1). It records
+/// native `agent:<ag_id>` (design/agent-device-identity-mtls.md §11.1). It records
 /// the agent's self-certifying pubkey, the owning member (`us_…`) whose UIK
 /// authority admits it, and the connection reach mask.
 ///
@@ -389,12 +525,13 @@ impl AgentMask {
 /// re-key — the agent never held K). There is no separate admission mode: an
 /// `ag_id` with no item is simply not authorized.
 ///
-/// Each item is **UIK-signed** and folded through [`crate::identity::config_sig_input`]
-/// under the logical name `agent/<ag_id>`; the fold verifies the signer is
-/// EITHER this `owner` (a member authorizing their OWN agent) OR any owner
-/// (owner override). Because the daemon holds only PUBLIC keys, it cannot
-/// re-sign a folded row, so the verified signed wrapper is retained in
-/// [`Self::signed_body`] and re-emitted byte-identically.
+/// Each item is a NATIVE `agent` row at wire id == `ag_id`, carrying a **UIK
+/// sidecar signature** (`record_signature_input`, type `"agent"`); on a v2 vault
+/// the fold honors it only if the signer is EITHER this `owner` (a member
+/// authorizing their OWN agent) OR any owner (owner override); an unsigned row is
+/// dropped there (honored only on a legacy single-person NoUik vault). Legacy
+/// `aux:agent/<ag_id>` rows are never folded. The daemon holds only PUBLIC keys,
+/// so it never writes agent rows; the console does.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentEntry {
     /// The agent's Ed25519 signing pubkey (base64url-nopad). Self-certifying:
@@ -410,13 +547,6 @@ pub struct AgentEntry {
     /// Connection reach mask (deny-list; `All` = unrestricted).
     #[serde(default)]
     pub connections: AgentMask,
-    /// The verified signed wrapper (`{ data, uik_sig, uik_sign_pub }`) exactly as
-    /// folded from cloud, retained so the daemon can re-emit this row
-    /// byte-identically (it holds only PUBLIC keys and cannot re-sign). `None` for
-    /// a legacy raw (unsigned) row → the daemon re-emits the raw body. Never
-    /// serialized as a struct field; consulted directly by the seal path.
-    #[serde(skip)]
-    pub signed_body: Option<serde_json::Value>,
 }
 
 /// `aux` payload — everything inside `ProtectedState.aux` for v4 vaults.
@@ -437,6 +567,11 @@ pub struct VaultAux {
     /// [`Connecting`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub connecting: BTreeMap<String, Connecting>,
+    /// The console's install requests (`service_request:<id>` items), as
+    /// written. Read only by the daemon's request handling, which writes
+    /// them itself; never part of a view's reconcile.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service_requests: BTreeMap<String, serde_json::Value>,
     /// Established connections, keyed by `connection_id`. Sparse. Status is
     /// derived (see [`Connection`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -447,19 +582,21 @@ pub struct VaultAux {
     /// sensible range during prune.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_retention_days: Option<u32>,
-    /// Per-vault custom service definitions: `service_id → verbatim v4
-    /// service.toml source`. Validated (v4 schema, inline-complete `[oauth2]`,
-    /// no tool-named sections) at unlock before it can broker,
-    /// and again at author time. Sparse — empty when the user authored none. A
-    /// custom service is folded into the catalog exactly like a compiled one;
-    /// it never shadows a built-in id.
+    /// Per-vault custom service definitions: `service_id → { service,
+    /// policy?, source? }` (verbatim service.toml, optional policy.toml, where
+    /// it came from); an entry written before sources is a plain service.toml
+    /// string and reads as one with no policy and no source
+    /// ([`crate::service::source::StoredService`]). Admitted through the gate
+    /// at unlock before it can broker, and again at author time. Sparse —
+    /// empty when the user authored none. A custom service is folded into the
+    /// catalog exactly like a compiled one; it never shadows a built-in id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub services: BTreeMap<String, String>,
+    pub services: BTreeMap<String, crate::service::source::StoredService>,
     /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
     /// (`derive_id(Agent, pubkey)`). **Presence = authorized**; an `ag_id` with no
     /// entry is not authorized (there is no admission mode). Each [`AgentEntry`] is
-    /// UIK-signed. Sliced to `aux:agent/<ag_id>` items (one per agent = independent
-    /// CAS, same pattern as connections). Team §8.1 / identity §11.
+    /// a native `agent:<ag_id>` item, UIK-signed by the console (one per agent =
+    /// independent CAS). Read-only for the daemon. Team §8.1 / identity §11.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentEntry>,
 }
@@ -484,6 +621,7 @@ impl VaultAux {
             store_order: vec![NATIVE_SECRETS_ID.to_string()],
             policy: None,
             connecting: BTreeMap::new(),
+            service_requests: BTreeMap::new(),
             connections: BTreeMap::new(),
             audit_retention_days: None,
             services: BTreeMap::new(),
@@ -503,10 +641,12 @@ pub struct VaultPlaintextView {
     /// because the view's lifetime is the request, not the protocol
     /// boundary — sudp's zeroize is preserved up to the moment we copy.
     pub native_secrets: BTreeMap<String, Vec<u8>>,
-    /// True when the fold saw any live legacy `aux:*` item — the trigger for
-    /// the one-shot addressing migration (team §8.3). Always false for views
-    /// opened from a whole-blob `ProtectedState` (no addressing there).
-    pub legacy_addressing: bool,
+    /// User notes on native secrets: `item_name → notes`, only for secrets that
+    /// have them. Kept OUT of `native_secrets` so every value consumer stays
+    /// untouched; the item write paths re-attach a secret's notes when they
+    /// re-seal its value, so a daemon-side rewrite (an OAuth token refresh,
+    /// `sc set`) never drops them.
+    pub native_secret_notes: BTreeMap<String, String>,
 }
 
 impl VaultPlaintextView {
@@ -527,7 +667,7 @@ impl VaultPlaintextView {
         Ok(VaultPlaintextView {
             aux,
             native_secrets,
-            legacy_addressing: false,
+            native_secret_notes: BTreeMap::new(),
         })
     }
 
@@ -582,6 +722,61 @@ impl VaultPlaintextView {
 mod tests {
     use super::*;
 
+    /// Removal deletes only what the connection wrote and nothing else binds;
+    /// every other bound native key is kept with its reason, a pre-tracking
+    /// record keeps all, and an external-store key is never listed.
+    #[test]
+    fn connection_removal_deletes_only_written_unshared_keys() {
+        let reg = crate::service::ServiceRegistry::load();
+        let raw = |keys: &[&str], written: Option<&[&str]>| Connection {
+            hosts: Some(vec!["api.example.com".into()]),
+            secrets: Some(keys.iter().map(|k| k.to_string()).collect()),
+            written: written.map(|w| w.iter().map(|k| k.to_string()).collect()),
+            ..Connection::default()
+        };
+        let mut conns = BTreeMap::new();
+        conns.insert(
+            "a".to_string(),
+            raw(
+                &["MINE", "SHARED", "BOUND", "EXTERNAL_ONLY"],
+                Some(&["mine", "SHARED"]),
+            ),
+        );
+        conns.insert("b".to_string(), raw(&["SHARED"], Some(&[])));
+        conns.insert("legacy".to_string(), raw(&["OLD"], None));
+        let native: BTreeMap<String, Vec<u8>> = ["MINE", "SHARED", "BOUND", "OLD"]
+            .iter()
+            .map(|k| (k.to_string(), b"v".to_vec()))
+            .collect();
+
+        let no_custom = std::collections::HashMap::new();
+        let reg = crate::service::ServiceDefs {
+            reg: &reg,
+            custom: &no_custom,
+        };
+        let plan = connection_removal("a", &conns["a"], &conns, &native, &reg);
+        assert_eq!(plan.delete, vec!["MINE".to_string()]);
+        assert_eq!(
+            plan.shared,
+            vec![("SHARED".to_string(), vec!["b".to_string()])]
+        );
+        assert_eq!(plan.referenced, vec!["BOUND".to_string()]);
+        assert!(plan.untracked.is_empty());
+
+        let plan = connection_removal("legacy", &conns["legacy"], &conns, &native, &reg);
+        assert!(plan.delete.is_empty());
+        assert_eq!(plan.untracked, vec!["OLD".to_string()]);
+
+        // `written` round-trips, and a legacy record without it reads as None.
+        let json = serde_json::to_value(&conns["b"]).unwrap();
+        assert_eq!(json["written"], serde_json::json!([]));
+        let legacy: Connection = serde_json::from_value(
+            serde_json::json!({ "hosts": ["h.example.com"], "secrets": ["OLD"] }),
+        )
+        .unwrap();
+        assert_eq!(legacy.written, None);
+    }
+
     #[test]
     fn connection_claims_cover_raw_keysmap_and_identity_bindings() {
         // Registry is loaded so gmail's declared GMAIL_REFRESH_TOKEN role
@@ -598,6 +793,7 @@ mod tests {
                 hosts: None,
                 secrets: Some(vec!["SHARED_KEY".into()]),
                 keys: None,
+                written: None,
             },
         );
         aux.connections.insert(
@@ -608,6 +804,7 @@ mod tests {
                 hosts: None,
                 secrets: None,
                 keys: None,
+                written: None,
             },
         );
         let mut work_keys = BTreeMap::new();
@@ -623,6 +820,7 @@ mod tests {
                 hosts: None,
                 secrets: None,
                 keys: Some(work_keys),
+                written: None,
             },
         );
 
@@ -641,16 +839,130 @@ mod tests {
 
         // secret_addresses: a raw conn lists its own; a named conn resolves its
         // bound key; the default conn is the identity role.
+        let no_custom = std::collections::HashMap::new();
+        let defs = crate::service::ServiceDefs {
+            reg: &reg,
+            custom: &no_custom,
+        };
         let raw = &aux.connections["stripe_key"];
-        assert_eq!(raw.secret_addresses(&reg), vec!["SHARED_KEY".to_string()]);
+        assert_eq!(raw.secret_addresses(&defs), vec!["SHARED_KEY".to_string()]);
         assert_eq!(
-            aux.connections["gmail"].secret_addresses(&reg),
+            aux.connections["gmail"].secret_addresses(&defs),
             vec!["GMAIL_REFRESH_TOKEN".to_string()]
         );
         assert_eq!(
-            aux.connections["gmail_work"].secret_addresses(&reg),
+            aux.connections["gmail_work"].secret_addresses(&defs),
             vec!["GMAIL_REFRESH_TOKEN_WORK".to_string()]
         );
+    }
+
+    /// A key a service's DEFAULT connection can use (its identity role, with
+    /// no record of its own: the proxy brokers `__sc__<service>__` for it) is
+    /// claimed by that service, so removing another connection that wrote it
+    /// keeps it. Removing the service's own record drops that claim.
+    #[test]
+    fn default_connection_without_a_record_claims_its_identity_keys() {
+        let reg = crate::service::ServiceRegistry::load();
+        let role = reg.get("github").unwrap().service.secrets[0].to_ascii_uppercase();
+        let no_custom = std::collections::HashMap::new();
+        let defs = crate::service::ServiceDefs {
+            reg: &reg,
+            custom: &no_custom,
+        };
+        let mut conns = BTreeMap::new();
+        conns.insert(
+            "mine".to_string(),
+            Connection {
+                hosts: Some(vec!["api.example.com".into()]),
+                secrets: Some(vec![role.clone()]),
+                written: Some(vec![role.clone()]),
+                ..Connection::default()
+            },
+        );
+        let native: BTreeMap<String, Vec<u8>> = [(role.clone(), b"v".to_vec())].into();
+        let plan = connection_removal("mine", &conns["mine"], &conns, &native, &defs);
+        assert!(plan.delete.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.shared,
+            vec![(role.clone(), vec!["github".to_string()])]
+        );
+
+        // With a `github` record of its own, the record's binding counts
+        // instead; removing that record does not count itself.
+        conns.insert(
+            "github".to_string(),
+            Connection {
+                service: Some("github".into()),
+                written: Some(vec![role.clone()]),
+                ..Connection::default()
+            },
+        );
+        let plan = connection_removal("github", &conns["github"], &conns, &native, &defs);
+        assert_eq!(plan.shared, vec![(role.clone(), vec!["mine".to_string()])]);
+        conns.remove("mine");
+        let plan = connection_removal("github", &conns["github"], &conns, &native, &defs);
+        assert_eq!(plan.delete, vec![role.clone()], "its own written key goes");
+    }
+
+    /// A connection of a vault-custom service (`aux.services`) binds its
+    /// declared roles like a compiled one: a claim, and an address.
+    #[test]
+    fn custom_service_binding_counts_as_a_claim() {
+        let reg = crate::service::ServiceRegistry::load();
+        let mut aux = VaultAux::initial();
+        aux.services.insert(
+            "acme_api".into(),
+            r#"
+[service]
+id = "acme_api"
+name = "Acme"
+hosts = ["api.acme.example"]
+secrets = ["ACME_TOKEN"]
+"#
+            .into(),
+        );
+        let mut keys = BTreeMap::new();
+        keys.insert("ACME_TOKEN".to_string(), "ACME_TOKEN_WORK".to_string());
+        aux.connections.insert(
+            "acme_work".into(),
+            Connection {
+                service: Some("acme_api".into()),
+                keys: Some(keys),
+                ..Connection::default()
+            },
+        );
+        aux.connections.insert(
+            "acme_api".into(),
+            Connection {
+                service: Some("acme_api".into()),
+                ..Connection::default()
+            },
+        );
+        let claims = aux.connection_claims(&reg, "other");
+        assert_eq!(
+            claims.get("ACME_TOKEN").map(Vec::as_slice),
+            Some(&["acme_api".to_string()][..]),
+            "the identity binding of the custom role"
+        );
+        assert_eq!(
+            claims.get("ACME_TOKEN_WORK").map(Vec::as_slice),
+            Some(&["acme_work".to_string()][..])
+        );
+        let (custom, skipped) = crate::service::vault_custom_services(&aux.services, true, &reg);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let defs = crate::service::ServiceDefs {
+            reg: &reg,
+            custom: &custom,
+        };
+        assert_eq!(
+            aux.connections["acme_api"].secret_addresses(&defs),
+            vec!["ACME_TOKEN".to_string()]
+        );
+        // Removing the default connection's own record: nothing else claims
+        // its identity key (the default does not claim against itself).
+        aux.connections.remove("acme_work");
+        let claims = aux.connection_claims(&reg, "acme_api");
+        assert!(!claims.contains_key("ACME_TOKEN"), "{claims:?}");
     }
 
     fn build_protected_state(

@@ -160,12 +160,11 @@ pub enum StreamHealth {
 
 // ── Daemon-global signals (v1.1 — op_relay + agent-hash eventing) ───────────
 
-/// Wakes `sync::sync_agent_keys_loop`. Fired on an `agent_hashes` stream
-/// event and after EVERY reconnect hello (resync-on-reconnect, see
-/// `run_stream`). A static, not AppState plumbing: the producers
-/// (`dispatch_record` / `run_stream`) are free functions with no AppState
-/// handle, and the sole consumer is spawned in main.rs BEFORE
-/// `spawn_watchers` builds any stream state.
+/// Wakes `principal_ledger::principal_ledger_loop` (an agent or device change
+/// on the account). Fired on an `agent_hashes` stream event and after EVERY
+/// reconnect hello (resync-on-reconnect, see `run_stream`). A static, not
+/// AppState plumbing: the producers (`dispatch_record` / `run_stream`) are
+/// free functions with no AppState handle.
 static AGENT_HASH_EVENTS: Notify = Notify::const_new();
 
 /// Arm a wake on the agent-hash signal. `notify_one` semantics: a fire with
@@ -269,11 +268,10 @@ pub fn op_events() -> &'static OpRegistry {
 /// The dispatcher's health watch, re-exposed daemon-wide. Set once by
 /// `sync::spawn_watchers` — the only place that knows whether streaming
 /// exists for this daemon at all — and read through [`stream_healthy`] by
-/// the consumers OUTSIDE the vault tasks (the agent-hash loop's cadence,
-/// the relay pollers' interval). A OnceLock set by spawn_watchers rather
-/// than a channel built at AppState construction because (a) main.rs spawns
-/// `sync_agent_keys_loop` BEFORE `spawn_watchers`, and relay pollers spawn
-/// at arbitrary times, so consumers can never assume the channel exists;
+/// the consumers OUTSIDE the vault tasks (the relay pollers' interval). A
+/// OnceLock set by spawn_watchers rather than a channel built at AppState
+/// construction because (a) relay pollers spawn at arbitrary times, so
+/// consumers can never assume the channel exists;
 /// (b) an UNSET cell already reads as Down, which is the right answer in
 /// every no-stream world (local-only daemon, unpaired device, watchers not
 /// yet started) — AppState would have to fabricate a dead channel to say

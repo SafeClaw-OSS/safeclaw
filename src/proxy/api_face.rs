@@ -8,13 +8,15 @@
 //! agent wrongly routed discovery through its own proxy) is the loop-guard case,
 //! also handled here. Everything is a plain READ:
 //! - `/health`, `/ca` — unauthenticated (liveness / public CA cert).
-//! - `/v/{vid}/registry`, `/op/{id}` — the agent Bearer key (§8).
+//! - `/v/{vid}/registry`, `/op/{id}` — the agent's AIK proof in the Bearer slot (§8),
+//!   admitted by the account ledger (§15 W3).
 //!
 //! Writes / ceremony never appear here — they stay on the control port (23293),
 //! passkey-gated and invisible to the agent. The read projections come from the
 //! SAME functions the control plane serves (`registry::vault_registry_value`,
 //! `approve::op_poll_value`, `health::health_value`), so the two ports can't
-//! drift; auth reuses the pure `api_key::check_token`. Both shared surfaces are
+//! drift; agent admission is `principal_ledger::authorize_agent`, the same rule
+//! the proxy applies. Both shared surfaces are
 //! `Value`/`&str`-typed, so this module never touches axum's `http` types.
 
 use std::sync::Arc;
@@ -99,7 +101,13 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
                 }
             }
         }
-        return match crate::server::handlers::approve::op_poll_value(state, op_id) {
+        // Same E1 gate as the control plane: an Export value is released only
+        // with its waiter secret, so the two faces stay byte-identical.
+        let waiter = req
+            .headers()
+            .get(crate::server::handlers::approve::WAITER_HEADER)
+            .and_then(|v| v.to_str().ok());
+        return match crate::server::handlers::approve::op_poll_value(state, op_id, waiter) {
             Ok(v) => op_poll_response(&v),
             Err(e) => app_err(e),
         };
@@ -174,86 +182,55 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
     problem(ScCode::NotFound, "Not found")
 }
 
-/// Gate an api-face request and resolve the caller's attribution (§8). Dual-auth:
-///
-/// - **hop-A AIK PoP** — a `scpop1…` token in the Bearer slot (the `sc` transport
-///   holds the AIK and mints it, keeping the key out of the child env). Crypto-
-///   verified against the request-line target (`apiface:<pq>`, account-scoped
-///   `vault=""`; the api-face is account-scoped, exactly like the legacy shared
-///   key hash-set), then authorized by `ag_` ∈ ANY unlocked vault's authorized-
-///   agents table. A `scpop1…` that doesn't verify/authorize is a 401 — it's not
-///   an api-key, so there's nothing to fall back to. Returns the resolved `ag_`.
-/// - **legacy Bearer api-key** — the same membership check the control plane uses
-///   via the pure `check_token`. On a miss with a key PRESENT, one debounced hash
-///   refresh (a just-minted `sc agent add` key must not 401 for the 30s sync
-///   loop), then re-check. Returns the key prefix (never the full key).
-///
-/// The returned id is the SAME attribution the proxy path stamps
-/// (`BrokerHandler::agent_attribution`), so op-binding, reach masks, and registry
-/// annotation agree across both faces. `Err` carries the ready 401.
+/// Gate an api-face request and resolve the caller's attribution (§8, §15 W3).
+/// The agent proves its AIK with a `scpop1…` token in the Bearer slot (the `sc`
+/// transport holds the AIK and mints it, keeping the key out of the child env),
+/// verified against the request-line target (`apiface:<pq>`, account-scoped
+/// `vault=""`). Then the one admission rule ([`crate::principal_ledger::authorize_agent`]):
+/// this device serves, the ledger admits the `ag_`, and some unlocked vault
+/// lists it. An api key alone is no longer an agent credential. Returns the
+/// `ag_` (the same attribution the proxy stamps). `Err` carries the ready refusal.
 async fn require_agent(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     pq: &str,
 ) -> Result<String, Response<Body>> {
-    let token = bearer_token(headers);
-    // hop-A: an AIK PoP in the Bearer slot (`scpop1.…`) is unambiguous vs. an
-    // `sc_…` api-key — verify + authorize here; on failure it's a hard 401 (a
-    // PoP string is never a hash-set member, so no api-key fallback applies).
-    if let Some(tok) = token.as_deref() {
-        if tok.starts_with(&format!("{}.", crate::agent_pop::TOKEN_PREFIX)) {
-            let target = crate::agent_pop::apiface_target(pq);
-            return match crate::agent_pop::verify_agent_proxy_pop(
-                tok,
-                "",
-                &target,
-                crate::util::now_unix(),
-                crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
-            ) {
-                // Verified AIK, authorized on some unlocked vault → attribution.
-                Some(ag) if state.agent_is_authorized_any(&ag) => Ok(ag),
-                // Verified AIK but NOT authorized anywhere yet: distinct from a bad
-                // credential — the fix is a Console authorize (Agents tab), not a
-                // key change (same fail-loudly posture as the proxy path).
-                Some(_) => Err(problem(
-                    ScCode::AgentNotAuthorized,
-                    "this agent isn't authorized on any of your vaults yet — \
-                     authorize it in the SafeClaw console (Agents tab)",
-                )),
-                // Not a valid/fresh PoP at all → generic 401 (no api-key fallback:
-                // a `scpop1…` string is never a hash-set member).
-                None => Err(problem(
-                    ScCode::Unauthorized,
-                    "missing or invalid agent api key",
-                )),
-            };
+    use crate::principal_ledger::AgentRefusal;
+    let verified = bearer_token(headers).and_then(|tok| {
+        crate::agent_pop::verify_agent_proxy_pop(
+            &tok,
+            "",
+            &crate::agent_pop::apiface_target(pq),
+            crate::util::now_unix(),
+            crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
+        )
+    });
+    match crate::principal_ledger::authorize_agent(state, verified.as_deref(), None).await {
+        Ok(ag) => Ok(ag),
+        Err(AgentRefusal::Device(e)) => {
+            let (code, msg) = e.code();
+            Err(problem(code, &msg))
         }
+        Err(AgentRefusal::NoIdentity) => Err(problem(
+            ScCode::Unauthorized,
+            crate::principal_ledger::NO_AGENT_IDENTITY_MSG,
+        )),
+        Err(AgentRefusal::NotAdmitted) => Err(problem(
+            ScCode::AgentNotAdmitted,
+            crate::error::AGENT_NOT_ADMITTED_MSG,
+        )),
+        Err(AgentRefusal::Locked) => Err(problem(
+            ScCode::VaultLocked,
+            crate::error::VAULT_LOCKED_MSG,
+        )),
+        // Verified and admitted, but NOT turned on anywhere yet: distinct from a
+        // bad credential — the fix is a Console authorize (Agent access page).
+        Err(AgentRefusal::NotAuthorized) => Err(problem(
+            ScCode::AgentNotAuthorized,
+            "this agent is not turned on for any vault. Turn it on in a vault's \
+             Agent access page in the SafeClaw console",
+        )),
     }
-    // Legacy Bearer api-key (dual-auth) — unchanged, incl. the debounced refresh.
-    if key_in_set(state, token.as_deref()) {
-        return Ok(legacy_attribution(token.as_deref()));
-    }
-    if token.is_some()
-        && crate::sync::refresh_agent_keys_on_miss(state).await
-        && key_in_set(state, token.as_deref())
-    {
-        return Ok(legacy_attribution(token.as_deref()));
-    }
-    Err(problem(
-        ScCode::Unauthorized,
-        "missing or invalid agent api key",
-    ))
-}
-
-/// The legacy attribution id for a Bearer api-key: its prefix (never the full
-/// key/token), matching the proxy path's `legacy_key_prefix`.
-fn legacy_attribution(token: Option<&str>) -> String {
-    token.map(crate::audit::agent_key_prefix).unwrap_or_default()
-}
-
-fn key_in_set(state: &AppState, token: Option<&str>) -> bool {
-    let hashes = state.agent_key_hashes.lock().unwrap();
-    crate::api_key::check_token(&hashes, token).is_ok()
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -376,5 +353,80 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert!(is_api_face(&loop_back, 23294));
+    }
+
+    /// §15 W3: an agent is served only while the account ledger admits its
+    /// `ag_` AND some vault lists it. A revoked agent is refused with
+    /// `agent_not_admitted` though a vault still lists it; a not-admitted device
+    /// refuses every agent; an api key alone is no agent credential.
+    #[tokio::test]
+    async fn the_ledger_admits_agents_and_a_revoked_agent_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = Arc::new(AppState::new(cfg));
+        let id = crate::identity::SigningIdentity::from_seed(&[9u8; 32]);
+        let ag = crate::identity::derive_id(crate::identity::IdKind::Agent, &id.public_bytes());
+        let signer = crate::agent_pop::AgentProxyPopSigner::new(id, ag.clone());
+        let headers = |pq: &str| {
+            let tok = signer.token(
+                "",
+                &crate::agent_pop::apiface_target(pq),
+                crate::util::now_unix(),
+            );
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {tok}").parse().unwrap(),
+            );
+            h
+        };
+        let code = |r: &Response<Body>| {
+            r.headers()
+                .get("x-safeclaw-error")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        // The vault lists the agent.
+        let mut cache = crate::state::SecretsCache::default();
+        cache.agents.insert(ag.clone(), Default::default());
+        // Admitted by the ledger (a parked device holds no K) and listed: served.
+        state.open_ledger_for_tests(&[&ag]);
+        state.unlock_vault("v1".into(), cache, zeroize::Zeroizing::new(vec![0x42u8; 32]));
+        assert_eq!(require_agent(&state, &headers("/vaults"), "/vaults").await.unwrap(), ag);
+
+        // Revoked in the ledger (the latest fold no longer admits it): refused
+        // with agent_not_admitted, though the vault still lists it. The on-miss
+        // re-pull finds no pairing in this test and changes nothing.
+        state.open_ledger_for_tests(&[]);
+        *state.ledger_sync.lock().await = Some(std::time::Instant::now());
+        let r = require_agent(&state, &headers("/vaults"), "/vaults").await.unwrap_err();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(code(&r).as_deref(), Some("agent_not_admitted"));
+
+        // No verified agent identity (an api key): refused, never looked up.
+        state.open_ledger_for_tests(&[&ag]);
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, "Bearer sc_agent_k9".parse().unwrap());
+        let r = require_agent(&state, &h, "/vaults").await.unwrap_err();
+        assert_eq!(code(&r).as_deref(), Some("unauthorized"));
+
+        // This device not admitted: every agent refused with device_not_admitted.
+        state.set_ledger(crate::principal_ledger::LedgerGate::default());
+        let r = require_agent(&state, &headers("/vaults"), "/vaults").await.unwrap_err();
+        assert_eq!(code(&r).as_deref(), Some("device_not_admitted"));
+        assert!(state.is_vault_locked("v1"), "parking evicts K");
     }
 }

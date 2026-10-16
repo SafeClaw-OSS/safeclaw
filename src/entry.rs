@@ -55,6 +55,16 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
         cli::logging::init_cli(verbose);
     }
     match cli.command {
+        Command::Setup(args) => match cli::setup::run(args, json).await {
+            Ok(()) => Ok(()),
+            Err(code) => std::process::exit(code),
+        },
+        Command::Skill(args) => {
+            cli::skill::run(args.sub).map_err(|e| -> Box<dyn std::error::Error> {
+                eprintln!("safeclaw skill: {}", e);
+                e.into()
+            })
+        }
         Command::Status(_args) => {
             // CLI commands log to stderr; don't initialise the tracing
             // subscriber here (it'd pollute the user-facing output of a
@@ -285,8 +295,9 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
         Command::Service(args) => {
             use crate::config::ServiceSubcommand;
             let r = match args.sub {
-                ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a).await,
+                ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a, json).await,
                 ServiceSubcommand::Add(a) => cli::service_def::run_add(a).await,
+                ServiceSubcommand::Update(a) => cli::service_def::run_update(a).await,
                 ServiceSubcommand::Ls(a) => cli::service_def::run_ls(a, json).await,
                 ServiceSubcommand::Rm(a) => cli::service_def::run_rm(a).await,
             };
@@ -360,11 +371,11 @@ async fn run_daemon(
     // team-edition §9.
     state.hydrate_shared_from_catalog();
 
-    // Agent-centric auth: sync the account-level agent-key hash-set once
-    // before serving (so account agent-keys are accepted from the start),
-    // then keep it fresh in the background (revokes/new agents land in ~30s).
-    crate::sync::sync_agent_keys_once(&state).await;
-    tokio::spawn(crate::sync::sync_agent_keys_loop(state.clone()));
+    // §15 principal ledger, enforced: load this device's persisted standing
+    // before serving (fail closed: park without an anchor, a DIK or an admit;
+    // lock past the lease). The ledger loop (spawned with the watchers) keeps it
+    // current and carries the admitted agents.
+    crate::principal_ledger::init_gate(&state);
 
     // Slice 3 realtime sync: one detached long-poll watcher PER synced vault
     // (active ∪ known_vaults — all vaults stay live, not just the active one).
@@ -377,6 +388,13 @@ async fn run_daemon(
     // terminal Use-op rows to the cloud `audit_events` table so the console can
     // show activity without a cloud daemon. Best-effort + gated like blob sync.
     tokio::spawn(crate::sync::ship_audit_loop(state.clone()));
+
+    // E1 liveness backstop (design/approvals-inbox.md D1-E): a pending Export
+    // whose creating `sc get` stopped polling (kill -9) is withdrawn as
+    // abandoned, so it leaves the inbox without anyone rejecting it.
+    tokio::spawn(crate::server::handlers::op::reap_abandoned_exports_loop(
+        state.clone(),
+    ));
 
     // Install the process-wide rustls crypto provider ONCE (aws-lc-rs, never
     // OpenSSL) before the proxy's TLS stacks touch it. Ignore "already set" —
@@ -416,7 +434,8 @@ async fn run_daemon(
     tracing::info!(
         listen = %addr,
         state_dir = %config.state_dir.display(),
-        rp_id = %config.rp_id,
+        rp_id = %config.relying_party.rp_id,
+        webauthn_origins = %config.relying_party.origins.join(","),
         origin = %config.origin,
         "safeclaw daemon starting"
     );

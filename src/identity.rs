@@ -533,7 +533,8 @@ pub fn membership_commitment(sigs: &[&[u8]]) -> [u8; 32] {
 /// ```
 ///
 /// `role` is the lowercase serde token of [`crate::storage::plaintext::MemberRole`]
-/// (`"owner"` / `"member"`). The variable-length fields are length-prefixed (so a
+/// (`"admin"` / `"member"`; a grant signed before the admin rename carries `"owner"`,
+/// which still verifies as admin). The variable-length fields are length-prefixed (so a
 /// `(vault, user, role)` triple can't be spliced into another); the trailing epoch
 /// is appended as a fixed-width big-endian `u64`, EXACTLY as [`rekey_sig_input`]
 /// appends `generation`.
@@ -573,10 +574,10 @@ pub fn role_grant_input(vault_id: &str, user_id: &str, role: &str, role_epoch: u
 ///
 /// `op` ∈ {`"set"`, `"remove"`}: `set` inserts `subject_id → role` (add / promote /
 /// demote); `remove` drops `subject_id` (NON-CASCADE — touches only the subject).
-/// `role` is the lowercase [`crate::storage::plaintext::MemberRole`] token for `set`,
-/// empty for `remove`. `granter_id` is the signing owner's `us_…`; the event is
-/// honored by the fold iff `granter_id` is an OWNER in the owner-set folded up to
-/// this event (so a member can't grant, and issuance-time authority survives the
+/// `role` is the lowercase [`crate::storage::plaintext::MemberRole`] token for `set`
+/// (`"admin"` / `"member"`, legacy `"owner"` = admin), empty for `remove`.
+/// `granter_id` is the signing admin's `us_…`; the event is honored by the fold
+/// iff `granter_id` is an ADMIN in the role set folded up to this event (so a member can't grant, and issuance-time authority survives the
 /// granter's later removal). `seq` is monotone within `role_epoch` (rollback guard);
 /// `role_epoch` binds the event to the current checkpoint so a compaction that folds
 /// the log invalidates replays of pre-compaction events at the new epoch.
@@ -624,12 +625,18 @@ pub fn delegation_event_input(
 /// a ledger that drops a higher-seq `revoke`. On a VERIFIED `revoke` of ITSELF, a
 /// device locks + wipes all local vaults + logs out (killing the bearer
 /// device-key alone only parks — delivery-before-hard-kill).
+///
+/// Contract C1 (grant-v3): the input ENDS with `lp(sc_pk)`: the device's raw
+/// 32-byte X25519 grant-seal key for a device admit, empty for an agent admit
+/// and for every revoke. The owner admits the device AND the one daemon key a
+/// browser may seal a grant to, in one signature.
 pub fn principal_event_input(
     account_id: &str,
     op: &str,
     principal_id: &str,
     seq: u64,
     owner_id: &str,
+    sc_pk: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::new();
     push_lp(&mut out, DS_PRINCIPAL_EVENT);
@@ -638,6 +645,83 @@ pub fn principal_event_input(
     push_lp(&mut out, principal_id.as_bytes());
     out.extend_from_slice(&seq.to_be_bytes());
     push_lp(&mut out, owner_id.as_bytes());
+    push_lp(&mut out, sc_pk);
+    out
+}
+
+/// Domain tag of the grant v3 identity signature (contract C3).
+pub const DS_GRANT_ID: &[u8] = b"safeclaw/v1/grant-id";
+
+/// Domain tag of the owner-signed principal-ledger head (contract C4).
+pub const DS_PRINCIPAL_HEAD: &[u8] = b"safeclaw/v1/principal-head";
+
+/// `SHA256(lp(k_enc) ‖ lp(k_ct))`: the seal hash a grant v3 `id_sig` binds (C3).
+pub fn grant_seal_hash(k_enc: &[u8], k_ct: &[u8]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(8 + k_enc.len() + k_ct.len());
+    push_lp(&mut buf, k_enc);
+    push_lp(&mut buf, k_ct);
+    sha256(&buf)
+}
+
+/// Signing input of a grant v3 identity signature (contract C3), one per op row:
+///
+/// ```text
+/// lp("safeclaw/v1/grant-id") ‖ lp(vault_id) ‖ lp(op_id) ‖ lp(beta) ‖ lp(credential_id)
+///   ‖ lp(SHA256(lp(k_enc) ‖ lp(k_ct))) ‖ lp(sc_pk) ‖ lp(id)
+/// ```
+///
+/// `beta` is the op's 32-byte binding ([`crate::crypto::binding::binding_for_op`]
+/// under `DOMAIN_STANDARD`), `credential_id` the raw passkey credential id, `sc_pk`
+/// the raw X25519 key the K seal is sealed to, `id` the approver's `us_…`. Binding
+/// the seal hash and `sc_pk` stops a relay from moving a signature onto another
+/// seal or daemon; binding `credential_id` makes passkey → person cryptographic.
+#[allow(clippy::too_many_arguments)]
+pub fn grant_id_input(
+    vault_id: &str,
+    op_id: &str,
+    beta: &[u8],
+    credential_id: &[u8],
+    k_enc: &[u8],
+    k_ct: &[u8],
+    sc_pk: &[u8],
+    id: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_GRANT_ID);
+    push_lp(&mut out, vault_id.as_bytes());
+    push_lp(&mut out, op_id.as_bytes());
+    push_lp(&mut out, beta);
+    push_lp(&mut out, credential_id);
+    push_lp(&mut out, &grant_seal_hash(k_enc, k_ct));
+    push_lp(&mut out, sc_pk);
+    push_lp(&mut out, id.as_bytes());
+    out
+}
+
+/// `SHA256(lp(sig_1) ‖ … ‖ lp(sig_n))` over the ledger's event signatures in
+/// `seq` order: the `events_hash` an owner-signed ledger head commits to (C4).
+pub fn principal_events_hash<S: AsRef<[u8]>>(sigs: &[S]) -> [u8; 32] {
+    let mut buf = Vec::new();
+    for s in sigs {
+        push_lp(&mut buf, s.as_ref());
+    }
+    sha256(&buf)
+}
+
+/// Signing input of the owner-signed principal-ledger head (contract C4):
+///
+/// ```text
+/// lp("safeclaw/v1/principal-head") ‖ lp(anchor) ‖ u64_be(max_seq) ‖ lp(events_hash)
+/// ```
+///
+/// `anchor` is the account owner's `us_…` id (UTF-8), the same string the events'
+/// `account_id` carries. Closes a forged or truncated ledger tail.
+pub fn principal_head_input(anchor: &str, max_seq: u64, events_hash: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_PRINCIPAL_HEAD);
+    push_lp(&mut out, anchor.as_bytes());
+    out.extend_from_slice(&max_seq.to_be_bytes());
+    push_lp(&mut out, events_hash);
     out
 }
 
@@ -1168,21 +1252,22 @@ mod tests {
 
     #[test]
     fn principal_event_input_every_field_binds() {
-        let base = principal_event_input("us_acct", "admit", "dev_box", 5, "us_acct");
-        assert_ne!(base, principal_event_input("us_other", "admit", "dev_box", 5, "us_acct"), "account binds");
-        assert_ne!(base, principal_event_input("us_acct", "revoke", "dev_box", 5, "us_acct"), "op binds");
-        assert_ne!(base, principal_event_input("us_acct", "admit", "ag_bot", 5, "us_acct"), "principal binds");
-        assert_ne!(base, principal_event_input("us_acct", "admit", "dev_box", 6, "us_acct"), "seq binds");
-        assert_ne!(base, principal_event_input("us_acct", "admit", "dev_box", 5, "us_other"), "owner binds");
-        assert_eq!(base, principal_event_input("us_acct", "admit", "dev_box", 5, "us_acct"), "deterministic");
+        let base = principal_event_input("us_acct", "admit", "dev_box", 5, "us_acct", &[]);
+        assert_ne!(base, principal_event_input("us_other", "admit", "dev_box", 5, "us_acct", &[]), "account binds");
+        assert_ne!(base, principal_event_input("us_acct", "revoke", "dev_box", 5, "us_acct", &[]), "op binds");
+        assert_ne!(base, principal_event_input("us_acct", "admit", "ag_bot", 5, "us_acct", &[]), "principal binds");
+        assert_ne!(base, principal_event_input("us_acct", "admit", "dev_box", 6, "us_acct", &[]), "seq binds");
+        assert_ne!(base, principal_event_input("us_acct", "admit", "dev_box", 5, "us_other", &[]), "owner binds");
+        assert_ne!(base, principal_event_input("us_acct", "admit", "dev_box", 5, "us_acct", &[1u8; 32]), "sc_pk binds");
+        assert_eq!(base, principal_event_input("us_acct", "admit", "dev_box", 5, "us_acct", &[]), "deterministic");
     }
 
     #[test]
     fn principal_event_input_lp_ambiguity_resolved() {
         // ("ab","c") vs ("a","bc") for (account, op) would collide without length
         // prefixes; with them the inputs differ.
-        let a = principal_event_input("ab", "c", "d", 1, "s");
-        let b = principal_event_input("a", "bc", "d", 1, "s");
+        let a = principal_event_input("ab", "c", "d", 1, "s", &[]);
+        let b = principal_event_input("a", "bc", "d", 1, "s", &[]);
         assert_ne!(a, b);
     }
 
@@ -1194,10 +1279,10 @@ mod tests {
         // (or vice versa) must fail — op is bound.
         let uik = SigningIdentity::from_seed(&UIK_SEED);
         let acct = uik.user_id();
-        let input = principal_event_input(&acct, "revoke", "dev_box", 9, &acct);
+        let input = principal_event_input(&acct, "revoke", "dev_box", 9, &acct, &[]);
         let sig = uik.sign(&input);
         assert!(verify(&uik.public_bytes(), &input, &sig), "own signature verifies");
-        let flipped = principal_event_input(&acct, "admit", "dev_box", 9, &acct);
+        let flipped = principal_event_input(&acct, "admit", "dev_box", 9, &acct, &[]);
         assert!(!verify(&uik.public_bytes(), &flipped, &sig), "a swapped op must not verify");
     }
 
@@ -1206,9 +1291,10 @@ mod tests {
         // §15 account principal-ledger golden vector. FIXED inputs: account
         // "us_acct", op "revoke", principal "dev_box", seq 7, owner "us_acct".
         // The TS mirror (Phase 3) pins the SAME hex. Do NOT edit an expected value
-        // to make a test pass — find why Rust ↔ TS diverged.
-        let input = principal_event_input("us_acct", "revoke", "dev_box", 7, "us_acct");
-        assert_eq!(hex(&input), "0000001b73616665636c61772f76312f7072696e636970616c2d6576656e740000000775735f61636374000000067265766f6b65000000076465765f626f7800000000000000070000000775735f61636374");
+        // to make a test pass — find why Rust ↔ TS diverged. Contract C1 (grant-v3)
+        // appended `lp(sc_pk)`, empty for a revoke: the trailing 00000000.
+        let input = principal_event_input("us_acct", "revoke", "dev_box", 7, "us_acct", &[]);
+        assert_eq!(hex(&input), "0000001b73616665636c61772f76312f7072696e636970616c2d6576656e740000000775735f61636374000000067265766f6b65000000076465765f626f7800000000000000070000000775735f6163637400000000");
     }
 
     #[test]

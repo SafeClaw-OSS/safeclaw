@@ -26,11 +26,30 @@ use sudp::state::{Registry, SealedCredential, SealedState, Version, CURRENT_VERS
 
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
+#[cfg(test)]
+use crate::protocol::grant::GrantKey;
 use crate::protocol::operation::decode_credential_id;
 use crate::storage::item::{
-    aad_id_from_wire, item_id, item_id_bytes, seal_item, unseal_item, wire_id_for, ItemCtx, ItemNs,
-    ItemPayload, VaultKeys,
+    aad_id_from_wire, body_digest as item_body_digest, item_id, item_id_bytes, normalized_body,
+    open_wire_item, parse_secret_body, seal_item, secret_body, unseal_item_keys,
+    wire_id_for, Conflict, ItemCtx, ItemNs, ItemPayload, Read, VaultKeys,
 };
+
+/// Per-vault count of items the LAST fold had to skip (unreadable at a format
+/// this build supports: corrupt, malformed, or sealed under a key we lack).
+/// Process-wide because the fold has no `AppState`; `/health` reports the total
+/// so `sc doctor` can warn. Diagnostic only, never a security decision.
+static UNREADABLE_ITEMS: std::sync::Mutex<BTreeMap<String, usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Total items skipped by the most recent fold of each vault (see
+/// [`UNREADABLE_ITEMS`]).
+pub fn unreadable_item_total() -> usize {
+    UNREADABLE_ITEMS
+        .lock()
+        .map(|m| m.values().sum())
+        .unwrap_or(0)
+}
 
 /// On-disk vault is exactly the sudp sealed-state JSON.
 pub type SealedVault = SealedState;
@@ -149,27 +168,6 @@ pub fn build_initial(
         credentials: vec![sealed_cred],
         ciphertext,
     })
-}
-
-/// Rotate the acting credential's `(prf_salt, wrapped_key)` after a Write and
-/// replace the body ciphertext. Used by the write handler.
-pub fn replace_after_write(
-    vault: &mut SealedVault,
-    credential_id_b64: &str,
-    new_prf_salt: Vec<u8>,
-    new_wrapped_key: Vec<u8>,
-    new_ciphertext: Vec<u8>,
-) -> Result<()> {
-    let cid_bytes = decode_credential_id(credential_id_b64)?;
-    let cred = vault
-        .credentials
-        .iter_mut()
-        .find(|c| c.credential_id == cid_bytes)
-        .ok_or_else(|| AppError::Unauthorized("unknown credential for write".into()))?;
-    cred.prf_salt = new_prf_salt;
-    cred.wrapped_key = new_wrapped_key;
-    vault.ciphertext = new_ciphertext;
-    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -319,8 +317,8 @@ pub struct StoredItem {
     #[serde(default)]
     pub tombstone: bool,
     /// The per-record Ed25519 signature (A1.2, `record_signature_input` over the
-    /// CIPHERTEXT), base64url-nopad — `None` for a legacy unsigned record (pre-team
-    /// fmt1 personal / NoUik, honored additively). Carried on the wire
+    /// CIPHERTEXT), base64url-nopad — `None` for an unsigned record (owner-config /
+    /// agent rows are honored unsigned ONLY on a fmt1 NoUik vault). Carried on the wire
     /// (`vault_items.sig`) so a blind server can gate + every reader can verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
@@ -330,6 +328,62 @@ pub struct StoredItem {
     /// devices) to verify + to a role for the role×type gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<String>,
+    /// For a DIRTY row in a keep-both namespace: the hex
+    /// [`crate::storage::item::body_digest`] of the body our change was made
+    /// from (the base), when known. A same-item conflict whose body equals it
+    /// is no conflict: ours applies. Local bookkeeping only (never sent);
+    /// `None` = unknown (the keep-both rule applies as is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Written by SafeClaw's automatic upgrade of this vault (the legacy-row
+    /// migration), not by a person: a conflict on it pauses the upgrade,
+    /// which retries. Local bookkeeping only (never sent).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upgrade: bool,
+    /// The keyset generation this device sealed the row under (its own
+    /// change), sent with its push: a vault with a keyset takes a row only
+    /// at its current generation. `None` for a row adopted from the cloud, or
+    /// sealed before this was recorded. Local bookkeeping only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    /// Confirmed, after a keyset refresh with keys of the keyset's current
+    /// generation, to open under no key this member holds (the current one,
+    /// or a retired one that lists it): no current member reads it, so a
+    /// writer that may write the record may write over it, at its next
+    /// version ([`PerItemVault::confirm_unreadable`]). Never set before such
+    /// a refresh; gone whenever the row is replaced. Local bookkeeping only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreadable_confirmed: bool,
+}
+
+/// A pulled replacement this device did not adopt (see `crate::sync`): kept
+/// with why, offered again on every pull and at unlock, and shown to the user
+/// until it is adopted or superseded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldRow {
+    pub version: u64,
+    pub seq: u64,
+    #[serde(with = "b64url_bytes")]
+    pub ct: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+    /// Why it is not applied.
+    pub reason: String,
+}
+
+/// What an item id addresses, as read with the vault key ([`PerItemVault::classify_rows`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RowKind {
+    /// A data record (a secret, a connection, an in-flight connect, a
+    /// service, `secret_order`), copies included: a pulled replacement needs
+    /// no key to adopt.
+    Data,
+    /// Owner-config, an agent grant, or a row not at its own address: a
+    /// pulled replacement on a vault with a keyset waits for the key.
+    Guarded,
 }
 
 /// The v2 (UIK) material carried alongside one credential (device) row — the
@@ -386,6 +440,14 @@ pub struct UikCred {
     /// fails verification).
     #[serde(default)]
     pub role_sig: Vec<u8>,
+    /// The vault's previous content keys, sealed under the current one (the
+    /// row's `uik_prev_content_ct`; an owner sets it on every member's row at
+    /// a re-key and on an invite): open rows a re-key has not moved yet
+    /// ([`crate::storage::item::material_with_prev`]). Empty when there is
+    /// none. Carried as sealed: every write of this entry keeps it, and this
+    /// process never makes a new one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prev_content_ct: Vec<u8>,
 }
 
 /// The v2 (UIK) layer of a keyset — the `custody → UIK → K` layering
@@ -461,6 +523,36 @@ pub struct DelegationEvent {
     /// `granter`'s Ed25519 over [`crate::identity::delegation_event_input`] (64 bytes).
     #[serde(with = "b64_std")]
     pub sig: Vec<u8>,
+}
+
+impl DelegationEvent {
+    /// Does `sig` verify under `granter_pub` over this event's signing input
+    /// ([`crate::identity::delegation_event_input`])? A `remove` signs an empty
+    /// role; a `set` signs its role token, which a legacy admin event spells
+    /// `"owner"` and a new one `"admin"` (either verifies the admin role, never
+    /// another role). The one check both the adopt filter and the fold run.
+    pub(crate) fn signature_verifies(&self, vault_id: &str, granter_pub: &[u8; 32]) -> bool {
+        let Ok(sig) = <[u8; 64]>::try_from(self.sig.as_slice()) else {
+            return false;
+        };
+        let role_toks: &[&str] = if self.op == "remove" {
+            &[""]
+        } else {
+            role_sig_tokens(self.role)
+        };
+        role_toks.iter().any(|tok| {
+            let input = crate::identity::delegation_event_input(
+                vault_id,
+                &self.op,
+                &self.subject_id,
+                tok,
+                &self.granter_id,
+                self.seq,
+                self.role_epoch,
+            );
+            crate::identity::verify(granter_pub, &input, &sig)
+        })
+    }
 }
 
 /// A root-succession certificate — the CURRENT root signs the NEXT root's id +
@@ -539,6 +631,15 @@ pub struct KeysetUik {
     /// generation-brick class of DoS by construction — [`resolve_current_root`]).
     #[serde(default)]
     pub root_succession: Vec<RootSuccession>,
+    /// `cid_b64 → us_…` for OTHER members' passkeys the membership serves as
+    /// approval-verification material only (`approver: true` credentials: a
+    /// vault admin's passkeys, so this daemon can verify an admin approving its
+    /// op). Their WebAuthn pubkeys go into the registry; they seat nobody and
+    /// unlock nothing here, are never this device's own passkeys, and never
+    /// count toward who the requester is. Who is an admin is still the verified
+    /// role fold alone. Local only (never pushed).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub approver_cids: BTreeMap<String, String>,
 }
 
 /// A one-way commitment to a content key for a re-key event: `SHA-256(domain ‖
@@ -552,13 +653,28 @@ pub fn rekey_commitment(content_key: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// The lowercase serde token for a role (`"owner"` / `"member"`) — the EXACT
-/// bytes the creator signs in [`crate::identity::role_grant_input`]. Kept in one
-/// place so the signing input and the enum's serde spelling can never drift.
+/// The token a record of `role` is signed with: its own lowercase serde
+/// spelling (`"admin"` / `"member"`, or the legacy `"owner"` a pre-rename record
+/// carries), the first of [`role_sig_tokens`]. The daemon signs no roles; test
+/// signers use this.
+#[cfg(test)]
 pub(crate) fn role_str(role: crate::storage::plaintext::MemberRole) -> &'static str {
+    role_sig_tokens(role)[0]
+}
+
+/// Every token a signature over `role` may have been made with, the record's own
+/// spelling (its serde token, the EXACT bytes signed in
+/// [`crate::identity::role_grant_input`] / [`crate::identity::delegation_event_input`])
+/// first. An admin was signed as `"owner"` before the rename and as
+/// `"admin"` after; both mean the same role, so a signature over either verifies
+/// it (this also tolerates another implementation that re-spells a legacy record).
+/// No token ever verifies a DIFFERENT role: `"member"` is never tried for an admin.
+fn role_sig_tokens(role: crate::storage::plaintext::MemberRole) -> &'static [&'static str] {
+    use crate::storage::plaintext::MemberRole;
     match role {
-        crate::storage::plaintext::MemberRole::Owner => "owner",
-        crate::storage::plaintext::MemberRole::Member => "member",
+        MemberRole::Admin => &["admin", "owner"],
+        MemberRole::LegacyOwner => &["owner", "admin"],
+        MemberRole::Member => &["member"],
     }
 }
 
@@ -590,9 +706,9 @@ pub struct Keyset {
 /// A signed body is `{ data, uik_sig, uik_sign_pub }`; the signature covers
 /// [`crate::identity::config_sig_input`]`(vault, config_name, version,
 /// JCS(data), derive_id(sign_pub))`. Returns:
-///   - `Some(data)` — honor this config: EITHER a valid signed wrapper, OR a
-///     legacy/v1 raw body (no `uik_sig`) — additive, so pre-signing vaults are
-///     untouched.
+///   - `Some(data)` — a valid signed wrapper, OR a legacy/v1 raw body (no
+///     `uik_sig`). Whether a raw body is HONORED is the caller's trust decision:
+///     only a [`MembershipTrust::NoUik`] (legacy v1) keyset honors it.
 ///   - `None` — DROP it: a signed wrapper that FAILED (bad sig, malformed, or a
 ///     signer whose pubkey is NOT a published member key — the anti-forgery
 ///     anchor from C.1). Dropping falls the field to its safe default (A1.6:
@@ -606,8 +722,9 @@ pub struct Keyset {
 /// Returns:
 ///   - `None` — a signed wrapper that FAILED (bad/malformed sig, or a signer
 ///     whose pubkey is NOT a published member key = the C.1 anti-forgery anchor).
-///   - `Some((data, None))` — a legacy/v1 raw body (no `uik_sig`): honored, no
-///     signer (additive — pre-signing vaults untouched).
+///   - `Some((data, None))` — a legacy/v1 raw body (no `uik_sig`), no signer.
+///     Integrity says nothing about authorization: callers honor it ONLY on a
+///     [`MembershipTrust::NoUik`] keyset (a v2 keyset drops it).
 ///   - `Some((data, Some(signer_id)))` — a valid signature; `signer_id` = the
 ///     signing member's `us_…` (for D's role authorization by the caller).
 fn verify_config_sig(
@@ -617,7 +734,8 @@ fn verify_config_sig(
     config_name: &str,
     version: u64,
 ) -> Option<(serde_json::Value, Option<String>)> {
-    // Not a signed wrapper → legacy raw body, honored unchanged (no signer).
+    // Not a signed wrapper → legacy raw body, no signer (the caller decides; only
+    // a NoUik keyset honors it).
     let obj = match &body {
         serde_json::Value::Object(o) if o.contains_key("uik_sig") => o,
         _ => return Some((body, None)),
@@ -708,13 +826,21 @@ fn verify_record_sidecar_sig(
     }
 }
 
-/// Fold one authorized-agents row, PREFERRING the new sidecar item-sig (A1.2) and
-/// falling back to the legacy in-body config-sig during the migration batch. The
-/// sidecar path verifies `record_signature_input` (type `"agent"`, the blinded
-/// `item_id` disambiguating WHICH agent) over the ciphertext, then applies the §11
-/// authz (signer is the row's `owner` OR any owner). Returns `(data, was_signed)`
-/// to honor, or `None` to drop. `body` is the raw row for the sidecar path (no
-/// wrapper) or the `{data,uik_sig}` wrapper for the config-sig fallback.
+/// Fold one NATIVE authorized-agents row (`ItemNs::Agent`, wire id == ag_id; the
+/// caller enforces the id) — design/agent-device-identity-mtls.md §11.1, design/
+/// agent-authz-cleartext-cutover.md. Returns the row body to honor, or `None` to
+/// drop it (that `ag_id` is then simply not authorized). Per trust state:
+///   - [`MembershipTrust::Verified`] (v2): honored ONLY with a valid sidecar item-sig
+///     (A1.2: `record_signature_input`, type `"agent"`, over the ciphertext, by a
+///     published keyset member) whose signer is a vault OWNER or the row's own
+///     `owner` (a member authorizing their OWN agent). An unsigned row, or one that
+///     carries only a legacy in-body `{data,uik_sig}` wrapper, is DROPPED: without
+///     the sidecar any K-holding member could write an authorization row.
+///   - [`MembershipTrust::NoUik`] (legacy v1): integrity-only. There are no member
+///     keys (single-person vault), so nothing can be signed and the K-seal (AEAD) is
+///     the only gate: a plain unsigned row is honored; anything claiming a signature
+///     is dropped (it can't verify against an empty keyset).
+///   - [`MembershipTrust::Untrusted`]: everything is dropped (fail closed).
 #[allow(clippy::too_many_arguments)]
 fn fold_agent_record(
     stored_sig: Option<&str>,
@@ -723,29 +849,40 @@ fn fold_agent_record(
     keyset: &Keyset,
     vault_id: &str,
     item_id_raw: &[u8],
-    config_name: &str,
     version: u64,
     body: serde_json::Value,
     trust: &MembershipTrust,
-) -> Option<(serde_json::Value, bool)> {
-    let Some(sig) = stored_sig else {
-        // No sidecar → legacy in-body config-sig path (unchanged).
-        return unwrap_verified_agent_grant(body, keyset, vault_id, config_name, version, trust);
-    };
-    let signer = stored_signer?;
-    let sid = verify_record_sidecar_sig(
-        ct, keyset, vault_id, item_id_raw, "agent", version, true, sig, signer,
-    )?;
+) -> Option<serde_json::Value> {
     match trust {
         MembershipTrust::Untrusted => None,
-        // Legacy v1 keyset: integrity-only (the sig already verified above).
-        MembershipTrust::NoUik => Some((body, true)),
+        MembershipTrust::NoUik => {
+            if stored_sig.is_some() || body.get("uik_sig").is_some() {
+                return None;
+            }
+            Some(body)
+        }
         MembershipTrust::Verified(membership) => {
-            let owner = body.get("owner").and_then(|v| v.as_str()).unwrap_or_default();
-            let is_owner = membership.get(&sid)
-                == Some(&crate::storage::plaintext::MemberRole::Owner);
+            let sig = stored_sig?;
+            let signer = stored_signer?;
+            let sid = verify_record_sidecar_sig(
+                ct,
+                keyset,
+                vault_id,
+                item_id_raw,
+                "agent",
+                version,
+                true,
+                sig,
+                signer,
+            )?;
+            let owner = body
+                .get("owner")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let is_owner =
+                membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Admin);
             if is_owner || sid == owner {
-                Some((body, true))
+                Some(body)
             } else {
                 None
             }
@@ -753,11 +890,15 @@ fn fold_agent_record(
     }
 }
 
-/// Fold one owner-config singleton, PREFERRING the sidecar item-sig (A1.2) and
-/// falling back to the in-body config-sig during migration. `config_name` doubles
-/// as the plaintext record type for the sidecar (owner-config ns == its name:
-/// `policy`/`stores`/…). Owner-only: the sidecar signer must be an owner. Returns
-/// the raw `data` to honor (the daemon then parses it) or `None` to drop.
+/// Fold one owner-config record (`ns`: a native kind, or a legacy `aux` row).
+/// `config_name` is the sidecar record type ([`crate::storage::item::ItemRule::signature_type`]).
+/// With a keyset only an owner's sidecar signature counts (A1.2). A native
+/// record is sidecar-only: the old in-body wrapper (`{data, uik_sig, ..}`),
+/// whose signature is not bound to the record's name, counts only on a legacy
+/// `aux:<field>` row ([`unwrap_verified_config`]). Without a keyset an
+/// unsigned body is honored; a native body claiming a signature is not.
+/// Returns the raw `data` to honor (the daemon then parses it) or `None` to
+/// drop.
 #[allow(clippy::too_many_arguments)]
 fn fold_owner_config_record(
     stored_sig: Option<&str>,
@@ -766,12 +907,19 @@ fn fold_owner_config_record(
     keyset: &Keyset,
     vault_id: &str,
     item_id_raw: &[u8],
+    ns: ItemNs,
     config_name: &str,
     version: u64,
     body: serde_json::Value,
     trust: &MembershipTrust,
 ) -> Option<serde_json::Value> {
     let Some(sig) = stored_sig else {
+        if ns != ItemNs::Aux {
+            return match trust {
+                MembershipTrust::NoUik if body.get("uik_sig").is_none() => Some(body),
+                _ => None,
+            };
+        }
         return unwrap_verified_config(body, keyset, vault_id, config_name, version, trust);
     };
     let signer = stored_signer?;
@@ -782,7 +930,7 @@ fn fold_owner_config_record(
         MembershipTrust::Untrusted => None,
         MembershipTrust::NoUik => Some(body),
         MembershipTrust::Verified(membership) => {
-            if membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Owner) {
+            if membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Admin) {
                 Some(body)
             } else {
                 None
@@ -799,6 +947,17 @@ fn fold_owner_config_record(
 /// STRIPPED looked identical to a legacy v1 vault and silently downgraded to
 /// integrity-only, letting a colluding member's signed owner-config be honored.
 /// The three states keep those cases distinct:
+/// Whether a grant's signer may approve an op ([`PerItemVault::approval_authority`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApprovalAuthority {
+    /// The signer is the requester.
+    Requester,
+    /// The signer is an admin of the vault.
+    Admin,
+    /// Anyone else; carries the reason.
+    Refused(String),
+}
+
 enum MembershipTrust {
     /// Legacy v1 keyset (`keyset.uik == None`) — no UIK layer, never re-keyable.
     /// Owner-config is honored on integrity alone (additive; pre-signing vaults).
@@ -810,8 +969,9 @@ enum MembershipTrust {
     /// A v2 keyset that carries credentials but has NO valid creator anchor
     /// (`creator_sig_pub` empty / not 32 bytes). This is the server-strippable
     /// state (`adopt_creator_pin` only pins a non-empty value), so it FAILS
-    /// CLOSED: ALL owner-config (signed OR legacy-raw) is dropped → the fields
-    /// fall to their safe defaults. Never downgrade this to integrity-only.
+    /// CLOSED: ALL owner-config (signed OR legacy-raw) and ALL agent rows are
+    /// dropped → the fields fall to their safe defaults. Never downgrade this to
+    /// integrity-only.
     Untrusted,
 }
 
@@ -822,10 +982,11 @@ enum MembershipTrust {
 /// keyed on the [`MembershipTrust`] state:
 ///   - [`MembershipTrust::NoUik`] (legacy v1) ⇒ integrity-only: a valid or unsigned
 ///     body is honored (additive — pre-signing vaults);
-///   - [`MembershipTrust::Verified`] (v2, anchor pinned) ⇒ owner-gated: legacy-raw
-///     (unsigned) honored; a valid signature honored only if the signer is an
-///     **owner** in the derived owner-set, else DROPPED (a non-owner member, an
-///     unknown signer, or a bad/forged signature all drop);
+///   - [`MembershipTrust::Verified`] (v2, anchor pinned) ⇒ owner-gated: a valid
+///     signature is honored only if the signer is an **owner** in the derived
+///     owner-set; everything else is DROPPED (an unsigned legacy-raw body, which
+///     any K-holding member could have written; a non-owner member; an unknown
+///     signer; a bad/forged signature);
 ///   - [`MembershipTrust::Untrusted`] (v2, anchor stripped) ⇒ FAIL CLOSED: EVERYTHING
 ///     the owner-config path would otherwise honor is dropped, signed or not, so
 ///     a colluding member's config is never honored via integrity-only.
@@ -845,71 +1006,17 @@ fn unwrap_verified_config(
             MembershipTrust::Untrusted => None,
             // Legacy v1: integrity-only (additive) — signed or unsigned honored.
             MembershipTrust::NoUik => Some(data),
-            // Verified v2: legacy-raw honored; a signed item is honored only from
-            // an OWNER in the derived owner-set, else dropped.
+            // Verified v2: honored ONLY when signed by an OWNER in the derived
+            // owner-set. An unsigned legacy-raw body is dropped (a K-holding
+            // member could have written it).
             MembershipTrust::Verified(membership) => match signer {
                 Some(signer_id)
                     if membership.get(&signer_id)
-                        != Some(&crate::storage::plaintext::MemberRole::Owner) =>
+                        == Some(&crate::storage::plaintext::MemberRole::Admin) =>
                 {
-                    None
+                    Some(data)
                 }
-                _ => Some(data),
-            },
-        },
-    }
-}
-
-/// §11.1 — verify AND authorize an **authorized-agents table** row body
-/// (design/agent-device-identity-mtls.md §11.1). Composes [`verify_config_sig`]
-/// (integrity + anti-server-forgery: the signer's pubkey MUST be a published
-/// keyset cred, i.e. a real member) with the agent-specific authorization rule: a
-/// signed row is honored iff the signer is EITHER the row's declared `owner` (a
-/// member authorizing their OWN agent) OR any owner (owner override). This REUSES
-/// the owner-config signing machinery — same crypto, one extra authz predicate,
-/// no new fragility.
-///
-/// Returns `Some((data, was_signed))`:
-///   - `was_signed == true` — a valid, authorized signature; the caller retains
-///     the original signed wrapper for lossless re-emit (the daemon holds only
-///     public keys and cannot re-sign).
-///   - `was_signed == false` — a legacy raw (unsigned) row, honored additively
-///     (pre-AIK vaults / NoUik keysets), no signer.
-/// Returns `None` — DROP the row: a bad/forged/unknown-signer signature, an
-/// [`MembershipTrust::Untrusted`] keyset, or a signer who is neither the row's
-/// `owner` nor an owner. A dropped row simply means that `ag_id` is not in the
-/// table (= not authorized), never a crash (A1.6 fault isolation).
-fn unwrap_verified_agent_grant(
-    body: serde_json::Value,
-    keyset: &Keyset,
-    vault_id: &str,
-    config_name: &str,
-    version: u64,
-    trust: &MembershipTrust,
-) -> Option<(serde_json::Value, bool)> {
-    match verify_config_sig(body, keyset, vault_id, config_name, version) {
-        None => None,
-        Some((data, signer)) => match trust {
-            // Anchor stripped: drop everything (fail-closed).
-            MembershipTrust::Untrusted => None,
-            // Legacy v1 keyset: integrity-only (additive; pre-AIK vaults).
-            MembershipTrust::NoUik => Some((data, signer.is_some())),
-            MembershipTrust::Verified(membership) => match signer {
-                // Legacy raw (unsigned) honored additively.
-                None => Some((data, false)),
-                Some(signer_id) => {
-                    let owner = data.get("owner").and_then(|v| v.as_str()).unwrap_or_default();
-                    let is_owner_override = membership.get(&signer_id)
-                        == Some(&crate::storage::plaintext::MemberRole::Owner);
-                    // self-service: the signer admits their OWN agent (the signer is
-                    // a real member — verify_config_sig pinned its pubkey to a keyset
-                    // cred); owner-override: any owner may admit/modify/revoke any.
-                    if is_owner_override || signer_id == owner {
-                        Some((data, true))
-                    } else {
-                        None
-                    }
-                }
+                _ => None,
             },
         },
     }
@@ -1046,12 +1153,12 @@ fn verify_rekey_proof(
     let Some(signer_pub) = signer_pub else {
         return false;
     };
-    // The signer must be an OWNER in the verified owner-set (D).
-    let owner = matches!(
-        membership.get(&proof.signer_id),
-        Some(crate::storage::plaintext::MemberRole::Owner)
-    );
-    if !owner {
+    // The signer must be an ADMIN in the verified role set (D). (`is_admin`, not a
+    // pattern: a legacy `"owner"` grant reads as `LegacyOwner`, also an admin.)
+    let admin = membership
+        .get(&proof.signer_id)
+        .is_some_and(|r| r.is_admin());
+    if !admin {
         return false;
     }
     let input = crate::identity::rekey_sig_input(
@@ -1099,6 +1206,412 @@ fn membership_prefix_ok(uik: &KeysetUik, vault_id: &str) -> bool {
     crate::identity::membership_commitment(&prefix_sigs).as_slice() == proof.membership_hash.as_slice()
 }
 
+/// What [`PerItemVault::reconcile_from_view`] treats as the CALLER's change.
+/// Only a difference from the view's base is one: a row a concurrent pull
+/// changed or adopted after the base was taken (pull does not take the vault
+/// write lock, and a connect awaits a token exchange in between) is neither
+/// reverted nor dropped.
+#[derive(Clone, Copy)]
+pub enum ReconcileBase<'a> {
+    /// The view was derived from `base` (captured before mutating it): upsert
+    /// only items whose body differs from the base, tombstone only items the
+    /// base had and the view dropped.
+    Since(&'a ViewBase),
+    /// The view IS this store's own fold, taken inside the same `&mut self`
+    /// call (nothing can interleave): every difference is the caller's.
+    OwnFold,
+}
+
+/// A view's items as `(ns, name) → digest(normalized body)`
+/// ([`crate::storage::item::body_digest`]), captured as a
+/// [`ReconcileBase::Since`] base. Digests only: no secret values are copied.
+#[derive(Debug, Clone, Default)]
+pub struct ViewBase {
+    items: BTreeMap<(ItemNs, String), [u8; 32]>,
+}
+
+impl ViewBase {
+    pub fn of(view: &crate::storage::plaintext::VaultPlaintextView) -> Result<Self> {
+        let items = PerItemVault::view_items(view)?
+            .into_iter()
+            .map(|((ns, name), body)| {
+                let d = item_body_digest(ns, &name, &body);
+                ((ns, name), d)
+            })
+            .collect();
+        Ok(Self { items })
+    }
+
+    fn has(&self, ns: ItemNs, name: &str) -> bool {
+        self.items.contains_key(&(ns, name.to_string()))
+    }
+
+    fn digest(&self, ns: ItemNs, name: &str) -> Option<&[u8; 32]> {
+        self.items.get(&(ns, name.to_string()))
+    }
+
+    fn unchanged(&self, ns: ItemNs, name: &str, body: &serde_json::Value) -> bool {
+        self.digest(ns, name) == Some(&item_body_digest(ns, name, body))
+    }
+}
+
+/// Hex form of a body digest (as [`StoredItem::base`] holds it).
+fn digest_hex(d: &[u8; 32]) -> String {
+    d.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// What [`PerItemVault::reconcile_from_view`] did: the item ids it wrote; the
+/// owner-config changes it set aside instead (the stored row changed since
+/// the caller's base), each `(canonical item id, record)` for the caller to
+/// report ("changed elsewhere meanwhile; re-run"); and the changes it refused
+/// because a row they would write over cannot be read with this vault's key
+/// (or no conflict copy may be written), each `(item id, why)`.
+#[derive(Debug, Default)]
+pub struct Reconciled {
+    pub changed: Vec<String>,
+    pub set_aside: Vec<(String, String)>,
+    pub refused: Vec<(String, String)>,
+}
+
+/// Why a change to `record` was not applied over a row this device cannot
+/// read (sealed under a key it does not have, or under a retired key that
+/// row did not exist under): the row is never written over. The one sentence
+/// for every such case, local write or sync.
+pub fn unreadable_refusal(record: &str) -> String {
+    format!(
+        "{}: this item was changed with a vault key this device does not have; your change to it was not applied: run `sc sync` after the vault owner's console finishes, then re-run it",
+        record
+    )
+}
+
+// ── Owner-config records ─────────────────────────────────────────────────────
+// Storage unit = edit unit: `policy:` = `{timeout, default,
+// allow_installed_services}`,
+// `policy:category:<tag>` = that tag's Levels, `policy:connection:<id>` =
+// that connection's ConnectionPolicy, `store:<id>` = one Store,
+// `store_order:` and `audit_retention_days:` one record each. The fold
+// reassembles the `VaultAux` fields, so policy evaluation is unchanged.
+
+/// The `policy:` record: the policy's own fields.
+#[derive(Serialize, Deserialize)]
+struct PolicyRoot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default: Option<crate::core::policy::Levels>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_installed_services: bool,
+}
+
+/// The owner-config kinds, each reassembled into its `VaultAux` field.
+const OWNER_CONFIG_KINDS: [ItemNs; 4] = [
+    ItemNs::Policy,
+    ItemNs::Store,
+    ItemNs::StoreOrder,
+    ItemNs::AuditRetentionDays,
+];
+
+/// One record of a view: `(ns, name) → body`.
+type Record = ((ItemNs, String), serde_json::Value);
+
+fn to_json<T: Serialize>(x: &T) -> Result<serde_json::Value> {
+    serde_json::to_value(x).map_err(AppError::from)
+}
+
+/// A policy as its records. A present policy always has its `policy:` record
+/// (so "set, but empty" stays distinct from "not set"); a category or
+/// connection under an empty key has no address and is left out.
+fn policy_items(p: &crate::core::policy::Policy) -> Result<Vec<Record>> {
+    use crate::storage::item::{POLICY_CATEGORY, POLICY_CONNECTION};
+    let root = PolicyRoot {
+        timeout: p.timeout,
+        default: p.default.clone(),
+        allow_installed_services: p.allow_installed_services,
+    };
+    let mut out = vec![((ItemNs::Policy, String::new()), to_json(&root)?)];
+    for (tag, levels) in p.categories.iter().filter(|(k, _)| !k.is_empty()) {
+        out.push((
+            (ItemNs::Policy, format!("{}{}", POLICY_CATEGORY, tag)),
+            to_json(levels)?,
+        ));
+    }
+    for (id, cp) in p.connections.iter().filter(|(k, _)| !k.is_empty()) {
+        out.push((
+            (ItemNs::Policy, format!("{}{}", POLICY_CONNECTION, id)),
+            to_json(cp)?,
+        ));
+    }
+    Ok(out)
+}
+
+/// The stores as their records, one per store (an empty id has no address).
+fn store_items(stores: &BTreeMap<String, crate::storage::plaintext::Store>) -> Result<Vec<Record>> {
+    stores
+        .iter()
+        .filter(|(id, _)| !id.is_empty())
+        .map(|(id, store)| Ok(((ItemNs::Store, id.clone()), to_json(store)?)))
+        .collect()
+}
+
+/// A view's owner-config as its native records. An unset policy or
+/// retention has none.
+fn owner_config_items(aux: &crate::storage::plaintext::VaultAux) -> Result<Vec<Record>> {
+    let mut out = Vec::new();
+    if let Some(p) = &aux.policy {
+        out.extend(policy_items(p)?);
+    }
+    out.extend(store_items(&aux.stores)?);
+    out.push((
+        (ItemNs::StoreOrder, String::new()),
+        to_json(&aux.store_order)?,
+    ));
+    if let Some(days) = aux.audit_retention_days {
+        out.push((
+            (ItemNs::AuditRetentionDays, String::new()),
+            serde_json::json!(days),
+        ));
+    }
+    Ok(out)
+}
+
+/// LEGACY(aux addressing): the native records an honored legacy
+/// `aux:<field>` value becomes, split exactly as a view's are (a null value:
+/// none). `Err` when the value does not parse as its field.
+fn legacy_field_items(field: &str, v: serde_json::Value) -> Result<Vec<Record>> {
+    match field {
+        "policy" => match parse_config::<Option<crate::core::policy::Policy>>("aux.policy", v)? {
+            Some(p) => policy_items(&p),
+            None => Ok(Vec::new()),
+        },
+        "stores" => {
+            match parse_config::<Option<BTreeMap<String, crate::storage::plaintext::Store>>>(
+                "aux.stores",
+                v,
+            )? {
+                Some(s) => store_items(&s),
+                None => Ok(Vec::new()),
+            }
+        }
+        "store_order" => Ok(parse_config::<Option<Vec<String>>>("aux.store_order", v)?
+            .map(|o| ((ItemNs::StoreOrder, String::new()), serde_json::json!(o)))
+            .into_iter()
+            .collect()),
+        "audit_retention_days" => Ok(parse_config::<Option<u32>>("aux.audit_retention_days", v)?
+            .map(|d| {
+                (
+                    (ItemNs::AuditRetentionDays, String::new()),
+                    serde_json::json!(d),
+                )
+            })
+            .into_iter()
+            .collect()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// An owner-config record body as its typed value re-serialized (a null or
+/// unknown field drops out), so the same content compares equal whoever
+/// wrote it ([`crate::storage::item::normalized_body`]). `None` when it does
+/// not parse as the record `(ns, name)`.
+pub(crate) fn owner_config_typed(
+    ns: ItemNs,
+    name: &str,
+    body: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    use crate::storage::item::{POLICY_CATEGORY, POLICY_CONNECTION};
+    fn re<T: serde::de::DeserializeOwned + Serialize>(
+        body: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        serde_json::from_value::<T>(body.clone())
+            .ok()
+            .and_then(|t| serde_json::to_value(t).ok())
+    }
+    match ns {
+        ItemNs::Policy if name.is_empty() => re::<PolicyRoot>(body),
+        ItemNs::Policy if name.starts_with(POLICY_CATEGORY) => {
+            re::<crate::core::policy::Levels>(body)
+        }
+        ItemNs::Policy if name.starts_with(POLICY_CONNECTION) => {
+            re::<crate::core::policy::ConnectionPolicy>(body)
+        }
+        ItemNs::Store => re::<crate::storage::plaintext::Store>(body),
+        ItemNs::StoreOrder => re::<Vec<String>>(body),
+        ItemNs::AuditRetentionDays => re::<Option<u32>>(body),
+        _ => None,
+    }
+}
+
+/// The native owner-config namespaces this process reads.
+fn is_owner_config_ns(ns: ItemNs) -> bool {
+    OWNER_CONFIG_KINDS.contains(&ns)
+}
+
+/// Parse an owner-config value, naming it in the error.
+fn parse_config<T: serde::de::DeserializeOwned>(what: &str, v: serde_json::Value) -> Result<T> {
+    serde_json::from_value(v).map_err(|e| AppError::Internal(format!("{} parse: {}", what, e)))
+}
+
+/// The owner-config the fold collects: the honored native records per key
+/// (`Some(value)` live, `None` a tombstone), and (LEGACY) the honored live
+/// legacy `aux:<field>` values. [`Self::apply`] resolves every kind the same
+/// way, per key: the legacy row's entries, overlaid by the honored native
+/// records (live sets its key, a tombstone removes it). A kind with no entry
+/// left reads its default ([`crate::storage::plaintext::VaultAux::initial`]):
+/// a tombstone alone never cancels a default. Keys: the policy's own fields
+/// (`policy:`), each category tag, each connection id; each store id; the
+/// whole store order; the whole retention. (The services union in the fold
+/// is the same rule per id.)
+#[derive(Default)]
+struct OwnerConfigFold {
+    native: BTreeMap<(ItemNs, String), Option<serde_json::Value>>,
+    legacy: BTreeMap<String, serde_json::Value>,
+}
+
+impl OwnerConfigFold {
+    /// An honored native record: `Some(body)` live, `None` a tombstone.
+    fn native(&mut self, ns: ItemNs, name: String, data: Option<serde_json::Value>) {
+        self.native.insert((ns, name), data);
+    }
+
+    /// LEGACY(aux addressing): an honored, live `aux:<field>` value.
+    fn legacy(&mut self, field: &str, data: serde_json::Value) {
+        self.legacy.insert(field.to_string(), data);
+    }
+
+    /// Set the owner-config fields of `aux` (which holds the defaults).
+    /// Returns the kinds left at their default.
+    fn apply(
+        self,
+        aux: &mut crate::storage::plaintext::VaultAux,
+    ) -> Result<std::collections::BTreeSet<ItemNs>> {
+        use crate::storage::item::{POLICY_CATEGORY, POLICY_CONNECTION};
+        let mut merged: BTreeMap<ItemNs, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
+        for (field, v) in self.legacy {
+            for ((ns, name), body) in legacy_field_items(&field, v)? {
+                merged.entry(ns).or_default().insert(name, body);
+            }
+        }
+        for ((ns, name), v) in self.native {
+            let entries = merged.entry(ns).or_default();
+            match v {
+                Some(body) => {
+                    entries.insert(name, body);
+                }
+                None => {
+                    entries.remove(&name);
+                }
+            }
+        }
+        let mut defaults = std::collections::BTreeSet::new();
+        for kind in OWNER_CONFIG_KINDS {
+            let mut entries = merged.remove(&kind).unwrap_or_default();
+            if entries.is_empty() {
+                defaults.insert(kind);
+                continue;
+            }
+            match kind {
+                ItemNs::Policy => {
+                    let mut p = crate::core::policy::Policy {
+                        timeout: None,
+                        default: None,
+                        categories: Default::default(),
+                        connections: Default::default(),
+                        allow_installed_services: false,
+                    };
+                    for (name, v) in entries {
+                        if name.is_empty() {
+                            let root: PolicyRoot = parse_config("policy", v)?;
+                            p.timeout = root.timeout;
+                            p.default = root.default;
+                            p.allow_installed_services = root.allow_installed_services;
+                        } else if let Some(tag) = name.strip_prefix(POLICY_CATEGORY) {
+                            p.categories
+                                .insert(tag.to_string(), parse_config("policy category", v)?);
+                        } else if let Some(id) = name.strip_prefix(POLICY_CONNECTION) {
+                            p.connections
+                                .insert(id.to_string(), parse_config("policy connection", v)?);
+                        }
+                    }
+                    aux.policy = Some(p);
+                }
+                ItemNs::Store => {
+                    aux.stores = entries
+                        .into_iter()
+                        .map(|(id, v)| Ok((id, parse_config("store", v)?)))
+                        .collect::<Result<_>>()?;
+                }
+                ItemNs::StoreOrder => {
+                    if let Some(v) = entries.remove("") {
+                        aux.store_order = parse_config("store_order", v)?;
+                    }
+                }
+                _ => {
+                    if let Some(v) = entries.remove("") {
+                        aux.audit_retention_days = parse_config("audit_retention_days", v)?;
+                    }
+                }
+            }
+        }
+        Ok(defaults)
+    }
+}
+
+/// Whether an owner-config TOMBSTONE counts as honored, by the same trust
+/// rules as a live record ([`fold_owner_config_record`]): without a keyset an
+/// unsigned one; with one, only an owner's sidecar signature over the
+/// tombstone (`status_live = false`).
+#[allow(clippy::too_many_arguments)]
+fn owner_config_tombstone_honored(
+    stored_sig: Option<&str>,
+    stored_signer: Option<&str>,
+    ct: &[u8],
+    keyset: &Keyset,
+    vault_id: &str,
+    item_id_raw: &[u8],
+    record_type: &str,
+    version: u64,
+    trust: &MembershipTrust,
+) -> bool {
+    match trust {
+        MembershipTrust::Untrusted => false,
+        MembershipTrust::NoUik => stored_sig.is_none(),
+        MembershipTrust::Verified(membership) => {
+            let (Some(sig), Some(signer)) = (stored_sig, stored_signer) else {
+                return false;
+            };
+            verify_record_sidecar_sig(
+                ct,
+                keyset,
+                vault_id,
+                item_id_raw,
+                record_type,
+                version,
+                false,
+                sig,
+                signer,
+            )
+            .is_some_and(|sid| {
+                membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Admin)
+            })
+        }
+    }
+}
+
+/// LEGACY: how the native record at one key reads, for the migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeKey {
+    /// No row at the key's address.
+    Absent,
+    /// A row the fold drops (not honored): a copy replaces it.
+    NotHonored,
+    /// A row that cannot be opened: nothing is written over it, and the
+    /// legacy row it would replace stays.
+    Unreadable,
+    /// An honored record (live or tombstone) decides the key; `on_cloud`:
+    /// the cloud holds this version (the row is clean).
+    Decided { on_cloud: bool },
+}
+
 /// The daemon's per-item on-disk vault: keyset blob + N sealed item records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerItemVault {
@@ -1118,6 +1631,12 @@ pub struct PerItemVault {
     /// existing on-disk `vault.per-item.json` loads without migration.
     #[serde(default)]
     pub keyset_seq: u64,
+    /// Pulled replacements not adopted, by item id (the newest each).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub held: BTreeMap<String, HeldRow>,
+    /// What each item id addresses, once read with the vault key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub row_kinds: BTreeMap<String, RowKind>,
 }
 
 impl PerItemVault {
@@ -1157,6 +1676,8 @@ impl PerItemVault {
             items: BTreeMap::new(),
             items_seq: 0,
             keyset_seq: 0,
+            held: BTreeMap::new(),
+            row_kinds: BTreeMap::new(),
         })
     }
 
@@ -1194,6 +1715,10 @@ impl PerItemVault {
                 tombstone: false,
                 sig,
                 signer,
+                base: None,
+                upgrade: false,
+                generation: None,
+                unreadable_confirmed: false,
             },
         );
     }
@@ -1290,6 +1815,8 @@ impl PerItemVault {
     /// Upsert a credential's v2 UIK material, promoting the keyset to v2 if it
     /// was v1 (owner-driven join / re-key sealed `K` to `enc_pub` via
     /// [`crate::crypto::vault_key::seal_k_to_uik`]). Idempotent by `cid_b64`.
+    /// The entry's previous content keys ([`UikCred::prev_content_ct`]) are
+    /// kept; [`Self::set_uik_prev_content_ct`] replaces them.
     #[allow(clippy::too_many_arguments)]
     pub fn set_uik_cred(
         &mut self,
@@ -1302,28 +1829,45 @@ impl PerItemVault {
         role: crate::storage::plaintext::MemberRole,
         role_sig: Vec<u8>,
     ) {
-        self.keyset
+        let creds = &mut self.keyset.uik.get_or_insert_with(KeysetUik::default).creds;
+        let prev_content_ct = creds
+            .get(&cid_b64)
+            .map(|c| c.prev_content_ct.clone())
+            .unwrap_or_default();
+        creds.insert(
+            cid_b64,
+            UikCred {
+                user_id,
+                sig_pub,
+                enc_pub,
+                k_encapped,
+                k_ct,
+                role,
+                role_sig,
+                prev_content_ct,
+            },
+        );
+    }
+
+    /// Set the previous content keys an entry carries, as sealed (an adopted
+    /// row's `uik_prev_content_ct`). A no-op for an entry that is not stored.
+    pub fn set_uik_prev_content_ct(&mut self, cid_b64: &str, sealed: Vec<u8>) {
+        if let Some(c) = self
+            .keyset
             .uik
-            .get_or_insert_with(KeysetUik::default)
-            .creds
-            .insert(
-                cid_b64,
-                UikCred {
-                    user_id,
-                    sig_pub,
-                    enc_pub,
-                    k_encapped,
-                    k_ct,
-                    role,
-                    role_sig,
-                },
-            );
+            .as_mut()
+            .and_then(|u| u.creds.get_mut(cid_b64))
+        {
+            c.prev_content_ct = sealed;
+        }
     }
 
     /// Adopt a pulled `/keys` row's v2 UIK fields (base64, lenient-decoded like
     /// the other keyset data fields). Mirrors [`Self::upsert_key_row`]'s b64-in
     /// contract so the sync layer never handles raw key bytes. Promotes the
-    /// keyset to v2.
+    /// keyset to v2. `prev_content_ct_b64`: the row's sealed previous content
+    /// keys; a row without them keeps what the entry holds (a re-key replaces
+    /// it; the seal binds the generation, so a stale one never opens).
     #[allow(clippy::too_many_arguments)]
     pub fn set_uik_cred_b64(
         &mut self,
@@ -1335,7 +1879,12 @@ impl PerItemVault {
         k_ct_b64: &str,
         role: crate::storage::plaintext::MemberRole,
         role_sig_b64: &str,
+        prev_content_ct_b64: Option<&str>,
     ) -> Result<()> {
+        let prev_content_ct = prev_content_ct_b64
+            .filter(|s| !s.is_empty())
+            .map(decode_keys_data_field)
+            .transpose()?;
         let sig_pub = decode_keys_data_field(sig_pub_b64)?;
         let enc_pub = decode_keys_data_field(enc_pub_b64)?;
         let k_encapped = decode_keys_data_field(k_encapped_b64)?;
@@ -1357,6 +1906,9 @@ impl PerItemVault {
             role,
             role_sig,
         );
+        if let Some(sealed) = prev_content_ct {
+            self.set_uik_prev_content_ct(cid_b64, sealed);
+        }
         Ok(())
     }
 
@@ -1457,19 +2009,66 @@ impl PerItemVault {
         version: u64,
         payload: &ItemPayload,
     ) -> Result<String> {
+        // This process writes as the device: only what the rule table lets
+        // the device write. Never an authorized-agents row in any spelling
+        // (native `agent:<ag_id>` or legacy `aux:agent/<ag_id>`, live or
+        // tombstone: it holds no UIK, agent authorization is console-written
+        // and UIK-signed, §11.1), never a legacy `aux` row except the
+        // migration's tombstone, owner-config only on a vault without a keyset.
+        let has_keyset = self.keyset.uik.is_some();
+        if !crate::storage::item::device_may_write(ns, name, has_keyset, payload.is_tombstone()) {
+            return Err(AppError::Internal(format!(
+                "refusing to write {} '{}': this process may not write that record",
+                ns.as_str(),
+                name
+            )));
+        }
+        self.seal_and_insert::<S>(keys, vault_id, ns, name, version, payload)
+    }
+
+    /// Plant a row as another writer would (an owner's console, an earlier
+    /// version): sealed like [`Self::seal_and_upsert`], without its rule-table
+    /// check. Test fixtures only.
+    #[cfg(test)]
+    pub(crate) fn plant<S: PrimitiveSuite>(
+        &mut self,
+        keys: VaultKeys,
+        vault_id: &str,
+        ns: ItemNs,
+        name: &str,
+        version: u64,
+        payload: &ItemPayload,
+    ) -> Result<String> {
+        self.seal_and_insert::<S>(keys, vault_id, ns, name, version, payload)
+    }
+
+    fn seal_and_insert<S: PrimitiveSuite>(
+        &mut self,
+        keys: VaultKeys,
+        vault_id: &str,
+        ns: ItemNs,
+        name: &str,
+        version: u64,
+        payload: &ItemPayload,
+    ) -> Result<String> {
         let ctx = ItemCtx::for_item::<S>(keys.id_seed, vault_id, ns, name, version)?;
         let ct = seal_item::<S>(keys.content, &ctx, payload)?;
-        // Agent-authz items address by the cleartext ag_id (== name) so the backend
-        // can gate the write by ownership (T2); the seal AAD is still ctx (the HMAC).
-        let id = if ns == ItemNs::Agent { name.to_string() } else { ctx.item_id_b64() };
+        let id = ctx.item_id_b64();
         // A local write leaves `synced_version` where it was (the new version
         // is by definition not on the cloud yet) — the row is dirty until pushed.
-        let synced_version = self.items.get(&id).map(|s| s.synced_version).unwrap_or(0);
+        // A row that was already dirty keeps the base its first change was made
+        // from (the cloud still holds that one or a later one).
+        let (synced_version, base) = match self.items.get(&id) {
+            Some(s) if s.version > s.synced_version => (s.synced_version, s.base.clone()),
+            Some(s) => (s.synced_version, None),
+            None => (0, None),
+        };
         let tombstone = payload.is_tombstone();
+        let generation = self.seal_generation(keys);
         // B2a: seal-level writers land UNSIGNED (sig/signer None) — signing is done
         // by the write ORCHESTRATION (B2b), which knows the principal (the DIK for
-        // the daemon's automatic writes). A `None` here is honored additively on a
-        // NoUik (fmt1 personal) vault and is the pre-cutover state for team writes.
+        // the daemon's automatic writes). An unsigned owner-config / agent row is
+        // honored ONLY on a NoUik (fmt1 personal) vault; a v2 fold drops it.
         self.items.insert(
             id.clone(),
             StoredItem {
@@ -1479,9 +2078,39 @@ impl PerItemVault {
                 tombstone,
                 sig: None,
                 signer: None,
+                base,
+                upgrade: false,
+                generation,
+                unreadable_confirmed: false,
             },
         );
         Ok(id)
+    }
+
+    /// The keyset generation `keys` seal under: this keyset's current one
+    /// when `keys.content` is the key its owner-signed re-key proof commits
+    /// to (generation 0, the original key, has no proof; a vault without a
+    /// keyset is generation 0). `None`: `keys` are not the current
+    /// generation's (an earlier key this session still holds).
+    pub fn seal_generation(&self, keys: VaultKeys) -> Option<u64> {
+        match self.keyset.uik.as_ref() {
+            None => Some(0),
+            Some(u) if u.generation == 0 => Some(0),
+            Some(u) => u
+                .rekey_proof
+                .as_ref()
+                .filter(|p| {
+                    p.generation == u.generation
+                        && p.k_commitment.as_slice() == rekey_commitment(keys.content).as_slice()
+                })
+                .map(|_| u.generation),
+        }
+    }
+
+    /// The keyset generation a row sealed now must carry (`None` without a
+    /// keyset: unchecked).
+    pub fn keyset_generation(&self) -> Option<u64> {
+        self.keyset.uik.as_ref().map(|u| u.generation)
     }
 
     /// Unseal one stored item addressed by `(ns, name)` under `K`. `Ok(None)` if
@@ -1502,7 +2131,7 @@ impl PerItemVault {
         };
         let raw = item_id_bytes::<S>(keys.id_seed, ns.as_str(), name)?;
         let ctx = ItemCtx::new(vault_id, raw, stored.version);
-        Ok(Some(unseal_item::<S>(keys.content, &ctx, &stored.ct)?))
+        Ok(Some(unseal_item_keys::<S>(keys, &id, &ctx, &stored.ct)?.0))
     }
 
     /// Seed / re-seed this vault's item rows from a decrypted
@@ -1514,11 +2143,10 @@ impl PerItemVault {
     ///
     /// Each item's CAS `version` starts at `bump_from + 1` for a freshly-sealed
     /// row, so re-seeding after a write monotonically advances the version an
-    /// offline peer will CAS against (the enroll case passes `0`). Aux subtrees
-    /// with their default/empty value are NOT sealed (they'd only add tombstone-
-    /// like noise); only `stores`, `store_order`, `policy`,
-    /// `audit_retention_days`, plus every connection/connecting entry and every
-    /// native secret, become their own item.
+    /// offline peer will CAS against (the enroll case passes `0`). Every
+    /// native secret, connection, in-flight connect and service becomes its own
+    /// item, and (a vault without a keyset) the owner-config its native records
+    /// ([`owner_config_items`]); an unset policy or retention writes nothing.
     pub fn seed_items_from_view<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
@@ -1529,7 +2157,9 @@ impl PerItemVault {
         for (name, bytes) in &view.native_secrets {
             let value = String::from_utf8(bytes.clone())
                 .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
-            let payload = ItemPayload::secret_live(name.clone(), &value);
+            let notes = view.native_secret_notes.get(name).map(String::as_str);
+            let payload =
+                ItemPayload::live(ItemNs::Secret, name.clone(), secret_body(&value, notes));
             self.seal_and_upsert::<S>(keys, vault_id, ItemNs::Secret, name, 1, &payload)?;
         }
         // established connections → one `connection` item each.
@@ -1544,68 +2174,167 @@ impl PerItemVault {
             let payload = ItemPayload::live(ItemNs::Connecting, conn_id.clone(), body);
             self.seal_and_upsert::<S>(keys, vault_id, ItemNs::Connecting, conn_id, 1, &payload)?;
         }
-        // aux subtrees → one `aux:<name>` item each. Config singletons are
-        // single blobs; AGENTS are PER-ITEM `aux:agent/<id>`
-        // (one item per agent) — independent CAS so two members editing their
-        // own agents never clobber, and a distinct item id per agent for the
-        // future per-author write gate (team §8.1). The `aux:` prefix is
-        // retained (the cosmetic drop → `agent:<id>` is the pre-launch
-        // console-coordinated cutover); the PER-ITEM SPLIT is here now.
-        for (name, body) in Self::aux_blob_bodies(&view.aux)? {
+        // Owner-config → its native records (`policy:*`, `store:<id>`,
+        // `store_order:`, `audit_retention_days:`), where the device may write
+        // them (a vault without a keyset). Agents are NEVER written by the
+        // daemon (console-written, UIK-signed only; §11.1).
+        let has_keyset = self.keyset.uik.is_some();
+        for ((ns, name), body) in owner_config_items(&view.aux)? {
+            if !crate::storage::item::device_may_write(ns, &name, has_keyset, false) {
+                continue;
+            }
             self.seal_and_upsert::<S>(
                 keys,
                 vault_id,
-                ItemNs::Aux,
+                ns,
                 &name,
                 1,
-                &ItemPayload::live(ItemNs::Aux, name.clone(), body),
+                &ItemPayload::live(ns, name.clone(), body),
+            )?;
+        }
+        for (id, body) in Self::service_bodies(&view.aux)? {
+            self.seal_and_upsert::<S>(
+                keys,
+                vault_id,
+                ItemNs::Service,
+                &id,
+                1,
+                &ItemPayload::live(ItemNs::Service, id.clone(), body),
             )?;
         }
         Ok(())
     }
 
-    /// The aux items a view wants materialised, as `(aux_name, body)` pairs
-    /// under `aux:<name>` addressing. Shared by seed + reconcile so the two
-    /// write paths can never disagree. Config singletons are whole
-    /// blobs; each agent mask is its OWN item `aux:agent/<id>` (per-item CAS).
-    /// Default/empty subtrees are skipped (no tombstone-like noise).
-    fn aux_blob_bodies(
+    /// The native `service` items a view wants, `id → body`: every entry of
+    /// `aux.services` (legacy entries included), each its own item, always in
+    /// the object form `{service, policy?, source?}`
+    /// ([`crate::storage::item::normalized_body`]: a plain-string entry is
+    /// `{service: <text>}`). A conflict copy is a record of its own name.
+    fn service_bodies(
         aux: &crate::storage::plaintext::VaultAux,
     ) -> Result<Vec<(String, serde_json::Value)>> {
-        let mut out: Vec<(String, serde_json::Value)> = Vec::new();
-        out.push((
-            "stores".into(),
-            serde_json::to_value(&aux.stores).map_err(AppError::from)?,
-        ));
-        out.push((
-            "store_order".into(),
-            serde_json::to_value(&aux.store_order).map_err(AppError::from)?,
-        ));
-        if let Some(policy) = &aux.policy {
-            out.push((
-                "policy".into(),
-                serde_json::to_value(policy).map_err(AppError::from)?,
-            ));
+        aux.services
+            .iter()
+            .map(|(id, e)| {
+                let body = serde_json::to_value(e).map_err(AppError::from)?;
+                Ok((id.clone(), normalized_body(ItemNs::Service, id, &body)))
+            })
+            .collect()
+    }
+
+    /// Keep `ours` as its keep-both conflict copy, an ordinary record
+    /// ([`crate::storage::item::conflict_copy_slot`] against this store):
+    /// written dirty (the next push sends it), or already here. Returns the
+    /// id written, if any; `Err` when no copy may be written (a row that
+    /// cannot be read, or the last copy level taken).
+    pub(crate) fn keep_conflict_copy<S: PrimitiveSuite>(
+        &mut self,
+        keys: VaultKeys,
+        vault_id: &str,
+        ours: &ItemPayload,
+    ) -> Result<Option<String>> {
+        use crate::storage::item::{conflict_copy_slot, row_at, CopySlot};
+        let slot = conflict_copy_slot::<S>(keys.id_seed, ours, |wire| {
+            row_at::<S>(
+                keys,
+                vault_id,
+                wire,
+                self.items.get(wire).map(|s| (s.version, s.ct.as_slice())),
+            )
+        })?;
+        match slot {
+            CopySlot::Same { .. } => Ok(None),
+            CopySlot::Write { payload, .. } => {
+                let (id, _) =
+                    self.seal_and_bump::<S>(keys, vault_id, payload.ns, &payload.name, &payload)?;
+                Ok(Some(id))
+            }
         }
-        if let Some(days) = aux.audit_retention_days {
-            out.push(("audit_retention_days".into(), serde_json::json!(days)));
+    }
+
+    /// Whether the row at `(ns, name)` may be written over: absent, or one
+    /// this key opens. A row that cannot be read is never written over.
+    fn writable<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+        ns: ItemNs,
+        name: &str,
+    ) -> Result<bool> {
+        let wire = wire_id_for::<S>(keys.id_seed, ns, name)?;
+        Ok(match self.items.get(&wire) {
+            None => true,
+            Some(s) => {
+                s.unreadable_confirmed
+                    || open_wire_item::<S>(keys, vault_id, &wire, s.version, &s.ct).is_ok()
+            }
+        })
+    }
+
+    /// After a keyset refresh, with `keys` of the keyset's current
+    /// generation: mark each clean row that opens under none of them
+    /// ([`StoredItem::unreadable_confirmed`]) and unmark one that opens.
+    /// Keys of another generation (a session from before the key changed)
+    /// mark nothing. Returns whether a mark changed.
+    pub fn confirm_unreadable<S: PrimitiveSuite>(&mut self, keys: VaultKeys, vault_id: &str) -> bool {
+        let current = self.keyset_generation().unwrap_or(0);
+        if self.seal_generation(keys) != Some(current) {
+            return false;
         }
-        if !aux.services.is_empty() {
-            out.push((
-                "services".into(),
-                serde_json::to_value(&aux.services).map_err(AppError::from)?,
-            ));
+        let marks: Vec<(String, bool)> = self
+            .items
+            .iter()
+            .filter(|(_, s)| s.version <= s.synced_version)
+            .map(|(id, s)| {
+                let unreadable = open_wire_item::<S>(keys, vault_id, id, s.version, &s.ct).is_err();
+                (id.clone(), unreadable)
+            })
+            .collect();
+        let mut changed = false;
+        for (id, unreadable) in marks {
+            if let Some(s) = self.items.get_mut(&id) {
+                if s.unreadable_confirmed != unreadable {
+                    s.unreadable_confirmed = unreadable;
+                    changed = true;
+                }
+            }
         }
-        // PER-AGENT items — one `aux:agent/<ag_id>` each (§11.1 authorized-agents
-        // table). A row folded from a UIK-signed wrapper is re-emitted VERBATIM
-        // (the daemon holds only public keys, so it cannot re-sign it); a legacy
-        // raw row serializes its fields directly.
-        for (id, entry) in &aux.agents {
-            let body = match &entry.signed_body {
-                Some(signed) => signed.clone(),
-                None => serde_json::to_value(entry).map_err(AppError::from)?,
-            };
-            out.push((format!("agent/{}", id), body));
+        changed
+    }
+
+    /// A view's reconcilable items as `(ns, name) → body`: every native secret,
+    /// connection, in-flight connect and service (normalized), and the
+    /// owner-config records ([`owner_config_items`]). Shared by [`Self::reconcile_from_view`]
+    /// and [`ViewBase::of`] so a base and a view are always compared on the
+    /// same representation.
+    fn view_items(
+        view: &crate::storage::plaintext::VaultPlaintextView,
+    ) -> Result<BTreeMap<(ItemNs, String), serde_json::Value>> {
+        let mut out: BTreeMap<(ItemNs, String), serde_json::Value> = BTreeMap::new();
+        for (name, bytes) in &view.native_secrets {
+            let value = String::from_utf8(bytes.clone())
+                .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
+            // Re-attach the secret's notes: a value rewrite must not drop them.
+            let notes = view.native_secret_notes.get(name).map(String::as_str);
+            out.insert((ItemNs::Secret, name.clone()), secret_body(&value, notes));
+        }
+        for (id, conn) in &view.aux.connections {
+            out.insert(
+                (ItemNs::Connection, id.clone()),
+                serde_json::to_value(conn).map_err(AppError::from)?,
+            );
+        }
+        for (id, c) in &view.aux.connecting {
+            out.insert(
+                (ItemNs::Connecting, id.clone()),
+                serde_json::to_value(c).map_err(AppError::from)?,
+            );
+        }
+        for (id, body) in Self::service_bodies(&view.aux)? {
+            out.insert((ItemNs::Service, id), body);
+        }
+        for (key, body) in owner_config_items(&view.aux)? {
+            out.insert(key, body);
         }
         Ok(out)
     }
@@ -1615,123 +2344,205 @@ impl PerItemVault {
     /// monotonic version bump so the sync layer's per-item CAS sees a strictly
     /// higher version (contract §4/§6). Unlike [`seed_items_from_view`] (which
     /// resets every version to 1), this:
-    ///   - upserts a `secret`/`connection`/`connecting`/`aux` item whose sealed
-    ///     value changed, at `current + 1`;
-    ///   - writes a `tombstone` (also bumped) for a `secret`/`connection`/
-    ///     `connecting` item that the view no longer has (e.g. a completed
-    ///     connect MOVEs its `connecting` entry away → tombstone the old row).
+    ///   - upserts an item whose sealed value changed, at `current + 1`: a
+    ///     secret, connection, in-flight connect or service, and (a vault
+    ///     without a keyset) an owner-config record;
+    ///   - writes a `tombstone` (also bumped) for one the view no longer has
+    ///     (e.g. a completed connect MOVEs its `connecting` entry away →
+    ///     tombstone the old row; a key only the legacy row held gets a native
+    ///     tombstone, so the legacy entry does not come back).
     ///
     /// This is the daemon-side, single-writer equivalent of "PUT the changed
-    /// items" (contract §5 `writeVault` diff). Returns the ids that changed.
+    /// items" (contract §5 `writeVault` diff). What counts as changed is
+    /// relative to the caller's [`ReconcileBase`]: only a view with a known base
+    /// can tell "the caller changed/deleted it" from "someone else changed it
+    /// since". A same-item conflict resolves per the record's
+    /// [`Conflict`] policy ([`crate::storage::item::ITEM_RULES`]). Returns the
+    /// ids written and the owner-config changes set aside ([`Reconciled`]).
     pub fn reconcile_from_view<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
         vault_id: &str,
         view: &crate::storage::plaintext::VaultPlaintextView,
-    ) -> Result<Vec<String>> {
-        let mut changed: Vec<String> = Vec::new();
+        base: ReconcileBase<'_>,
+    ) -> Result<Reconciled> {
+        let mut out = Reconciled::default();
+        // Only what the device may write (the rule table): data records on
+        // every keyset; owner-config only on a vault without a keyset. On a
+        // keyset owner-config is honored only owner-signed, and this process
+        // holds no UIK: an unsigned copy would be dropped by every fold, and
+        // re-writing it could clobber an owner-signed row (or replace a dropped
+        // one with the safe default). Agents are never emitted at all.
+        let has_keyset = self.keyset.uik.is_some();
+        let desired: BTreeMap<(ItemNs, String), serde_json::Value> = Self::view_items(view)?
+            .into_iter()
+            .filter(|((ns, name), _)| {
+                crate::storage::item::device_may_write(*ns, name, has_keyset, false)
+            })
+            .collect();
+        // The base each write is made from, recorded on a keep-both row that
+        // goes dirty (see [`StoredItem::base`]). `OwnFold`: our own fold now.
+        let (now, default_kinds) = self.fold_view_and_defaults::<S>(keys, vault_id)?;
+        let own_base = match base {
+            ReconcileBase::OwnFold => Some(ViewBase::of(&now)?),
+            ReconcileBase::Since(_) => None,
+        };
+        drop(now);
+        let base_digests: &ViewBase = match (base, own_base.as_ref()) {
+            (ReconcileBase::Since(b), _) => b,
+            (ReconcileBase::OwnFold, Some(b)) => b,
+            (ReconcileBase::OwnFold, None) => unreachable!("own base computed above"),
+        };
 
-        // Build the desired (ns, name) → body set from the view.
-        let mut desired: BTreeMap<(ItemNs, String), serde_json::Value> = BTreeMap::new();
-        for (name, bytes) in &view.native_secrets {
-            let value = String::from_utf8(bytes.clone())
-                .map_err(|_| AppError::Internal(format!("secret '{}' not utf8", name)))?;
-            desired.insert(
-                (ItemNs::Secret, name.clone()),
-                serde_json::Value::String(value),
-            );
-        }
-        for (id, conn) in &view.aux.connections {
-            desired.insert(
-                (ItemNs::Connection, id.clone()),
-                serde_json::to_value(conn).map_err(AppError::from)?,
-            );
-        }
-        for (id, c) in &view.aux.connecting {
-            desired.insert(
-                (ItemNs::Connecting, id.clone()),
-                serde_json::to_value(c).map_err(AppError::from)?,
-            );
-        }
-        // aux subtrees (config + agents + members) at legacy `aux:<name>`.
-        for (name, body) in Self::aux_blob_bodies(&view.aux)? {
-            desired.insert((ItemNs::Aux, name.to_string()), body);
-        }
+        // An owner-config kind that reads its default is written WHOLE when
+        // the caller changes it: once any of its entries is stored, the
+        // default no longer applies to the rest.
+        let whole_kinds: std::collections::BTreeSet<ItemNs> = match base {
+            ReconcileBase::Since(b) => desired
+                .iter()
+                .filter(|((ns, name), body)| {
+                    is_owner_config_ns(*ns)
+                        && default_kinds.contains(ns)
+                        && !b.unchanged(*ns, name, body)
+                })
+                .map(|((ns, _), _)| *ns)
+                .collect(),
+            ReconcileBase::OwnFold => Default::default(),
+        };
 
-        // Upsert every desired item whose sealed body differs from what we hold.
+        // Upsert every desired item the caller changed (vs its base) whose sealed
+        // body differs from what we hold (compared normalized).
         for ((ns, name), body) in &desired {
+            if let ReconcileBase::Since(b) = base {
+                if b.unchanged(*ns, name, body) && !whole_kinds.contains(ns) {
+                    continue;
+                }
+            }
             // `open_item` is unconverted (single-key); id_seed == content here so
-            // the read is byte-identical either way.
-            let existing = self.open_item::<S>(keys, vault_id, *ns, name)?;
-            let same = existing
-                .as_ref()
-                .map(|p| !p.is_tombstone() && &p.body == body)
-                .unwrap_or(false);
-            if same {
+            // the read is byte-identical either way. A row this key cannot
+            // open is never written over: the change is refused and reported.
+            let wire = wire_id_for::<S>(keys.id_seed, *ns, name)?;
+            let existing = match self.open_item::<S>(keys, vault_id, *ns, name) {
+                Ok(p) => p,
+                // Confirmed after a keyset refresh to open under no key a
+                // current member holds: this change may go over it.
+                Err(_) if self.items.get(&wire).is_some_and(|s| s.unreadable_confirmed) => None,
+                Err(_) => {
+                    let label =
+                        crate::storage::item::record_label(&ItemPayload::live(*ns, name.clone(), body.clone()));
+                    out.refused.push((wire, unreadable_refusal(&label)));
+                    continue;
+                }
+            };
+            let existing_live = existing.as_ref().filter(|p| !p.is_tombstone());
+            let wanted = item_body_digest(*ns, name, body);
+            if existing_live.is_some_and(|p| item_body_digest(*ns, name, &p.body) == wanted) {
                 continue;
             }
             let payload = ItemPayload::live(*ns, name.clone(), body.clone());
+            let policy = crate::storage::item::conflict_policy(*ns, name);
+            let row = self
+                .items
+                .get(&wire)
+                .map(|s| (s.version, s.version > s.synced_version));
+            // §4 same-item conflict: the caller changed it AND the stored row no
+            // longer matches the base (a pull changed or deleted it meanwhile,
+            // e.g. during a connect's token exchange). Their body equal to the
+            // base (normalized) is no conflict: ours applies.
+            if let (ReconcileBase::Since(b), Some(_)) = (base, row) {
+                let theirs = existing_live.map(|p| item_body_digest(*ns, name, &p.body));
+                if theirs.as_ref() != b.digest(*ns, name) {
+                    match policy {
+                        // THEIRS stays at the canonical id; OURS becomes its
+                        // conflict copy, a dirty record of its own name
+                        // (console parity); their delete stands.
+                        Conflict::KeepBoth => {
+                            match self.keep_conflict_copy::<S>(keys, vault_id, &payload) {
+                                Ok(Some(copy)) => out.changed.push(copy),
+                                Ok(None) => {}
+                                Err(e) => out.refused.push((wire.clone(), e.to_string())),
+                            }
+                            continue;
+                        }
+                        // Never overwritten: ours is not written and is
+                        // reported for a re-run.
+                        Conflict::OwnerConfig => {
+                            out.set_aside
+                                .push((wire.clone(), crate::storage::item::record_label(&payload)));
+                            continue;
+                        }
+                        Conflict::TakeWriter => {}
+                    }
+                }
+            }
+            let was_clean = row.is_none_or(|(_, dirty)| !dirty);
             let (id, _v) = self.seal_and_bump::<S>(keys, vault_id, *ns, name, &payload)?;
-            changed.push(id);
+            if was_clean && policy == Conflict::KeepBoth {
+                if let Some(s) = self.items.get_mut(&id) {
+                    s.base = base_digests.digest(*ns, name).map(digest_hex);
+                }
+            }
+            out.changed.push(id);
         }
 
-        // Tombstone secret/connection/connecting rows the view dropped. Our own
+        // Tombstone secret/connection/connecting rows the caller dropped. Our own
         // folded view gives the currently-live (ns, name) set; tombstone any not
-        // in `desired` (a completed connect MOVEs its `connecting` entry, so the
-        // old connecting row must become a tombstone).
+        // in `desired` that the base had (a completed connect MOVEs its
+        // `connecting` entry, so the old connecting row must become a tombstone).
+        let removed = |ns: ItemNs, name: &String| -> bool {
+            !desired.contains_key(&(ns, name.clone()))
+                && match base {
+                    ReconcileBase::Since(b) => b.has(ns, name),
+                    ReconcileBase::OwnFold => true,
+                }
+        };
         let mine = self.fold_view::<S>(keys, vault_id)?;
-        for name in mine.native_secrets.keys() {
-            if !desired.contains_key(&(ItemNs::Secret, name.clone())) {
-                let (id, _v) = self.seal_and_bump::<S>(
-                    keys,
-                    vault_id,
-                    ItemNs::Secret,
-                    name,
-                    &ItemPayload::tombstone(ItemNs::Secret, name.clone()),
-                )?;
-                changed.push(id);
+        let mut drop_keys: Vec<(ItemNs, String)> = Vec::new();
+        drop_keys.extend(mine.native_secrets.keys().map(|n| (ItemNs::Secret, n.clone())));
+        drop_keys.extend(mine.aux.connections.keys().map(|n| (ItemNs::Connection, n.clone())));
+        drop_keys.extend(mine.aux.connecting.keys().map(|n| (ItemNs::Connecting, n.clone())));
+        // A service the caller dropped (a native item, or a legacy-only entry
+        // of the `services` record) gets a native tombstone, which hides the
+        // legacy entry of its id.
+        drop_keys.extend(mine.aux.services.keys().map(|n| (ItemNs::Service, n.clone())));
+        // Owner-config records the caller dropped (a policy category or
+        // connection entry, a store, the retention), where the device may
+        // write them.
+        drop_keys.extend(
+            owner_config_items(&mine.aux)?
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|(ns, name)| {
+                    crate::storage::item::device_may_write(*ns, name, has_keyset, true)
+                }),
+        );
+        for (ns, name) in drop_keys {
+            if !removed(ns, &name) {
+                continue;
             }
-        }
-        for id in mine.aux.connections.keys() {
-            if !desired.contains_key(&(ItemNs::Connection, id.clone())) {
-                let (iid, _v) = self.seal_and_bump::<S>(
-                    keys,
-                    vault_id,
-                    ItemNs::Connection,
-                    id,
-                    &ItemPayload::tombstone(ItemNs::Connection, id.clone()),
-                )?;
-                changed.push(iid);
+            // A key read from a legacy row may have a native row this key
+            // cannot open: never written over.
+            if !self.writable::<S>(keys, vault_id, ns, &name)? {
+                let label =
+                    crate::storage::item::record_label(&ItemPayload::tombstone(ns, name.clone()));
+                out.refused.push((
+                    wire_id_for::<S>(keys.id_seed, ns, &name)?,
+                    unreadable_refusal(&label),
+                ));
+                continue;
             }
+            let (iid, _v) = self.seal_and_bump::<S>(
+                keys,
+                vault_id,
+                ns,
+                &name,
+                &ItemPayload::tombstone(ns, name.clone()),
+            )?;
+            out.changed.push(iid);
         }
-        for id in mine.aux.connecting.keys() {
-            if !desired.contains_key(&(ItemNs::Connecting, id.clone())) {
-                let (iid, _v) = self.seal_and_bump::<S>(
-                    keys,
-                    vault_id,
-                    ItemNs::Connecting,
-                    id,
-                    &ItemPayload::tombstone(ItemNs::Connecting, id.clone()),
-                )?;
-                changed.push(iid);
-            }
-        }
-        // A dropped agent mask (offboarding sweep, or a member deleting their
-        // own agent) → tombstone its per-item `aux:agent/<id>` row.
-        for id in mine.aux.agents.keys() {
-            let name = format!("agent/{}", id);
-            if !desired.contains_key(&(ItemNs::Aux, name.clone())) {
-                let (iid, _v) = self.seal_and_bump::<S>(
-                    keys,
-                    vault_id,
-                    ItemNs::Aux,
-                    &name,
-                    &ItemPayload::tombstone(ItemNs::Aux, name.clone()),
-                )?;
-                changed.push(iid);
-            }
-        }
-        Ok(changed)
+        // Agent rows are never written here (no live upsert, no tombstone): a
+        // revoke is the console deleting the UIK-signed row.
+        Ok(out)
     }
 
     /// Resolve the KEYSET's [`MembershipTrust`] — the owner-authority anchor state
@@ -1743,7 +2554,7 @@ impl PerItemVault {
     /// fail-open to integrity-only on a v2 keyset:
     ///
     /// - `keyset.uik == None` ⇒ [`MembershipTrust::NoUik`] (legacy v1 — integrity-only,
-    ///   additive; pre-signing vaults are untouched).
+    ///   single-person vaults with no member keys to sign anything).
     /// - `uik` present but `creator_sig_pub` is NOT a valid 32-byte key AND the
     ///   keyset already carries credentials ⇒ [`MembershipTrust::Untrusted`]. This is
     ///   the server-strippable state (`adopt_creator_pin` only pins non-empty), so
@@ -1762,7 +2573,7 @@ impl PerItemVault {
     ///   (its role=Owner, self-signed under `creator_pub`); no special case. An
     ///   empty owner-set is a valid `Verified` result (all signed owner-config
     ///   drops). A `uik` with no anchor AND no creds yet is a fresh bootstrap with
-    ///   nothing to authorize — `Verified(∅)` (only legacy-raw config is additive).
+    ///   nothing to authorize — `Verified(∅)` (every owner-config and agent row drops).
     fn resolve_membership_trust(&self, vault_id: &str) -> MembershipTrust {
         let Some(uik) = self.keyset.uik.as_ref() else {
             return MembershipTrust::NoUik; // legacy v1 — integrity-only (additive)
@@ -1772,7 +2583,7 @@ impl PerItemVault {
         // keyset that already carries creds but has NO resolvable root is the
         // server-strippable state → FAIL CLOSED (`Untrusted`); an anchor-less keyset
         // with NO creds is a fresh bootstrap: nothing to authorize → empty Verified
-        // set (legacy-raw stays additive, every signed item drops).
+        // set (every owner-config / agent row drops, signed or not).
         if resolve_current_root(uik, vault_id).is_none() {
             return if uik.creds.is_empty() {
                 MembershipTrust::Verified(BTreeMap::new())
@@ -1789,7 +2600,7 @@ impl PerItemVault {
         if !membership_prefix_ok(uik, vault_id) {
             return MembershipTrust::Untrusted;
         }
-        MembershipTrust::Verified(self.fold_owner_set(vault_id))
+        MembershipTrust::Verified(self.fold_roles(vault_id))
     }
 
     /// §15 leg-B: is `us_id` a VERIFIED member of this vault right now? Answers the
@@ -1819,7 +2630,7 @@ impl PerItemVault {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use crate::storage::plaintext::MemberRole;
         // Authority: only an OWNER may tombstone the vault.
-        if self.fold_owner_set(vault_id).get(signer) != Some(&MemberRole::Owner) {
+        if self.fold_roles(vault_id).get(signer) != Some(&MemberRole::Admin) {
             return false;
         }
         // The signer's verifying key rides the keyset creds; self-certify it (its id
@@ -1846,15 +2657,116 @@ impl PerItemVault {
         crate::identity::verify(&pub32, &crate::identity::vault_tombstone_input(vault_id), &sig)
     }
 
-    /// §15 leg A: is this a legacy fmt1 / NoUik vault (no signed owner set)? Such a vault
-    /// has no fold-owner to verify a tombstone against, so the require-signed gate cannot
-    /// apply — the caller keeps the legacy UNSIGNED drop for it (fmt1 is being retired; a
-    /// fmt2 vault's owner signs the tombstone). Never blocks a legacy delete from propagating.
-    pub(crate) fn is_legacy_nouik(&self, vault_id: &str) -> bool {
-        matches!(self.resolve_membership_trust(vault_id), MembershipTrust::NoUik)
+    /// The `us_…` ids this keyset seats under one of THIS device's own passkeys:
+    /// entries keyed by a credential id that has a WebAuthn pubkey in the registry
+    /// (the membership triple keys only the caller's own member under its cids;
+    /// other members sit under their `us_…`), excluding every credential the
+    /// membership served as another member's approval material
+    /// ([`KeysetUik::approver_cids`]): an admin's passkey in the registry never
+    /// makes the admin "own". The fallback requester identity when the pairing
+    /// carries no account UIK.
+    pub(crate) fn own_identities(&self) -> std::collections::BTreeSet<String> {
+        let Some(uik) = self.keyset.uik.as_ref() else {
+            return Default::default();
+        };
+        uik.creds
+            .iter()
+            .filter(|(cid, _)| !uik.approver_cids.contains_key(*cid))
+            .filter(|(cid, _)| find_pubkey_in_registry(&self.keyset.registry, cid).is_some())
+            .map(|(_, c)| c.user_id.clone())
+            .collect()
     }
 
-    /// Compute the current derived OWNER-SET (`user_id → role`) = the FOLD of the
+    /// Adopt another member's passkey served as approval-verification material
+    /// (`approver: true`): its WebAuthn pubkey into the registry (so an
+    /// assertion by it verifies) and `cid → identity_id` into
+    /// [`KeysetUik::approver_cids`] (so the signer resolves). An entry an
+    /// earlier adoption keyed under this cid (a seat it took for the device's
+    /// own) is dropped: the member's seat is keyed under their `us_…`.
+    pub fn set_approver_credential(
+        &mut self,
+        cid_b64: &str,
+        identity_id: &str,
+        x_b64: &str,
+        y_b64: &str,
+    ) -> Result<()> {
+        if identity_id.is_empty() {
+            return Err(AppError::BadRequest("approver credential has no identity".into()));
+        }
+        self.set_registry_pubkey(cid_b64, x_b64, y_b64, "")?;
+        let uik = self.keyset.uik.get_or_insert_with(KeysetUik::default);
+        uik.creds.remove(cid_b64);
+        uik.approver_cids
+            .insert(cid_b64.to_string(), identity_id.to_string());
+        Ok(())
+    }
+
+    /// The identity (`us_…`) a passkey belongs to on this v2 keyset, as the
+    /// membership labels it: the device's own entry keyed by the cid, else an
+    /// approver credential ([`KeysetUik::approver_cids`]). A label, not proof:
+    /// callers authorize on the verified role fold.
+    pub(crate) fn credential_identity(&self, cid_b64: &str) -> Option<String> {
+        let uik = self.keyset.uik.as_ref()?;
+        uik.creds
+            .get(cid_b64)
+            .map(|c| c.user_id.clone())
+            .or_else(|| uik.approver_cids.get(cid_b64).cloned())
+    }
+
+    /// The Ed25519 signing key of identity `id` as this vault knows it, for a
+    /// grant v3 `id_sig` check: a keyset entry seated for `id`, or the vault's
+    /// current (succession-resolved) root. Every candidate must SELF-CERTIFY
+    /// (`derive_id(User, pub) == id`), so the source does not matter: a key the
+    /// server mislabeled never derives to `id`. `None` = this vault holds no key
+    /// that is `id`'s.
+    pub(crate) fn identity_sig_pub(&self, vault_id: &str, id: &str) -> Option<[u8; 32]> {
+        let uik = self.keyset.uik.as_ref()?;
+        let certifies = |pub32: &[u8; 32]| {
+            crate::identity::derive_id(crate::identity::IdKind::User, pub32) == id
+        };
+        uik.creds
+            .values()
+            .filter(|c| c.user_id == id)
+            .filter_map(|c| <[u8; 32]>::try_from(c.sig_pub.as_slice()).ok())
+            .find(certifies)
+            .or_else(|| {
+                resolve_current_root(uik, vault_id)
+                    .map(|(root, _)| root)
+                    .filter(certifies)
+            })
+    }
+
+    /// May `signer` (the approver's `us_…`, already proven by a verified grant v3
+    /// `id_sig`) approve an op that `requester` (the account whose daemon raised
+    /// it) is waiting on? The requester always may. Anyone else must be an ADMIN
+    /// of the vault per the current, VERIFIED role fold; a v1 keyset (a personal
+    /// vault) has no fold, so only the requester approves there. An untrusted
+    /// fold (no confirmable admin) still lets the requester approve their own op.
+    pub(crate) fn approval_authority(
+        &self,
+        vault_id: &str,
+        requester: &std::collections::BTreeSet<String>,
+        signer: &str,
+    ) -> ApprovalAuthority {
+        if requester.contains(signer) {
+            return ApprovalAuthority::Requester;
+        }
+        match self.resolve_membership_trust(vault_id) {
+            MembershipTrust::Verified(roles)
+                if roles.get(signer).is_some_and(|r| r.is_admin()) =>
+            {
+                ApprovalAuthority::Admin
+            }
+            _ => ApprovalAuthority::Refused(format!(
+                "{} is neither the requester nor an admin of this vault; \
+                 only the requester or a vault admin can approve this request",
+                signer
+            )),
+        }
+    }
+
+    /// Compute the current derived ROLE SET (`user_id → role`; its admins are the
+    /// vault's admin set) = the FOLD of the
     /// root-signed CHECKPOINT (each cred's `role_sig` @ the current `role_epoch`)
     /// followed by the append-only `delegation_log` (design/identity-uik-aik.md
     /// §4.3, delegation-log-impl-spec.md §0). The checkpoint is verified under the
@@ -1864,7 +2776,7 @@ impl PerItemVault {
     /// (NON-CASCADE). A last-owner removal/demote is ignored (defense in depth; also
     /// gated at write time). Returns an EMPTY map when there is no UIK layer or no
     /// resolvable root (no confirmable owner → callers fail closed).
-    pub(crate) fn fold_owner_set(
+    pub(crate) fn fold_roles(
         &self,
         vault_id: &str,
     ) -> BTreeMap<String, crate::storage::plaintext::MemberRole> {
@@ -1878,7 +2790,7 @@ impl PerItemVault {
         };
         let root_id = crate::identity::derive_id(crate::identity::IdKind::User, &root_pub);
         // Genesis: the current root is an owner (TOFU-pinned anchor + succession).
-        map.insert(root_id.clone(), MemberRole::Owner);
+        map.insert(root_id.clone(), MemberRole::Admin);
         // Checkpoint: root-signed grants @ the current (succession-derived) role_epoch
         // (depth-1 → a fresh daemon verifies with no history).
         for cred in uik.creds.values() {
@@ -1901,13 +2813,14 @@ impl PerItemVault {
             let Ok(sig) = <[u8; 64]>::try_from(cred.role_sig.as_slice()) else {
                 continue; // no / malformed grant → not in the checkpoint
             };
-            let input = crate::identity::role_grant_input(
-                vault_id,
-                &cred.user_id,
-                role_str(cred.role),
-                role_epoch,
-            );
-            if crate::identity::verify(&root_pub, &input, &sig) {
+            // A legacy admin grant was signed over `"owner"`, a new one over
+            // `"admin"`: either spelling of the cred's OWN role verifies it.
+            let granted = role_sig_tokens(cred.role).iter().any(|tok| {
+                let input =
+                    crate::identity::role_grant_input(vault_id, &cred.user_id, tok, role_epoch);
+                crate::identity::verify(&root_pub, &input, &sig)
+            });
+            if granted {
                 map.insert(cred.user_id.clone(), cred.role);
             }
         }
@@ -1933,7 +2846,7 @@ impl PerItemVault {
             // A junk / non-owner event must NOT consume the seq slot (else it could
             // suppress a legitimate same-seq event — the dup guard would then drop the
             // real one), so `last_seq` advances ONLY AFTER full validation below.
-            if map.get(&e.granter_id) != Some(&MemberRole::Owner) {
+            if map.get(&e.granter_id) != Some(&MemberRole::Admin) {
                 continue;
             }
             // The granter's verifying key rides INLINE and is SELF-CERTIFYING: it must
@@ -1948,24 +2861,7 @@ impl PerItemVault {
             {
                 continue;
             }
-            let role_tok = if e.op == "remove" {
-                ""
-            } else {
-                role_str(e.role)
-            };
-            let input = crate::identity::delegation_event_input(
-                vault_id,
-                &e.op,
-                &e.subject_id,
-                role_tok,
-                &e.granter_id,
-                e.seq,
-                e.role_epoch,
-            );
-            let Ok(sig) = <[u8; 64]>::try_from(e.sig.as_slice()) else {
-                continue;
-            };
-            if !crate::identity::verify(&granter_pub, &input, &sig) {
+            if !e.signature_verifies(vault_id, &granter_pub) {
                 continue;
             }
             // VALIDATED (owner + self-certifying key + signature): now consume the seq
@@ -1978,22 +2874,22 @@ impl PerItemVault {
             // owner-set is never EMPTIED — a remove/demote that would drop the LAST
             // owner is ignored (last-owner guard; also enforced at write time in the
             // console). This replaces the old "root is permanently immune" rule.
-            let owner_count = |m: &BTreeMap<String, MemberRole>| {
-                m.values().filter(|r| **r == MemberRole::Owner).count()
+            let admin_count = |m: &BTreeMap<String, MemberRole>| {
+                m.values().filter(|r| r.is_admin()).count()
             };
             match e.op.as_str() {
                 "remove" => {
-                    if map.get(&e.subject_id) == Some(&MemberRole::Owner) && owner_count(&map) <= 1
+                    if map.get(&e.subject_id) == Some(&MemberRole::Admin) && admin_count(&map) <= 1
                     {
-                        continue; // last-owner guard: never empty the owner-set
+                        continue; // last-admin guard: never empty the admin set
                     }
                     map.remove(&e.subject_id); // NON-CASCADE: only the subject
                 }
                 "set" => {
-                    // A demote (owner → member) of the last owner would empty it → skip.
-                    if e.role != MemberRole::Owner
-                        && map.get(&e.subject_id) == Some(&MemberRole::Owner)
-                        && owner_count(&map) <= 1
+                    // A demote (admin → member) of the last admin would empty it → skip.
+                    if !e.role.is_admin()
+                        && map.get(&e.subject_id) == Some(&MemberRole::Admin)
+                        && admin_count(&map) <= 1
                     {
                         continue;
                     }
@@ -2024,35 +2920,38 @@ impl PerItemVault {
         keys: VaultKeys,
         vault_id: &str,
     ) -> Result<crate::storage::plaintext::VaultPlaintextView> {
+        Ok(self.fold_view_and_defaults::<S>(keys, vault_id)?.0)
+    }
+
+    /// [`Self::fold_view`], and the owner-config kinds that read their
+    /// default ([`OwnerConfigFold::apply`]).
+    fn fold_view_and_defaults<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+    ) -> Result<(
+        crate::storage::plaintext::VaultPlaintextView,
+        std::collections::BTreeSet<ItemNs>,
+    )> {
+        use crate::storage::item::rule;
         use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
 
-        // Start from the fresh-vault defaults; config items OVERRIDE their
-        // subtree, secret/connection/connecting/agent items fill their maps.
-        //
-        // Unified addressing (team §8.2): config singletons live at their own
-        // ns with the empty name. Legacy `aux:<name>` items are still parsed
-        // (read-compat for not-yet-migrated vaults) but NEW addresses win when
-        // both spellings exist mid-migration — precedence is tracked with
-        // `seen_new`, not item order (the id map iterates in hash order).
+        // Start from the fresh-vault defaults. Every record is read per its
+        // rule in the table (`ITEM_RULES`, its `read`): data records fill
+        // their maps; owner-config is collected per kind and applied after the
+        // loop (the id map iterates in hash order), native before legacy.
         let mut aux = VaultAux::initial();
         let mut native_secrets: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        #[derive(Default)]
-        struct SeenNew {
-            stores: bool,
-            store_order: bool,
-            policy: bool,
-            retention: bool,
-            services: bool,
-        }
-        let mut seen_new = SeenNew::default();
-        // Legacy values parked until the loop ends (applied only where no new-
-        // address item set the field).
-        let mut legacy_stores: Option<serde_json::Value> = None;
-        let mut legacy_store_order: Option<serde_json::Value> = None;
-        let mut legacy_policy: Option<serde_json::Value> = None;
-        let mut legacy_retention: Option<serde_json::Value> = None;
+        let mut native_secret_notes: BTreeMap<String, String> = BTreeMap::new();
+        let mut config = OwnerConfigFold::default();
         let mut legacy_services: Option<serde_json::Value> = None;
-        let mut legacy_addressing = false;
+        // Native `service` items (one per service id): live entries, and the
+        // ids a tombstone removes. Overlaid on the legacy `services` record
+        // after the loop: a native item wins for its id.
+        let mut native_services: BTreeMap<String, crate::service::source::StoredService> =
+            BTreeMap::new();
+        let mut native_removed: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
 
         // D: the verified OWNER-SET authorizes owner-config (owner-only). It is
         // now derived from the KEYSET (creator-rooted role grants), NOT from an
@@ -2071,6 +2970,7 @@ impl PerItemVault {
             ));
         }
 
+        let mut unreadable = 0usize;
         for (id_b64, stored) in &self.items {
             // Fold each item independently: a single unreadable/unparseable item
             // (seal-parity mismatch, a body shape from a newer client, a rotated
@@ -2080,391 +2980,578 @@ impl PerItemVault {
                 // recomputes its HMAC (design/agent-authz-cleartext-cutover.md).
                 let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
-                let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
-                if payload.is_tombstone() {
+                let (payload, _) = unseal_item_keys::<S>(keys, id_b64, &ctx, &stored.ct)?;
+                // A record without a rule is not read: the retired `stores:` /
+                // `services:` / `members`, a legacy `aux:agent/<id>` (only
+                // native, UIK-signed agent rows authorize), an unknown `aux` or
+                // `policy` name (fail closed).
+                let Some(r) = rule(payload.ns, &payload.name) else {
+                    return Ok(());
+                };
+                // One address per record: a row counts only at the derived id
+                // of its own (ns, name) (an agent's: its ag_id). A conflict
+                // copy is a record of its own name (`"<name> (conflict
+                // copy)"`) at that name's id, read like any other.
+                if wire_id_for::<S>(keys.id_seed, payload.ns, &payload.name)? != *id_b64 {
+                    tracing::warn!(vault = %vault_id, ns = %payload.ns.as_str(), wire = %id_b64, "fold: dropping a record that is not at its own id");
                     return Ok(());
                 }
-                let name = payload.name;
-                match payload.ns {
-                    ItemNs::Secret => {
-                        let s = payload.body.as_str().ok_or_else(|| {
-                            AppError::Internal(format!(
-                                "secret item '{}' body is not a string",
-                                name
-                            ))
-                        })?;
-                        native_secrets.insert(name, s.as_bytes().to_vec());
+                let sig_type = r.signature_type(&payload.name).map(str::to_string);
+                let owner_config = |body: serde_json::Value| {
+                    fold_owner_config_record(
+                        stored.sig.as_deref(),
+                        stored.signer.as_deref(),
+                        &stored.ct,
+                        &self.keyset,
+                        vault_id,
+                        &raw,
+                        payload.ns,
+                        sig_type.as_deref().unwrap_or(""),
+                        stored.version,
+                        body,
+                        &trust,
+                    )
+                };
+                let name = payload.name.clone();
+                let live = payload.status == crate::storage::item::ItemStatus::Live;
+                match r.read {
+                    // A data record like a connection (no signature), live or
+                    // tombstone: one item per service id.
+                    Read::DerivedIdOnlyUnionLegacy => {
+                        if !live {
+                            native_removed.insert(name);
+                        } else {
+                            let entry = serde_json::from_value(payload.body).map_err(|e| {
+                                AppError::Internal(format!("service '{}' parse: {}", name, e))
+                            })?;
+                            native_services.insert(name, entry);
+                        }
                     }
-                    ItemNs::Connection => {
-                        let conn = serde_json::from_value(payload.body).map_err(|e| {
-                            AppError::Internal(format!("connection '{}' parse: {}", name, e))
-                        })?;
-                        aux.connections.insert(name, conn);
-                    }
-                    ItemNs::Connecting => {
-                        let c = serde_json::from_value(payload.body).map_err(|e| {
-                            AppError::Internal(format!("connecting '{}' parse: {}", name, e))
-                        })?;
-                        aux.connecting.insert(name, c);
-                    }
-                    ItemNs::Agent => {
-                        // T2 (design/agent-authz-cleartext-cutover.md): a native agent
-                        // item MUST live at its own cleartext id (wire id == ag_id ==
-                        // name). Drop a body smuggled at any other id, so the backend
-                        // ownership gate on the ag_id cannot be dodged.
-                        if id_b64.as_str() != name.as_str() {
-                            tracing::warn!(vault = %vault_id, agent = %name, wire = %id_b64, "fold: dropping agent grant — wire id != ag_id");
+                    // Native owner-config; with a keyset only owner-signed
+                    // (sidecar type = the namespace). A tombstone counts too:
+                    // it removes its key, over the legacy row.
+                    Read::OwnerSignedWithKeysetNativeWins => {
+                        let ty = sig_type.as_deref().unwrap_or("");
+                        if !live {
+                            if owner_config_tombstone_honored(
+                                stored.sig.as_deref(),
+                                stored.signer.as_deref(),
+                                &stored.ct,
+                                &self.keyset,
+                                vault_id,
+                                &raw,
+                                ty,
+                                stored.version,
+                                &trust,
+                            ) {
+                                config.native(payload.ns, name, None);
+                            }
                             return Ok(());
                         }
-                        let raw_body = payload.body.clone();
-                        let cfg = format!("agent/{}", name);
-                        let Some((data, was_signed)) = fold_agent_record(
+                        match owner_config(payload.body) {
+                            Some(data) => config.native(payload.ns, name, Some(data)),
+                            None => {
+                                tracing::warn!(vault = %vault_id, ns = %payload.ns.as_str(), "fold: dropping owner-config — unauthorized/invalid owner signature")
+                            }
+                        }
+                    }
+                    _ if !live => {}
+                    Read::All => match payload.ns {
+                        ItemNs::Secret => {
+                            let (value, notes) = parse_secret_body(&payload.body).map_err(|e| {
+                                AppError::Internal(format!("secret item '{}': {}", name, e))
+                            })?;
+                            if let Some(n) = notes {
+                                native_secret_notes.insert(name.clone(), n);
+                            }
+                            native_secrets.insert(name, value.into_bytes());
+                        }
+                        ItemNs::Connection => {
+                            let conn = serde_json::from_value(payload.body).map_err(|e| {
+                                AppError::Internal(format!("connection '{}' parse: {}", name, e))
+                            })?;
+                            aux.connections.insert(name, conn);
+                        }
+                        ItemNs::Connecting => {
+                            let c = serde_json::from_value(payload.body).map_err(|e| {
+                                AppError::Internal(format!("connecting '{}' parse: {}", name, e))
+                            })?;
+                            aux.connecting.insert(name, c);
+                        }
+                        ItemNs::ServiceRequest => {
+                            aux.service_requests.insert(name, payload.body);
+                        }
+                        _ => {}
+                    },
+                    // T2 (design/agent-authz-cleartext-cutover.md): a native
+                    // agent item lives at its own cleartext id (wire id ==
+                    // ag_id == name, checked above), so the backend ownership
+                    // gate on the ag_id cannot be dodged.
+                    Read::SignerAuthorizedAndWireIdMatches => {
+                        let Some(data) = fold_agent_record(
                             stored.sig.as_deref(),
                             stored.signer.as_deref(),
                             &stored.ct,
                             &self.keyset,
                             vault_id,
                             &raw,
-                            &cfg,
                             stored.version,
                             payload.body,
                             &trust,
                         ) else {
-                            tracing::warn!(vault = %vault_id, agent = %name, "fold: dropping agent grant — unauthorized/invalid signature");
+                            tracing::warn!(vault = %vault_id, agent = %name, "fold: dropping agent grant — unsigned/unauthorized/invalid signature");
                             return Ok(());
                         };
-                        let mut entry: crate::storage::plaintext::AgentEntry =
+                        let entry: crate::storage::plaintext::AgentEntry =
                             serde_json::from_value(data).map_err(|e| {
                                 AppError::Internal(format!("agent '{}' parse: {}", name, e))
                             })?;
-                        entry.signed_body = was_signed.then_some(raw_body);
                         aux.agents.insert(name, entry);
                     }
-                    ItemNs::Policy => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "policy",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping policy — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.policy = Some(
-                            serde_json::from_value(data)
-                                .map_err(|e| AppError::Internal(format!("policy parse: {}", e)))?,
-                        );
-                        seen_new.policy = true;
-                    }
-                    ItemNs::Stores => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "stores",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping stores — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.stores = serde_json::from_value(data)
-                            .map_err(|e| AppError::Internal(format!("stores parse: {}", e)))?;
-                        seen_new.stores = true;
-                    }
-                    ItemNs::StoreOrder => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "store_order",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping store_order — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.store_order = serde_json::from_value(data)
-                            .map_err(|e| AppError::Internal(format!("store_order parse: {}", e)))?;
-                        seen_new.store_order = true;
-                    }
-                    ItemNs::AuditRetentionDays => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "audit_retention_days",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping audit_retention_days — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.audit_retention_days = serde_json::from_value(data).map_err(|e| {
-                            AppError::Internal(format!("audit_retention_days parse: {}", e))
-                        })?;
-                        seen_new.retention = true;
-                    }
-                    ItemNs::Services => {
-                        let Some(data) = fold_owner_config_record(
-                            stored.sig.as_deref(),
-                            stored.signer.as_deref(),
-                            &stored.ct,
-                            &self.keyset,
-                            vault_id,
-                            &raw,
-                            "services",
-                            stored.version,
-                            payload.body,
-                            &trust,
-                        ) else {
-                            tracing::warn!(vault = %vault_id, "fold: dropping services — unauthorized/invalid owner signature");
-                            return Ok(());
-                        };
-                        aux.services = serde_json::from_value(data)
-                            .map_err(|e| AppError::Internal(format!("services parse: {}", e)))?;
-                        seen_new.services = true;
-                    }
-                    ItemNs::Members => {
-                        // The in-vault membership is RETIRED (finding #1):
-                        // role now rides the keyset cred (owner-authority anchor,
-                        // §4.3), derived by `resolve_membership_trust`. Any
-                        // legacy `members:` item is ignored — never trusted for
-                        // roles, never folded back into the view.
-                    }
-                    ItemNs::Aux => {
-                        // Config singletons ride `aux:<name>` blobs (parked +
-                        // applied after the loop if no unified-ns item set the
-                        // field — the cosmetic `aux:` drop is deferred). AGENTS
-                        // are per-item `aux:agent/<id>` — one mask each,
-                        // independent CAS (team §8.1).
-                        legacy_addressing = true;
-                        // C.3: owner-config carries a UIK signature (or is legacy
-                        // raw). Verify+unwrap here; a bad signature parks `None`
-                        // (→ safe default). `config_name` is addressing-independent.
-                        // A legacy `aux:members` blob is ignored (membership retired).
-                        match name.as_str() {
-                            "stores" => {
-                                legacy_stores = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "stores",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            "store_order" => {
-                                legacy_store_order = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "store_order",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            "policy" => {
-                                legacy_policy = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "policy",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            "audit_retention_days" => {
-                                legacy_retention = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "audit_retention_days",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            "services" => {
-                                legacy_services = fold_owner_config_record(
-                                    stored.sig.as_deref(),
-                                    stored.signer.as_deref(),
-                                    &stored.ct,
-                                    &self.keyset,
-                                    vault_id,
-                                    &raw,
-                                    "services",
-                                    stored.version,
-                                    payload.body,
-                                    &trust,
-                                )
-                            }
-                            n => {
-                                if let Some(agent_id) = n.strip_prefix("agent/") {
-                                    // §11.1 authorized-agents table row — sidecar
-                                    // item-sig (A1.2) preferred, in-body config-sig
-                                    // fallback. Verify + authorize; a bad /
-                                    // unauthorized row drops (that ag_id is simply
-                                    // not in the table). The verified signed body is
-                                    // retained for lossless re-emit.
-                                    let raw_body = payload.body.clone();
-                                    let Some((data, was_signed)) = fold_agent_record(
-                                        stored.sig.as_deref(),
-                                        stored.signer.as_deref(),
-                                        &stored.ct,
-                                        &self.keyset,
-                                        vault_id,
-                                        &raw,
-                                        n,
-                                        stored.version,
-                                        payload.body,
-                                        &trust,
-                                    ) else {
-                                        tracing::warn!(vault = %vault_id, agent = %agent_id, "fold: dropping agent grant — unauthorized/invalid signature");
-                                        return Ok(());
-                                    };
-                                    let mut entry: crate::storage::plaintext::AgentEntry =
-                                        serde_json::from_value(data).map_err(|e| {
-                                            AppError::Internal(format!(
-                                                "agent '{}' parse: {}",
-                                                agent_id, e
-                                            ))
-                                        })?;
-                                    entry.signed_body = was_signed.then_some(raw_body);
-                                    // Per-item row is authoritative for its id;
-                                    // it overrides anything a legacy blob carried.
-                                    aux.agents.insert(agent_id.to_string(), entry);
-                                }
-                                // other unknown aux names: ignored (forward-compat).
-                            }
+                    // LEGACY(aux addressing): `aux:<field>`, whose entries
+                    // apply to the keys without an honored native record
+                    // ([`OwnerConfigFold::apply`]). C.3: a bad / missing
+                    // signature drops it (→ safe default).
+                    Read::LegacyWhenNoHonoredNative => {
+                        if let Some(data) = owner_config(payload.body) {
+                            config.legacy(&name, data);
                         }
                     }
+                    // LEGACY(services row): unioned under the native items.
+                    Read::LegacyUnionNativeWins => {
+                        legacy_services = owner_config(payload.body);
+                    }
+                    Read::ConsoleOnly => {}
                 }
                 Ok(())
             })();
             if let Err(e) = one {
-                tracing::warn!(item = %id_b64, "fold: skipping unreadable item: {}", e);
+                // Not a version problem (a too-new vault format is refused before
+                // this, via the signed envelope): this record is unreadable as is.
+                unreadable += 1;
+                tracing::warn!(vault = %vault_id, item = %id_b64, "fold: skipping unreadable item: {}", e);
             }
         }
 
-        // Apply parked legacy values where no new-address item set the field.
-        if !seen_new.stores {
-            if let Some(v) = legacy_stores {
-                aux.stores = serde_json::from_value(v)
-                    .map_err(|e| AppError::Internal(format!("aux.stores parse: {}", e)))?;
+        // LEGACY(services row): the services are the union of the legacy
+        // `services` record (owner-config, read only; moved to native items by
+        // the migration) and the native `service` items; a native tombstone
+        // hides the legacy entry of its id, a native live item replaces it.
+        // A legacy record that does not parse is skipped like any unreadable
+        // record. Drop the legacy half with the legacy record.
+        if let Some(v) = legacy_services {
+            match serde_json::from_value(v) {
+                Ok(services) => aux.services = services,
+                Err(e) => {
+                    unreadable += 1;
+                    tracing::warn!(vault = %vault_id, "fold: skipping the legacy services record: {}", e);
+                }
             }
         }
-        if !seen_new.store_order {
-            if let Some(v) = legacy_store_order {
-                aux.store_order = serde_json::from_value(v)
-                    .map_err(|e| AppError::Internal(format!("aux.store_order parse: {}", e)))?;
-            }
+        for id in native_removed {
+            aux.services.remove(&id);
         }
-        if !seen_new.policy {
-            if let Some(v) = legacy_policy {
-                aux.policy = Some(
-                    serde_json::from_value(v)
-                        .map_err(|e| AppError::Internal(format!("aux.policy parse: {}", e)))?,
-                );
-            }
-        }
-        if !seen_new.retention {
-            if let Some(v) = legacy_retention {
-                aux.audit_retention_days = serde_json::from_value(v).map_err(|e| {
-                    AppError::Internal(format!("aux.audit_retention_days parse: {}", e))
-                })?;
-            }
-        }
-        if !seen_new.services {
-            if let Some(v) = legacy_services {
-                aux.services = serde_json::from_value(v)
-                    .map_err(|e| AppError::Internal(format!("aux.services parse: {}", e)))?;
-            }
-        }
-        // No `members` legacy blob to merge: the in-vault membership is retired
-        // (finding #1); role lives on the keyset cred (owner-authority anchor).
+        aux.services.extend(native_services);
 
-        Ok(VaultPlaintextView {
-            aux,
-            native_secrets,
-            legacy_addressing,
-        })
+        if let Ok(mut m) = UNREADABLE_ITEMS.lock() {
+            if unreadable > 0 {
+                m.insert(vault_id.to_string(), unreadable);
+            } else {
+                m.remove(vault_id);
+            }
+        }
+
+        // Owner-config per key: the legacy rows' entries, overlaid by the
+        // honored native records; a kind with no entry left: its default.
+        let defaults = config.apply(&mut aux)?;
+
+        Ok((
+            VaultPlaintextView {
+                aux,
+                native_secrets,
+                native_secret_notes,
+            },
+            defaults,
+        ))
     }
 
-    /// One-shot migration to the unified addressing (team §8.3 "升级即切换").
-    /// If the vault still holds live legacy `aux:*` items: fold, re-write every
-    /// config singleton at its new address, and tombstone the legacy rows —
-    /// all version-bumped so sync pushes them as normal item changes. Idempotent
-    /// (second call folds to `legacy_addressing == false` and does nothing).
-    /// Returns the changed item ids (empty = already migrated). The caller is
-    /// responsible for (a) writing a plaintext snapshot BEFORE calling this and
-    /// (b) marking the vault `format=2` server-side AFTER the push succeeds.
-    pub fn migrate_addressing<S: PrimitiveSuite>(
+    /// LEGACY(aux addressing, services row): the legacy rows the fold reads,
+    /// live, each with the native records its entries become:
+    /// `aux:policy` → `policy:` + `policy:category:<tag>` +
+    /// `policy:connection:<id>`, `aux:stores` → `store:<id>`,
+    /// `aux:store_order` → `store_order:`, `aux:audit_retention_days` →
+    /// `audit_retention_days:`, `aux:services` → `service:<id>` (object
+    /// form). Each row on its own: one that is absent, unreadable, a
+    /// tombstone, not honored or does not parse is left out (and left as it
+    /// is). `aux:secret_order` is the console's.
+    fn legacy_rows<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+        trust: &MembershipTrust,
+    ) -> Vec<(&'static str, Vec<Record>)> {
+        let mut out = Vec::new();
+        for field in [
+            "policy",
+            "stores",
+            "store_order",
+            "audit_retention_days",
+            "services",
+        ] {
+            let one = || -> Result<Option<Vec<Record>>> {
+                let wire = wire_id_for::<S>(keys.id_seed, ItemNs::Aux, field)?;
+                let Some(stored) = self.items.get(&wire) else {
+                    return Ok(None);
+                };
+                let raw = item_id_bytes::<S>(keys.id_seed, ItemNs::Aux.as_str(), field)?;
+                let (payload, _) = unseal_item_keys::<S>(
+                    keys,
+                    &wire,
+                    &ItemCtx::new(vault_id, raw, stored.version),
+                    &stored.ct,
+                )?;
+                if payload.is_tombstone() || payload.ns != ItemNs::Aux || payload.name != field {
+                    return Ok(None);
+                }
+                let Some(data) = fold_owner_config_record(
+                    stored.sig.as_deref(),
+                    stored.signer.as_deref(),
+                    &stored.ct,
+                    &self.keyset,
+                    vault_id,
+                    &raw,
+                    ItemNs::Aux,
+                    field,
+                    stored.version,
+                    payload.body,
+                    trust,
+                ) else {
+                    return Ok(None);
+                };
+                if field != "services" {
+                    return legacy_field_items(field, data).map(Some);
+                }
+                let entries: BTreeMap<String, crate::service::source::StoredService> =
+                    parse_config("aux.services", data)?;
+                entries
+                    .iter()
+                    .map(|(id, e)| {
+                        let body = normalized_body(ItemNs::Service, id, &to_json(e)?);
+                        Ok(((ItemNs::Service, id.clone()), body))
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .map(Some)
+            };
+            match one() {
+                Ok(Some(items)) => out.push((field, items)),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(vault = %vault_id, field, "legacy row left as it is: {}", e)
+                }
+            }
+        }
+        out
+    }
+
+    /// How the native record at `(ns, name)` reads for the migration (see
+    /// [`NativeKey`]).
+    fn native_key<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+        trust: &MembershipTrust,
+        ns: ItemNs,
+        name: &str,
+    ) -> NativeKey {
+        let Ok(wire) = wire_id_for::<S>(keys.id_seed, ns, name) else {
+            return NativeKey::Unreadable;
+        };
+        let Some(stored) = self.items.get(&wire) else {
+            return NativeKey::Absent;
+        };
+        let Ok(raw) = item_id_bytes::<S>(keys.id_seed, ns.as_str(), name) else {
+            return NativeKey::Unreadable;
+        };
+        let Ok((payload, _)) = unseal_item_keys::<S>(
+            keys,
+            &wire,
+            &ItemCtx::new(vault_id, raw, stored.version),
+            &stored.ct,
+        ) else {
+            return NativeKey::Unreadable;
+        };
+        let honored = payload.ns == ns
+            && payload.name == name
+            && if !is_owner_config_ns(ns) {
+                true // a data record (a service), at its own id
+            } else {
+                let ty = crate::storage::item::rule(ns, name)
+                    .and_then(|r| r.signature_type(name))
+                    .unwrap_or("");
+                if payload.is_tombstone() {
+                    owner_config_tombstone_honored(
+                        stored.sig.as_deref(),
+                        stored.signer.as_deref(),
+                        &stored.ct,
+                        &self.keyset,
+                        vault_id,
+                        &raw,
+                        ty,
+                        stored.version,
+                        trust,
+                    )
+                } else {
+                    fold_owner_config_record(
+                        stored.sig.as_deref(),
+                        stored.signer.as_deref(),
+                        &stored.ct,
+                        &self.keyset,
+                        vault_id,
+                        &raw,
+                        ns,
+                        ty,
+                        stored.version,
+                        payload.body,
+                        trust,
+                    )
+                    .is_some()
+                }
+            };
+        if honored {
+            NativeKey::Decided {
+                on_cloud: stored.synced_version >= stored.version,
+            }
+        } else {
+            NativeKey::NotHonored
+        }
+    }
+
+    /// LEGACY(aux addressing, services row), step 1 of the migration on a
+    /// vault without a keyset: copy every entry of every legacy row the fold
+    /// reads ([`Self::legacy_rows`]) to its native record, unsigned, where no
+    /// honored native record decides its key yet (one the fold drops is
+    /// replaced; an unreadable one is left as it is). The legacy rows stay:
+    /// [`Self::retire_legacy_rows`] tombstones one only once every copy is
+    /// confirmed on the cloud. The fold reads the same before and after. On a
+    /// vault with a keyset this process writes nothing (the owner's console
+    /// migrates, signed). Run only after a pull. Returns the item ids written.
+    pub fn migrate_legacy_copies<S: PrimitiveSuite>(
         &mut self,
         keys: VaultKeys,
         vault_id: &str,
-    ) -> Result<Vec<String>> {
-        let view = self.fold_view::<S>(keys, vault_id)?;
-        if !view.legacy_addressing {
-            return Ok(Vec::new());
+    ) -> Vec<String> {
+        if self.keyset.uik.is_some() {
+            return Vec::new();
         }
-        // Reconcile writes every config singleton at its NEW address (the
-        // mapping lives in `singleton_bodies`, shared with seed).
-        let mut changed = self.reconcile_from_view::<S>(keys, vault_id, &view)?;
-        // Tombstone every live legacy aux row (known + unknown names alike —
-        // the namespace is retired wholesale).
-        let legacy: Vec<String> = self
-            .live_names_in_ns::<S>(keys, vault_id, ItemNs::Aux)?
-            .into_iter()
-            .collect();
-        for name in legacy {
-            let (id, _v) = self.seal_and_bump::<S>(
+        let trust = self.resolve_membership_trust(vault_id);
+        let mut changed = Vec::new();
+        for (field, items) in self.legacy_rows::<S>(keys, vault_id, &trust) {
+            for ((ns, name), body) in items {
+                if !matches!(
+                    self.native_key::<S>(keys, vault_id, &trust, ns, &name),
+                    NativeKey::Absent | NativeKey::NotHonored
+                ) {
+                    continue;
+                }
+                let payload = ItemPayload::live(ns, name.clone(), body);
+                match self.seal_and_bump::<S>(keys, vault_id, ns, &name, &payload) {
+                    Ok((iid, _)) => {
+                        self.mark_upgrade(&iid);
+                        changed.push(iid)
+                    }
+                    Err(e) => {
+                        tracing::warn!(vault = %vault_id, field, "legacy copy not written: {}", e)
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// LEGACY(aux addressing, services row), step 2: tombstone each legacy
+    /// row the fold reads whose every entry is decided by an honored native
+    /// record that the cloud holds (`on_cloud`; a device without a cloud:
+    /// held locally), so no reader ever sees the legacy row gone before its
+    /// copies. A row with a copy still unconfirmed (not pushed yet, failed,
+    /// refused) stays live and is retired on a later run. A vault with a
+    /// keyset: nothing. Returns the item ids written.
+    pub fn retire_legacy_rows<S: PrimitiveSuite>(
+        &mut self,
+        keys: VaultKeys,
+        vault_id: &str,
+        on_cloud: bool,
+    ) -> Vec<String> {
+        if self.keyset.uik.is_some() {
+            return Vec::new();
+        }
+        let trust = self.resolve_membership_trust(vault_id);
+        let mut changed = Vec::new();
+        for (field, items) in self.legacy_rows::<S>(keys, vault_id, &trust) {
+            let all_held = items.iter().all(|((ns, name), _)| {
+                matches!(
+                    self.native_key::<S>(keys, vault_id, &trust, *ns, name),
+                    NativeKey::Decided { on_cloud: held } if held || !on_cloud
+                )
+            });
+            if !all_held {
+                continue;
+            }
+            match self.seal_and_bump::<S>(
                 keys,
                 vault_id,
                 ItemNs::Aux,
-                &name,
-                &ItemPayload::tombstone(ItemNs::Aux, name.clone()),
-            )?;
-            changed.push(id);
+                field,
+                &ItemPayload::tombstone(ItemNs::Aux, field),
+            ) {
+                Ok((iid, _)) => {
+                    self.mark_upgrade(&iid);
+                    changed.push(iid)
+                }
+                Err(e) => tracing::warn!(vault = %vault_id, field, "legacy row not retired: {}", e),
+            }
         }
-        Ok(changed)
+        changed
+    }
+
+    /// Mark the row at `iid` as written by SafeClaw's automatic upgrade.
+    fn mark_upgrade(&mut self, iid: &str) {
+        if let Some(s) = self.items.get_mut(iid) {
+            s.upgrade = true;
+        }
+    }
+
+    /// Why adopting `incoming` over the local row at `wire` is held back, or
+    /// `None` to adopt: it would replace an owner-config record the fold
+    /// honors (native or legacy, live or tombstone) with one it does not
+    /// honor or cannot read; then the local row is kept, the last honored
+    /// value. Only a vault with a keyset has owner-config the fold drops;
+    /// without one this is always `None`.
+    pub(crate) fn unhonored_replacement<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+        wire: &str,
+        incoming: &StoredItem,
+    ) -> Option<&'static str> {
+        if self.keyset.uik.is_none() {
+            return None;
+        }
+        let local = self.items.get(wire)?;
+        let trust = self.resolve_membership_trust(vault_id);
+        let read = |stored: &StoredItem| -> Option<bool> {
+            let raw = aad_id_from_wire::<S>(keys.id_seed, wire).ok()?;
+            let (payload, _) = unseal_item_keys::<S>(
+                keys,
+                wire,
+                &ItemCtx::new(vault_id, raw, stored.version),
+                &stored.ct,
+            )
+            .ok()?;
+            let r = crate::storage::item::rule(payload.ns, &payload.name)?;
+            if r.signed != crate::storage::item::Signed::OwnerWithKeyset
+                || wire_id_for::<S>(keys.id_seed, payload.ns, &payload.name).ok()? != wire
+            {
+                return Some(false);
+            }
+            let ty = r.signature_type(&payload.name).unwrap_or("");
+            Some(if payload.is_tombstone() {
+                owner_config_tombstone_honored(
+                    stored.sig.as_deref(),
+                    stored.signer.as_deref(),
+                    &stored.ct,
+                    &self.keyset,
+                    vault_id,
+                    &raw,
+                    ty,
+                    stored.version,
+                    &trust,
+                )
+            } else {
+                fold_owner_config_record(
+                    stored.sig.as_deref(),
+                    stored.signer.as_deref(),
+                    &stored.ct,
+                    &self.keyset,
+                    vault_id,
+                    &raw,
+                    payload.ns,
+                    ty,
+                    stored.version,
+                    payload.body,
+                    &trust,
+                )
+                .is_some()
+            })
+        };
+        if read(local) != Some(true) {
+            return None;
+        }
+        match read(incoming) {
+            Some(true) => None,
+            Some(false) => Some(HELD_NOT_OWNER_SIGNED),
+            None => Some(HELD_UNREADABLE),
+        }
+    }
+
+    /// Whether [`Self::unhonored_replacement`] holds `incoming` back.
+    #[cfg(test)]
+    pub(crate) fn keeps_honored_owner_config<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+        wire: &str,
+        incoming: &StoredItem,
+    ) -> bool {
+        self.unhonored_replacement::<S>(keys, vault_id, wire, incoming)
+            .is_some()
+    }
+
+    /// Record what each row not yet classified addresses ([`RowKind`]),
+    /// reading it with the vault key: a data record at its own derived id is
+    /// [`RowKind::Data`]; owner-config, an agent grant, or a row not at its
+    /// own address is [`RowKind::Guarded`]. An id is the HMAC of its record's
+    /// name, so what it addresses never changes. A row this key cannot open
+    /// stays unclassified (read again next time). Ids no longer stored are
+    /// forgotten.
+    pub fn classify_rows<S: PrimitiveSuite>(&mut self, keys: VaultKeys, vault_id: &str) {
+        let items = &self.items;
+        self.row_kinds.retain(|id, _| items.contains_key(id));
+        let todo: Vec<String> = self
+            .items
+            .keys()
+            .filter(|id| !self.row_kinds.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in todo {
+            if crate::storage::item::is_agent_wire_id(&id) {
+                self.row_kinds.insert(id, RowKind::Guarded);
+                continue;
+            }
+            let stored = &self.items[&id];
+            let Ok(payload) = open_wire_item::<S>(keys, vault_id, &id, stored.version, &stored.ct)
+            else {
+                continue;
+            };
+            let data = crate::storage::item::rule(payload.ns, &payload.name).is_some_and(|r| {
+                r.conflict != Conflict::OwnerConfig
+                    && payload.ns != ItemNs::Agent
+                    && wire_id_for::<S>(keys.id_seed, payload.ns, &payload.name)
+                        .is_ok_and(|w| w == id)
+            });
+            self.row_kinds.insert(
+                id,
+                if data {
+                    RowKind::Data
+                } else {
+                    RowKind::Guarded
+                },
+            );
+        }
     }
 
     /// Names of live (non-tombstone) items in one namespace. Unreadable items
     /// are skipped with a warning (same fault isolation as the fold).
+    #[cfg(test)]
     fn live_names_in_ns<S: PrimitiveSuite>(
         &self,
         keys: VaultKeys,
@@ -2477,7 +3564,7 @@ impl PerItemVault {
                 // Cleartext agent wire ids recompute their HMAC AAD; blinded decode.
                 let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
-                let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
+                let (payload, _) = unseal_item_keys::<S>(keys, id_b64, &ctx, &stored.ct)?;
                 if payload.ns == want && !payload.is_tombstone() {
                     out.push(payload.name);
                 }
@@ -2490,6 +3577,16 @@ impl PerItemVault {
         Ok(out)
     }
 }
+
+/// A held replacement's reason: not signed by an owner of the vault.
+pub const HELD_NOT_OWNER_SIGNED: &str =
+    "it is not signed by an owner of this vault; the owner-signed setting stays in force";
+/// A held replacement's reason: it cannot be read with the vault key.
+pub const HELD_UNREADABLE: &str =
+    "it cannot be read with this vault's key; the owner-signed setting stays in force";
+/// A held replacement's reason: the vault is locked.
+pub const HELD_LOCKED: &str =
+    "the vault is locked; it is checked with the vault key at unlock";
 
 /// Read the per-item vault file. `None` if it doesn't exist. (New per-item
 /// format; NOT interchangeable with [`read`]'s whole-blob `SealedState`.)
@@ -2523,7 +3620,7 @@ pub fn write_per_item_atomic(path: &Path, vault: &PerItemVault) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     // Test fixture encodes credential_id with base64url-no-pad to match
     // `decode_credential_id`'s wire format (the WebAuthn convention).
@@ -2805,15 +3902,275 @@ mod tests {
         );
     }
 
-    // T1 addressing: config singletons ride single `aux:<name>` blobs
-    // (console-compatible; the cosmetic `aux:` drop is the deferred cutover).
-    // AGENTS are PER-ITEM `aux:agent/<id>` — one item each, so two members
-    // editing their own agents never clobber (independent CAS). This asserts the
-    // seed → fold round-trip, per-item agent addressing, and that a dropped agent
-    // tombstones only its own row. (The in-vault `members` membership is retired —
-    // finding #1 — so it is no longer part of the fold round-trip.)
+    // `ReconcileBase`: only a difference from the view's base is the caller's.
+    // B was pulled into the store after the base was taken (in neither base nor
+    // view) and C was changed by a pull to a newer value the stale base/view
+    // still holds the old one of: neither is dropped or reverted under `Since`.
     #[test]
-    fn t1_agents_are_per_item_config_and_members_are_blobs() {
+    fn reconcile_is_relative_to_the_base() {
+        use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
+        use sudp::primitives::StdPrimitives;
+        let k = [0x56u8; 32];
+        let vid = "vault-del";
+        let keys = VaultKeys::single(&k);
+        let view_of = |pairs: &[(&str, &str)]| VaultPlaintextView {
+            aux: VaultAux::initial(),
+            native_secrets: pairs
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
+                .collect(),
+            native_secret_notes: Default::default(),
+        };
+        // The store: A, B (pulled), C at its NEWER pulled value, D.
+        let store = || {
+            let mut pv = PerItemVault::build_initial(
+                b"c".to_vec(),
+                "x".into(),
+                "y".into(),
+                "Dev".into(),
+                vec![0u8; 32],
+                vec![0u8; 48],
+            )
+            .unwrap();
+            pv.seed_items_from_view::<StdPrimitives>(
+                keys,
+                vid,
+                &view_of(&[("A", "a"), ("B", "b"), ("C", "new"), ("D", "d")]),
+            )
+            .unwrap();
+            pv
+        };
+        let live = |pv: &PerItemVault| -> Vec<(String, String)> {
+            pv.fold_view::<StdPrimitives>(keys, vid)
+                .unwrap()
+                .native_secrets
+                .into_iter()
+                .map(|(n, v)| (n, String::from_utf8(v).unwrap()))
+                .collect()
+        };
+        let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        // The caller's base predates the pulls (no B, old C); it deletes A and
+        // sets D.
+        let base = ViewBase::of(&view_of(&[("A", "a"), ("C", "old"), ("D", "d")])).unwrap();
+        let view = view_of(&[("C", "old"), ("D", "d2")]);
+
+        let mut pv = store();
+        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(
+            live(&pv),
+            pairs(&[("B", "b"), ("C", "new"), ("D", "d2")]),
+            "only the caller's delete (A) and edit (D) apply; pulled B and C survive"
+        );
+
+        // OwnFold: every difference is the caller's.
+        let mut pv = store();
+        pv.reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::OwnFold)
+            .unwrap();
+        assert_eq!(live(&pv), pairs(&[("C", "old"), ("D", "d2")]));
+    }
+
+    // §4 under `Since`: the caller changed K while a pull changed K too (the
+    // stored row no longer matches the base). A keep-both ns keeps THEIRS at the
+    // canonical id and OURS as its DIRTY conflict copy, the record "K
+    // (conflict copy)"; owner-config is never written over (reported).
+    // Idempotent.
+    #[test]
+    fn reconcile_keeps_both_on_a_concurrent_same_item_change() {
+        use crate::storage::item::{self as il};
+        use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
+        use sudp::primitives::StdPrimitives;
+        let k = [0x57u8; 32];
+        let vid = "vault-kb";
+        let keys = VaultKeys::single(&k);
+        let view_of = |k_val: &str, days: u32| {
+            let mut aux = VaultAux::initial();
+            aux.audit_retention_days = Some(days);
+            VaultPlaintextView {
+                aux,
+                native_secrets: [("K".to_string(), k_val.as_bytes().to_vec())].into(),
+                native_secret_notes: Default::default(),
+            }
+        };
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        // The store holds THEIR values (pulled after the base): K, retention 14.
+        pv.seed_items_from_view::<StdPrimitives>(keys, vid, &view_of("theirs", 14))
+            .unwrap();
+        for s in pv.items.values_mut() {
+            s.synced_version = s.version;
+        }
+        let k_id = il::wire_id_for::<StdPrimitives>(&k, ItemNs::Secret, "K").unwrap();
+        let their_k = pv.get_item(&k_id).unwrap().clone();
+
+        // The caller read the base (K "base", 7) and changed both.
+        let base = ViewBase::of(&view_of("base", 7)).unwrap();
+        let view = view_of("ours", 30);
+        let reconciled = pv
+            .reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
+            .unwrap();
+
+        // K: theirs untouched (still clean); ours is a dirty local conflict copy.
+        let k_now = pv.get_item(&k_id).unwrap();
+        assert_eq!(
+            (k_now.version, k_now.synced_version, k_now.ct.clone()),
+            (their_k.version, their_k.version, their_k.ct.clone())
+        );
+        // The copy is a record of its own name at that name's id: dirty, a
+        // create on the next push.
+        let copy_id =
+            il::wire_id_for::<StdPrimitives>(&k, ItemNs::Secret, &il::conflict_copy_name("K"))
+                .unwrap();
+        let copy = pv.get_item(&copy_id).expect("local conflict copy").clone();
+        assert_eq!((copy.version, copy.synced_version), (1, 0));
+        let folded = pv.fold_view::<StdPrimitives>(keys, vid).unwrap();
+        assert_eq!(folded.native_secrets["K"], b"theirs");
+        assert_eq!(folded.native_secrets[&il::conflict_copy_name("K")], b"ours");
+        // Owner-config: never written over theirs, also without a keyset. Ours
+        // is not written and is reported for a re-run.
+        assert_eq!(folded.aux.audit_retention_days, Some(14));
+        let r_id = il::wire_id_for::<StdPrimitives>(&k, ItemNs::AuditRetentionDays, "").unwrap();
+        assert_eq!(
+            reconciled.set_aside,
+            [(r_id.clone(), "audit_retention_days".to_string())]
+        );
+        let theirs_r = pv.get_item(&r_id).unwrap();
+        assert_eq!(
+            theirs_r.version, theirs_r.synced_version,
+            "theirs untouched"
+        );
+        assert!(reconciled.changed.contains(&copy_id));
+        assert!(!reconciled.changed.contains(&r_id));
+
+        // Idempotent: a second reconcile adds no second copy (the same
+        // content is already there).
+        let n = pv.items.len();
+        let again = pv
+            .reconcile_from_view::<StdPrimitives>(keys, vid, &view, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(pv.items.len(), n);
+        assert_eq!(again.set_aside.len(), 1, "still reported");
+    }
+
+    // keep_both, the base rule: the stored row changed since the caller's base
+    // but its body equals the base (normalized: e.g. another device only
+    // copied a legacy plain-text service entry to a native item in the object
+    // form) is no conflict: ours applies, and the dirty row records the base
+    // it was made from (the push applies the same rule to a 409).
+    #[test]
+    fn reconcile_applies_ours_when_theirs_equals_the_base() {
+        use crate::service::source::StoredService;
+        use crate::storage::item::{self as il};
+        use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x58u8; 32];
+        let vid = "vault-base";
+        let keys = VaultKeys::single(&k);
+        let text = |host: &str| format!("[service]\nid = \"acme\"\nhosts = [\"{host}\"]\n");
+        let view_with = |entry: StoredService| {
+            let mut aux = VaultAux::initial();
+            aux.services.insert("acme".into(), entry);
+            VaultPlaintextView {
+                aux,
+                native_secrets: Default::default(),
+                native_secret_notes: Default::default(),
+            }
+        };
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        // Another device copied the entry (plain text in our base) as a native
+        // item in the object form; we pulled it.
+        pv.seal_and_bump::<S>(
+            keys,
+            vid,
+            ItemNs::Service,
+            "acme",
+            &ItemPayload::live(
+                ItemNs::Service,
+                "acme",
+                serde_json::json!({ "service": text("a.old") }),
+            ),
+        )
+        .unwrap();
+        for s in pv.items.values_mut() {
+            s.synced_version = s.version;
+        }
+        let base = ViewBase::of(&view_with(StoredService::from(text("a.old")))).unwrap();
+        let ours = view_with(StoredService::new(text("a.new"), None, None));
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &ours, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(r.set_aside.is_empty());
+        let id = il::wire_id_for::<S>(&k, ItemNs::Service, "acme").unwrap();
+        assert_eq!(r.changed, [id.clone()], "ours applied, no conflict copy");
+        let row = pv.get_item(&id).unwrap();
+        assert!(row.version > row.synced_version, "dirty");
+        assert_eq!(
+            row.base.as_deref(),
+            Some(
+                il::body_digest_hex(ItemNs::Service, "acme", &serde_json::json!(text("a.old")))
+                    .as_str()
+            ),
+            "the base it was made from"
+        );
+        assert_eq!(
+            pv.open_item::<S>(keys, vid, ItemNs::Service, "acme")
+                .unwrap()
+                .unwrap()
+                .body,
+            serde_json::json!({ "service": text("a.new") })
+        );
+        // A second change before the push keeps the first base.
+        let ours2 = view_with(StoredService::new(text("a.newer"), None, None));
+        let base2 = ViewBase::of(&ours).unwrap();
+        pv.reconcile_from_view::<S>(keys, vid, &ours2, ReconcileBase::Since(&base2))
+            .unwrap();
+        assert_eq!(
+            pv.get_item(&id).unwrap().base.as_deref(),
+            Some(
+                il::body_digest_hex(ItemNs::Service, "acme", &serde_json::json!(text("a.old")))
+                    .as_str()
+            )
+        );
+        // A plain-text entry in a view is written in the object form.
+        let plain = view_with(StoredService::from(text("a.plain")));
+        let base3 = ViewBase::of(&pv.fold_view::<S>(keys, vid).unwrap()).unwrap();
+        pv.reconcile_from_view::<S>(keys, vid, &plain, ReconcileBase::Since(&base3))
+            .unwrap();
+        assert_eq!(
+            pv.open_item::<S>(keys, vid, ItemNs::Service, "acme")
+                .unwrap()
+                .unwrap()
+                .body,
+            serde_json::json!({ "service": text("a.plain") })
+        );
+    }
+
+    // The daemon NEVER writes authorized-agents rows (any spelling, live or
+    // tombstone): it holds no UIK, so it cannot sign one. Seed + reconcile from a
+    // view that carries agents emit only config; dropping an agent from the view
+    // writes no tombstone; and the seal primitive itself refuses agent rows.
+    #[test]
+    fn daemon_never_writes_agent_rows() {
         use crate::storage::plaintext::{AgentEntry, AgentMask, VaultAux};
         use sudp::primitives::StdPrimitives;
         let k = [0x55u8; 32];
@@ -2839,81 +4196,111 @@ mod tests {
                 },
                 ..Default::default()
             },
-        ); // blacklist
-        aux.agents.insert("ag_bob".into(), AgentEntry::default()); // "all"
+        );
+        aux.agents.insert("ag_bob".into(), AgentEntry::default());
         let view = crate::storage::plaintext::VaultPlaintextView {
             aux,
             native_secrets: std::collections::BTreeMap::new(),
-            legacy_addressing: false,
+            native_secret_notes: std::collections::BTreeMap::new(),
         };
         pv.seed_items_from_view::<StdPrimitives>(VaultKeys::single(&k), vid, &view)
             .unwrap();
+        let items_after_seed = pv.items.len();
 
+        // Config round-trips (NoUik keyset: integrity-only); agents were NOT written.
         let folded = pv
             .fold_view::<StdPrimitives>(VaultKeys::single(&k), vid)
             .unwrap();
         assert_eq!(folded.aux.policy.as_ref().unwrap().timeout, Some(222));
-        // Blacklist survives the seed → fold round-trip: denied conn refused,
-        // everything else (incl. ids never listed) allowed (fail-open).
-        assert!(matches!(
-            folded.aux.agents["ag_alice"].connections,
-            AgentMask::Blocked { .. }
-        ));
         assert!(
-            !folded.aux.agents["ag_alice"].connections.allows("stripe"),
-            "blacklist denies"
+            folded.aux.agents.is_empty(),
+            "daemon seed wrote no agent rows"
         );
-        assert!(
-            folded.aux.agents["ag_alice"].connections.allows("gmail"),
-            "blacklist allows non-denied"
-        );
-        assert!(
-            folded.aux.agents["ag_alice"]
-                .connections
-                .allows("added-later-conn"),
-            "blacklist allows unknown/new (fail-open)"
-        );
-        assert!(
-            folded.aux.agents["ag_bob"].connections.allows("anything"),
-            "all"
-        );
-
-        // Per-item: each agent is its OWN `aux:agent/<id>` item (independent
-        // CAS), NOT a shared blob and NOT a new-ns row.
         let aux_names = pv
             .live_names_in_ns::<StdPrimitives>(VaultKeys::single(&k), vid, ItemNs::Aux)
             .unwrap();
-        assert!(aux_names.contains(&"agent/ag_alice".to_string()));
-        assert!(aux_names.contains(&"agent/ag_bob".to_string()));
         assert!(
-            !aux_names.contains(&"agents".to_string()),
-            "no shared agents blob"
+            !aux_names.iter().any(|n| n.starts_with("agent/")),
+            "no legacy aux:agent rows"
         );
         assert!(
             pv.live_names_in_ns::<StdPrimitives>(VaultKeys::single(&k), vid, ItemNs::Agent)
                 .unwrap()
                 .is_empty(),
-            "T1 keeps agents under aux:, not the deferred agent: ns"
+            "no native agent rows"
         );
 
-        // Drop ag_bob (offboard/delete) — reconcile tombstones ONLY its row;
-        // ag_alice's item is untouched (the anti-clobber property).
-        let mut view2 = pv
-            .fold_view::<StdPrimitives>(VaultKeys::single(&k), vid)
-            .unwrap();
-        view2.aux.agents.remove("ag_bob");
-        pv.reconcile_from_view::<StdPrimitives>(VaultKeys::single(&k), vid, &view2)
-            .unwrap();
-        let after = pv
-            .fold_view::<StdPrimitives>(VaultKeys::single(&k), vid)
-            .unwrap();
+        // Reconcile from a view that still carries agents (and then one that drops
+        // one): no agent row is upserted, and no tombstone is written.
+        let changed = pv
+            .reconcile_from_view::<StdPrimitives>(
+                VaultKeys::single(&k),
+                vid,
+                &view,
+                ReconcileBase::OwnFold,
+            )
+            .unwrap()
+            .changed;
         assert!(
-            after.aux.agents.contains_key("ag_alice"),
-            "other agent survives"
+            changed.is_empty(),
+            "agents in the view write nothing: {:?}",
+            changed
         );
-        assert!(
-            !after.aux.agents.contains_key("ag_bob"),
-            "dropped agent tombstoned"
+        let mut view2 = crate::storage::plaintext::VaultPlaintextView {
+            aux: view.aux.clone(),
+            native_secrets: view.native_secrets.clone(),
+            native_secret_notes: view.native_secret_notes.clone(),
+        };
+        view2.aux.agents.remove("ag_bob");
+        let changed = pv
+            .reconcile_from_view::<StdPrimitives>(
+                VaultKeys::single(&k),
+                vid,
+                &view2,
+                ReconcileBase::OwnFold,
+            )
+            .unwrap()
+            .changed;
+        assert!(changed.is_empty(), "dropping an agent writes no tombstone");
+        assert_eq!(pv.items.len(), items_after_seed);
+
+        // The seal primitive refuses agent rows in BOTH spellings, live or tombstone.
+        let ag = "ag_abcdefghijklmnopqrstuvwxyz234567";
+        let body = serde_json::to_value(AgentEntry::default()).unwrap();
+        assert!(pv
+            .seal_and_upsert::<StdPrimitives>(
+                VaultKeys::single(&k),
+                vid,
+                ItemNs::Agent,
+                ag,
+                1,
+                &ItemPayload::live(ItemNs::Agent, ag.to_string(), body.clone()),
+            )
+            .is_err());
+        assert!(pv
+            .seal_and_bump::<StdPrimitives>(
+                VaultKeys::single(&k),
+                vid,
+                ItemNs::Agent,
+                ag,
+                &ItemPayload::tombstone(ItemNs::Agent, ag.to_string()),
+            )
+            .is_err());
+        let legacy = format!("agent/{}", ag);
+        assert!(pv
+            .seal_and_upsert::<StdPrimitives>(
+                VaultKeys::single(&k),
+                vid,
+                ItemNs::Aux,
+                &legacy,
+                1,
+                &ItemPayload::live(ItemNs::Aux, legacy.clone(), body),
+            )
+            .is_err());
+        assert_eq!(
+            pv.items.len(),
+            items_after_seed,
+            "refused writes stored nothing"
         );
     }
 
@@ -2938,18 +4325,22 @@ mod tests {
         .unwrap();
         let ag = "ag_abcdefghijklmnopqrstuvwxyz234567";
         let body = serde_json::to_value(AgentEntry::default()).unwrap();
-        // seal_and_upsert stores the row at wire == ag_id (not a blinded HMAC).
-        let id = pv
-            .seal_and_upsert::<StdPrimitives>(
-                VaultKeys::single(&k),
-                vid,
-                ItemNs::Agent,
-                ag,
-                1,
-                &ItemPayload::live(ItemNs::Agent, ag.to_string(), body),
-            )
-            .unwrap();
-        assert_eq!(id.as_str(), ag, "native agent item addresses by the cleartext ag_id");
+        // The daemon never writes agent rows; land one the way the PULL path does
+        // (console-sealed ct at wire == ag_id, AAD = the HMAC id).
+        let id = wire_id_for::<StdPrimitives>(&k, ItemNs::Agent, ag).unwrap();
+        assert_eq!(
+            id.as_str(),
+            ag,
+            "native agent item addresses by the cleartext ag_id"
+        );
+        let ctx = ItemCtx::for_item::<StdPrimitives>(&k, vid, ItemNs::Agent, ag, 1).unwrap();
+        let ct = seal_item::<StdPrimitives>(
+            &k,
+            &ctx,
+            &ItemPayload::live(ItemNs::Agent, ag.to_string(), body),
+        )
+        .unwrap();
+        pv.put_raw_signed(id, 1, ct, None, None);
         // open_item finds it by (ns,name) and unseals via the recomputed HMAC AAD.
         let opened = pv
             .open_item::<StdPrimitives>(VaultKeys::single(&k), vid, ItemNs::Agent, ag)
@@ -2965,6 +4356,85 @@ mod tests {
             names.contains(&ag.to_string()),
             "cleartext agent shows in live_names_in_ns(Agent)"
         );
+    }
+
+    /// Notes ride a secret's body; the fold splits them off, and a daemon-side
+    /// rewrite of the VALUE (an OAuth refresh, `sc set`) re-attaches them, so the
+    /// daemon never silently drops what the user wrote.
+    #[test]
+    fn secret_notes_survive_a_daemon_value_rewrite() {
+        use sudp::primitives::StdPrimitives;
+        let k = [0x43u8; 32];
+        let vid = "vault-notes";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        pv.seal_and_upsert::<StdPrimitives>(
+            VaultKeys::single(&k),
+            vid,
+            ItemNs::Secret,
+            "TOKEN",
+            1,
+            &ItemPayload::live(
+                ItemNs::Secret,
+                "TOKEN",
+                secret_body("old", Some("prod key")),
+            ),
+        )
+        .unwrap();
+        pv.seal_and_upsert::<StdPrimitives>(
+            VaultKeys::single(&k),
+            vid,
+            ItemNs::Secret,
+            "PLAIN",
+            1,
+            &ItemPayload::secret_live("PLAIN", "p"),
+        )
+        .unwrap();
+
+        let mut view = pv
+            .fold_view::<StdPrimitives>(VaultKeys::single(&k), vid)
+            .unwrap();
+        assert_eq!(
+            view.native_secrets.get("TOKEN").map(Vec::as_slice),
+            Some(&b"old"[..])
+        );
+        assert_eq!(
+            view.native_secret_notes.get("TOKEN").map(String::as_str),
+            Some("prod key")
+        );
+        assert!(!view.native_secret_notes.contains_key("PLAIN"));
+
+        // The daemon rewrites only the value.
+        view.native_secrets.insert("TOKEN".into(), b"new".to_vec());
+        pv.reconcile_from_view::<StdPrimitives>(
+            VaultKeys::single(&k),
+            vid,
+            &view,
+            ReconcileBase::OwnFold,
+        )
+        .unwrap();
+
+        let token = pv
+            .open_item::<StdPrimitives>(VaultKeys::single(&k), vid, ItemNs::Secret, "TOKEN")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            token.body,
+            serde_json::json!({ "value": "new", "notes": "prod key" })
+        );
+        // A note-less secret keeps the original bare-string shape.
+        let plain = pv
+            .open_item::<StdPrimitives>(VaultKeys::single(&k), vid, ItemNs::Secret, "PLAIN")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.body, serde_json::Value::String("p".into()));
     }
 
     #[test]
@@ -3015,7 +4485,8 @@ mod tests {
             ),
         )
         .unwrap();
-        pv.seal_and_upsert::<StdPrimitives>(
+        // LEGACY(aux addressing): a row an earlier version wrote.
+        pv.plant::<StdPrimitives>(
             VaultKeys::single(&k),
             vid,
             ItemNs::Aux,
@@ -3113,7 +4584,7 @@ mod tests {
             enc_pub.clone(),
             encapped,
             ct,
-            crate::storage::plaintext::MemberRole::Owner,
+            crate::storage::plaintext::MemberRole::Admin,
             Vec::new(),
         );
         assert!(pv.is_uik(), "seal promotes the keyset to v2");
@@ -3283,7 +4754,7 @@ mod tests {
         let uid = uik.user_id();
         // Signer is an OWNER in the owner-set → honored.
         let owner_set: std::collections::BTreeMap<String, MemberRole> =
-            [(uid.clone(), MemberRole::Owner)].into_iter().collect();
+            [(uid.clone(), MemberRole::Admin)].into_iter().collect();
         assert_eq!(
             unwrap_verified_config(
                 wrapper.clone(),
@@ -3321,6 +4792,22 @@ mod tests {
             ),
             None,
         );
+        // Unsigned legacy-raw body on a v2 (Verified) keyset → DROP: any K-holding
+        // member could have written it (only NoUik honors raw config).
+        let owner_set2: std::collections::BTreeMap<String, MemberRole> =
+            [(uid.clone(), MemberRole::Admin)].into_iter().collect();
+        assert_eq!(
+            unwrap_verified_config(
+                data.clone(),
+                &pv.keyset,
+                vault,
+                "policy",
+                version,
+                &MembershipTrust::Verified(owner_set2)
+            ),
+            None,
+            "Verified drops unsigned owner-config",
+        );
 
         // --- E (MembershipTrust::Untrusted = v2 anchor stripped) fails CLOSED ---
         // Even a VALID owner-signed wrapper is dropped when the keyset carries no
@@ -3350,6 +4837,185 @@ mod tests {
             None,
             "Untrusted drops legacy-raw config too (no integrity-only downgrade)",
         );
+    }
+
+    /// Re-keys the owner's console has not finished: rows still under a
+    /// previous content key read through the previous keys the member's own
+    /// keyset row carries (opened at unlock with the current key, newest
+    /// first), each only for the rows that existed, exactly so, when it was
+    /// retired. A row under a retired key that it does not list (sealed after
+    /// it retired) is not honored and never written over. A row read through a previous key
+    /// is never written back under it: a reconcile leaves it as it is, and a
+    /// change to it is sealed under the current key.
+    #[test]
+    fn rows_a_rekey_has_not_moved_read_through_the_previous_keys() {
+        use crate::storage::item::{seal_prev_content_keys, vault_key_bundle};
+        type S = sudp::primitives::StdPrimitives;
+        let fx = rekeyed_fixture();
+        let vid = fx.vault;
+        let c_older = [0x4du8; 32];
+        let mut pv = fx.pv.clone();
+        let old = VaultKeys {
+            id_seed: &fx.id_seed,
+            content: &fx.c_old,
+            prev: &[],
+        };
+        let older = VaultKeys {
+            content: &c_older,
+            ..old
+        };
+        let bundle = vault_key_bundle(&fx.id_seed, &fx.c_new);
+        let current = VaultKeys::from_material(&bundle);
+        let old_id = pv
+            .plant::<S>(old, vid, ItemNs::Secret, "OLD", 3, &ItemPayload::secret_live("OLD", "o"))
+            .unwrap();
+        let new_id = pv
+            .plant::<S>(current, vid, ItemNs::Secret, "NEW", 1, &ItemPayload::secret_live("NEW", "n"))
+            .unwrap();
+        let older_id = pv
+            .plant::<S>(older, vid, ItemNs::Secret, "OLDER", 2, &ItemPayload::secret_live("OLDER", "x"))
+            .unwrap();
+        // Sealed under the retired key after it retired: listed nowhere.
+        let planted_id = pv
+            .plant::<S>(old, vid, ItemNs::Secret, "PLANTED", 5, &ItemPayload::secret_live("PLANTED", "p"))
+            .unwrap();
+        for s in pv.items.values_mut() {
+            s.synced_version = s.version;
+        }
+        let (old_ct, older_ct) = (pv.items[&old_id].ct.clone(), pv.items[&older_id].ct.clone());
+        pv.set_uik_prev_content_ct(
+            "cid-creator",
+            seal_prev_content_keys::<S>(
+                &fx.c_new,
+                vid,
+                1,
+                &[
+                    (&fx.c_old, &[(old_id.as_str(), 3, old_ct.as_slice())]),
+                    (&c_older, &[(older_id.as_str(), 2, older_ct.as_slice())]),
+                ],
+            ),
+        );
+
+        // Unlock: the grant's root opens the bundle and, from the member's own
+        // row, the previous keys with their rows.
+        let material = crate::server::handlers::metadata::acquire_k_from_keyset(
+            &pv.keyset,
+            crate::protocol::grant::GrantKey::Custody(&fx.root),
+            b"another-cred",
+            vid,
+        )
+        .unwrap();
+        assert!(material.len() > 64);
+        // The vault key an admin delivers (`k_*`): the same bundle opens the
+        // same material, with no member entry of the approving credential.
+        let delivered = crate::server::handlers::metadata::acquire_k_from_keyset(
+            &pv.keyset,
+            GrantKey::VaultKey(&bundle),
+            b"an-admins-cred",
+            vid,
+        )
+        .unwrap();
+        assert_eq!(&delivered[..], &material[..]);
+        for bad in [&bundle[..31], &[0u8; 48][..]] {
+            assert!(crate::server::handlers::metadata::acquire_k_from_keyset(
+                &pv.keyset,
+                GrantKey::VaultKey(bad),
+                b"an-admins-cred",
+                vid,
+            )
+            .is_err());
+        }
+        let mut v1 = pv.keyset.clone();
+        v1.uik = None;
+        assert!(
+            crate::server::handlers::metadata::acquire_k_from_keyset(
+                &v1,
+                GrantKey::VaultKey(&bundle),
+                b"c",
+                vid,
+            )
+            .is_err(),
+            "a v1 keyset takes no delivered vault key"
+        );
+        let keys = VaultKeys::from_material(&material);
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        assert_eq!(view.native_secrets["OLD"], b"o");
+        assert_eq!(view.native_secrets["OLDER"], b"x");
+        assert_eq!(view.native_secrets["NEW"], b"n");
+        assert!(!view.native_secrets.contains_key("PLANTED"), "not honored");
+        // Without them, only the current key reads.
+        let view = pv.fold_view::<S>(current, vid).unwrap();
+        assert!(!view.native_secrets.contains_key("OLD"));
+        assert!(!view.native_secrets.contains_key("OLDER"));
+        // A seal for another generation does not open: the bundle alone.
+        let mut stale = pv.clone();
+        stale.set_uik_prev_content_ct(
+            "cid-creator",
+            seal_prev_content_keys::<S>(
+                &fx.c_new,
+                vid,
+                2,
+                &[(&fx.c_old, &[(old_id.as_str(), 3, old_ct.as_slice())])],
+            ),
+        );
+        let m = crate::server::handlers::metadata::acquire_k_from_keyset(
+            &stale.keyset,
+            crate::protocol::grant::GrantKey::Custody(&fx.root),
+            b"another-cred",
+            vid,
+        )
+        .unwrap();
+        assert_eq!(m.len(), 64);
+
+        // The unlisted row is never written over: a change to it is refused
+        // with the note, the row left as it is.
+        let planted = pv.items[&planted_id].clone();
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        let base = ViewBase::of(&view).unwrap();
+        let mut mine = pv.fold_view::<S>(keys, vid).unwrap();
+        mine.native_secrets.insert("PLANTED".into(), b"mine".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &mine, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(r.changed.is_empty());
+        assert_eq!(r.refused.len(), 1);
+        assert!(r.refused[0].1.contains("changed with a vault key this device does not have"));
+        assert_eq!(pv.items[&planted_id].ct, planted.ct);
+
+        // Nothing changed: nothing is written, the old row stays as it is.
+        let before = pv.items[&old_id].clone();
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        let base = ViewBase::of(&view).unwrap();
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &view, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(r.changed.is_empty() && r.refused.is_empty());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &view, ReconcileBase::OwnFold)
+            .unwrap();
+        assert!(r.changed.is_empty() && r.refused.is_empty());
+        // Another row changed: the old one is still not touched.
+        let mut changed = pv.fold_view::<S>(keys, vid).unwrap();
+        changed.native_secrets.insert("NEW".into(), b"n2".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &changed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(r.changed, vec![new_id.clone()]);
+        assert_eq!(pv.items[&old_id].ct, before.ct);
+        assert_eq!(pv.items[&old_id].version, before.version);
+        // The old row changed: written at its next version under the current key.
+        let base = ViewBase::of(&changed).unwrap();
+        changed.native_secrets.insert("OLD".into(), b"o2".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &changed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(r.changed, vec![old_id.clone()]);
+        assert_eq!(pv.items[&old_id].version, 4);
+        let got = pv
+            .open_item::<S>(current, vid, ItemNs::Secret, "OLD")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.body, serde_json::json!("o2"));
     }
 
     #[test]
@@ -3382,6 +5048,7 @@ mod tests {
         let vk_new = VaultKeys {
             id_seed: &seed,
             content: &c_new,
+            prev: &[],
         };
         pv.seal_and_upsert::<StdPrimitives>(
             vk_new,
@@ -3415,6 +5082,7 @@ mod tests {
         let vk_old = VaultKeys {
             id_seed: &seed,
             content: &c_old,
+            prev: &[],
         };
         assert!(
             pv.open_item::<StdPrimitives>(vk_old, vid, ItemNs::Secret, "TOKEN")
@@ -3470,7 +5138,7 @@ mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             Vec::new(),
         );
         {
@@ -3486,7 +5154,7 @@ mod tests {
             });
         }
         let owner_trust = MembershipTrust::Verified(
-            [(owner_id.clone(), MemberRole::Owner)]
+            [(owner_id.clone(), MemberRole::Admin)]
                 .into_iter()
                 .collect(),
         );
@@ -3551,11 +5219,89 @@ mod tests {
         ));
     }
 
+    /// A re-keyed vault (generation 1): a v2 keyset pinned to its creator, the
+    /// creator's cred (`cid-creator`) holding a real K-seal of the key bundle
+    /// `id_seed ‖ c_new`, and the owner-signed proof of the re-key to `c_new`
+    /// from `c_old`. No items, no previous content keys on the cred.
+    pub(crate) struct Rekeyed {
+        pub vault: &'static str,
+        /// The creator's UIK root (the secret a grant delivers).
+        pub root: [u8; 32],
+        pub id_seed: [u8; 32],
+        pub c_old: [u8; 32],
+        pub c_new: [u8; 32],
+        pub pv: PerItemVault,
+    }
+
+    impl Rekeyed {
+        /// The key material the creator's unlock retains: `id_seed ‖ c_new`.
+        pub fn material(&self) -> Vec<u8> {
+            crate::storage::item::vault_key_bundle(&self.id_seed, &self.c_new)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rekeyed_fixture() -> Rekeyed {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let vault = "vault-rekeyed";
+        let root = [0x11u8; 32];
+        let creator = UikRoot::from_root(root);
+        let creator_id = creator.user_id();
+        let (id_seed, c_old, c_new) = ([0x5au8; 32], [0x6bu8; 32], [0x7cu8; 32]);
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        let enc_pub = creator.encryption_public().unwrap();
+        let bundle = crate::storage::item::vault_key_bundle(&id_seed, &c_new);
+        let (k_encapped, k_ct) =
+            crate::crypto::vault_key::seal_k_to_uik(&enc_pub, vault, &bundle).unwrap();
+        pv.set_uik_cred(
+            "cid-creator".into(),
+            creator_id.clone(),
+            creator.signing().public_bytes().to_vec(),
+            enc_pub,
+            k_encapped,
+            k_ct,
+            MemberRole::Admin,
+            Vec::new(),
+        );
+        let commit = rekey_commitment(&c_new).to_vec();
+        let membership = crate::identity::membership_commitment(&[]).to_vec();
+        let input =
+            crate::identity::rekey_sig_input(vault, 1, &commit, &creator_id, 0, &membership);
+        let uik = pv.keyset.uik.as_mut().unwrap();
+        uik.creator_sig_pub = creator.signing().public_bytes().to_vec();
+        uik.generation = 1;
+        uik.rekey_proof = Some(RekeyProof {
+            generation: 1,
+            k_commitment: commit,
+            sig: creator.signing().sign(&input).to_vec(),
+            signer_id: creator_id,
+            membership_len: 0,
+            membership_hash: membership,
+        });
+        Rekeyed {
+            vault,
+            root,
+            id_seed,
+            c_old,
+            c_new,
+            pv,
+        }
+    }
+
     /// Shared setup for the role-on-keyset fixtures: a v2 keyset pinned to a
     /// creator, a creator cred (Owner, self-signed) and a member cred. Returns the
     /// vault, keyset holder, both roots, and their ids.
     #[cfg(test)]
-    fn role_fixture_creator_cred() -> (
+    pub(crate) fn role_fixture_creator_cred() -> (
         &'static str,
         crate::crypto::vault_key::UikRoot,
         crate::crypto::vault_key::UikRoot,
@@ -3594,7 +5340,7 @@ mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             creator_grant.to_vec(),
         );
         // Pin the root anchor = the creator's signing pubkey.
@@ -3634,7 +5380,7 @@ mod tests {
         let MembershipTrust::Verified(owner_set) = pv.resolve_membership_trust(vault) else {
             panic!("pinned creator ⇒ MembershipTrust::Verified");
         };
-        assert_eq!(owner_set.get(&creator_id), Some(&MemberRole::Owner));
+        assert_eq!(owner_set.get(&creator_id), Some(&MemberRole::Admin));
         assert_eq!(owner_set.get(&member_id), Some(&MemberRole::Member));
         let trust = MembershipTrust::Verified(owner_set);
 
@@ -3679,16 +5425,59 @@ mod tests {
         );
     }
 
+    /// Land an agent row the way the PULL path does (console-sealed ct + the wire
+    /// sidecar sig/signer): `ns = Agent` ⇒ native row at wire id == ag_id; `ns = Aux`
+    /// with `name = "agent/<ag_id>"` ⇒ the legacy blinded spelling. `signer = Some`
+    /// adds a valid A1.2 sidecar sig (type `"agent"`, over the ct + HMAC id bytes).
+    #[allow(clippy::too_many_arguments)]
+    fn put_agent_row(
+        pv: &mut PerItemVault,
+        k: &[u8; 32],
+        vault: &str,
+        ns: ItemNs,
+        name: &str,
+        version: u64,
+        body: serde_json::Value,
+        signer: Option<&crate::crypto::vault_key::UikRoot>,
+    ) {
+        use sudp::primitives::StdPrimitives;
+        let ctx = ItemCtx::for_item::<StdPrimitives>(k, vault, ns, name, version).unwrap();
+        let ct =
+            seal_item::<StdPrimitives>(k, &ctx, &ItemPayload::live(ns, name.to_string(), body))
+                .unwrap();
+        let (sig, sid) = match signer {
+            Some(sg) => {
+                let input = crate::identity::record_signature_input(
+                    "agent",
+                    ctx.id_bytes(),
+                    version,
+                    vault,
+                    &ct,
+                    true,
+                    &sg.user_id(),
+                );
+                (
+                    Some(STANDARD.encode(sg.signing().sign(&input))),
+                    Some(sg.user_id()),
+                )
+            }
+            None => (None, None),
+        };
+        let wire = wire_id_for::<StdPrimitives>(k, ns, name).unwrap();
+        pv.put_raw_signed(wire, version, ct, sig, sid);
+    }
+
     #[test]
     fn agent_grant_authz_self_owner_and_forged() {
-        // §11.1 authorized-agents table authorization: a row is honored iff its
-        // signer is the row's declared `owner` (a member admitting their OWN
-        // agent) OR any owner (override). A member admitting SOMEONE ELSE'S agent,
-        // an unknown signer, or a bad signature all drop; legacy raw (unsigned) is
-        // honored additively.
+        // §11.1 authorized-agents table, end-to-end through `fold_view` on a v2
+        // (Verified) keyset. A NATIVE row is honored iff it carries a valid sidecar
+        // item-sig whose signer is the row's `owner` (self-service) or any owner
+        // (override). A member admitting SOMEONE ELSE'S agent, an outsider, an
+        // UNSIGNED row, a row with only a legacy in-body wrapper, and EVERY legacy
+        // `aux:agent/*` row (even owner-signed) all drop.
         use crate::crypto::vault_key::UikRoot;
         use crate::storage::plaintext::MemberRole;
-        use base64::engine::general_purpose::STANDARD;
+        use sudp::primitives::StdPrimitives;
 
         let (vault, creator, member, creator_id, member_id, mut pv) = role_fixture_creator_cred();
         // Add a member cred (role=Member, creator-signed at gen 0).
@@ -3705,84 +5494,187 @@ mod tests {
             MemberRole::Member,
             member_grant.to_vec(),
         );
-        let MembershipTrust::Verified(owner_set) = pv.resolve_membership_trust(vault) else {
-            panic!("pinned creator ⇒ Verified");
-        };
-        let trust = MembershipTrust::Verified(owner_set);
+        assert!(
+            matches!(
+                pv.resolve_membership_trust(vault),
+                MembershipTrust::Verified(_)
+            ),
+            "pinned creator ⇒ Verified"
+        );
         let outsider = UikRoot::from_root([0x99u8; 32]); // never published to the keyset
+        let k = [0x5au8; 32];
+        let v = 3u64;
+        let ag = |c: char| format!("ag_{}", c.to_string().repeat(32));
+        let grant = |owner_id: &str| serde_json::json!({ "owner": owner_id, "connections": "all" });
 
-        let cfg = "agent/ag_testagent";
-        let version = 3u64;
-        let grant_body = |owner_id: &str| -> serde_json::Value {
-            serde_json::json!({ "agent_pubkey": "cGs", "owner": owner_id, "connections": "all" })
-        };
-        let sign = |signer: &UikRoot, data: &serde_json::Value| -> serde_json::Value {
-            let sid = signer.user_id();
-            let canonical = crate::crypto::canonical::canonicalize(data);
-            let input =
-                crate::identity::config_sig_input(vault, cfg, version, Some(&canonical), &sid);
-            let sig = signer.signing().sign(&input);
-            serde_json::json!({
-                "data": data,
-                "uik_sig": STANDARD.encode(sig),
-                "uik_sign_pub": STANDARD.encode(signer.signing().public_bytes()),
-            })
-        };
+        // honored: member admits their OWN agent; creator (owner) admits the member's.
+        put_agent_row(
+            &mut pv,
+            &k,
+            vault,
+            ItemNs::Agent,
+            &ag('a'),
+            v,
+            grant(&member_id),
+            Some(&member),
+        );
+        put_agent_row(
+            &mut pv,
+            &k,
+            vault,
+            ItemNs::Agent,
+            &ag('b'),
+            v,
+            grant(&member_id),
+            Some(&creator),
+        );
+        // dropped: member admits an agent declared OWNED BY the creator.
+        put_agent_row(
+            &mut pv,
+            &k,
+            vault,
+            ItemNs::Agent,
+            &ag('c'),
+            v,
+            grant(&creator_id),
+            Some(&member),
+        );
+        // dropped: outsider (not a keyset cred) self-admits.
+        put_agent_row(
+            &mut pv,
+            &k,
+            vault,
+            ItemNs::Agent,
+            &ag('d'),
+            v,
+            grant(&outsider.user_id()),
+            Some(&outsider),
+        );
+        // dropped: UNSIGNED native row (any K-holding member could write it).
+        put_agent_row(
+            &mut pv,
+            &k,
+            vault,
+            ItemNs::Agent,
+            &ag('e'),
+            v,
+            grant(&member_id),
+            None,
+        );
+        // dropped: native row carrying ONLY a legacy in-body wrapper, even creator-signed.
+        let data = grant(&member_id);
+        let canonical = crate::crypto::canonical::canonicalize(&data);
+        let cfg = format!("agent/{}", ag('f'));
+        let input =
+            crate::identity::config_sig_input(vault, &cfg, v, Some(&canonical), &creator_id);
+        let wrapper = serde_json::json!({
+            "data": data,
+            "uik_sig": STANDARD.encode(creator.signing().sign(&input)),
+            "uik_sign_pub": STANDARD.encode(creator.signing().public_bytes()),
+        });
+        put_agent_row(
+            &mut pv,
+            &k,
+            vault,
+            ItemNs::Agent,
+            &ag('f'),
+            v,
+            wrapper,
+            None,
+        );
+        // dropped: legacy blinded `aux:agent/<id>` rows, unsigned AND owner-signed.
+        let legacy_g = format!("agent/{}", ag('g'));
+        put_agent_row(
+            &mut pv,
+            &k,
+            vault,
+            ItemNs::Aux,
+            &legacy_g,
+            v,
+            grant(&member_id),
+            None,
+        );
+        let legacy_h = format!("agent/{}", ag('h'));
+        put_agent_row(
+            &mut pv,
+            &k,
+            vault,
+            ItemNs::Aux,
+            &legacy_h,
+            v,
+            grant(&member_id),
+            Some(&creator),
+        );
 
-        // self-service: member admits their OWN agent → honored, signed.
-        let own = grant_body(&member_id);
+        let view = pv
+            .fold_view::<StdPrimitives>(VaultKeys::single(&k), vault)
+            .unwrap();
+        let got: Vec<String> = view.aux.agents.keys().cloned().collect();
         assert_eq!(
-            unwrap_verified_agent_grant(sign(&member, &own), &pv.keyset, vault, cfg, version, &trust),
-            Some((own.clone(), true)),
-            "member admits own agent",
+            got,
+            vec![ag('a'), ag('b')],
+            "only signed+authorized native rows"
         );
-        // owner override: creator admits the member's agent → honored, signed.
-        assert_eq!(
-            unwrap_verified_agent_grant(
-                sign(&creator, &own),
-                &pv.keyset,
-                vault,
-                cfg,
-                version,
-                &trust
-            ),
-            Some((own.clone(), true)),
-            "any owner may admit any agent",
-        );
-        // forged: member admits an agent it declares OWNED BY the creator (neither
-        // self nor an owner) → drop.
-        let other = grant_body(&creator_id);
-        assert_eq!(
-            unwrap_verified_agent_grant(
-                sign(&member, &other),
-                &pv.keyset,
-                vault,
-                cfg,
-                version,
-                &trust
-            ),
+        assert_eq!(view.aux.agents[&ag('a')].owner, member_id);
+
+        // Untrusted (anchor stripped) drops even a validly-signed native row.
+        pv.keyset.uik.as_mut().unwrap().creator_sig_pub = Vec::new();
+        assert!(matches!(
+            pv.resolve_membership_trust(vault),
+            MembershipTrust::Untrusted
+        ));
+        let view = pv
+            .fold_view::<StdPrimitives>(VaultKeys::single(&k), vault)
+            .unwrap();
+        assert!(view.aux.agents.is_empty(), "Untrusted folds no agent rows");
+    }
+
+    #[test]
+    fn nouik_agent_rows_integrity_only_and_legacy_ignored() {
+        // Legacy fmt1 (NoUik, single person, no member keys): a plain unsigned
+        // NATIVE row is honored on integrity (K) alone; a legacy `aux:agent/*` row
+        // is still ignored.
+        use crate::storage::plaintext::AgentEntry;
+        use sudp::primitives::StdPrimitives;
+        let k = [0x5bu8; 32];
+        let vid = "vault-nouik-agent";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        assert!(pv.keyset.uik.is_none(), "a v1 keyset");
+        let native = "ag_abcdefghijklmnopqrstuvwxyz234567";
+        let legacy_ag = "ag_765432zyxwvutsrqponmlkjihgfedcba";
+        let body = serde_json::to_value(AgentEntry::default()).unwrap();
+        put_agent_row(
+            &mut pv,
+            &k,
+            vid,
+            ItemNs::Agent,
+            native,
+            1,
+            body.clone(),
             None,
-            "member cannot admit an agent owned by someone else",
         );
-        // unknown signer (outsider, not a keyset cred) → drop.
-        assert_eq!(
-            unwrap_verified_agent_grant(
-                sign(&outsider, &own),
-                &pv.keyset,
-                vault,
-                cfg,
-                version,
-                &trust
-            ),
-            None,
-            "outsider signature dropped",
+        let legacy = format!("agent/{}", legacy_ag);
+        put_agent_row(&mut pv, &k, vid, ItemNs::Aux, &legacy, 1, body, None);
+        let view = pv
+            .fold_view::<StdPrimitives>(VaultKeys::single(&k), vid)
+            .unwrap();
+        assert!(
+            view.aux.agents.contains_key(native),
+            "NoUik: unsigned native row honored"
         );
-        // legacy raw (unsigned) → honored additively, unsigned.
-        assert_eq!(
-            unwrap_verified_agent_grant(own.clone(), &pv.keyset, vault, cfg, version, &trust),
-            Some((own.clone(), false)),
-            "legacy raw honored, was_signed=false",
+        assert!(
+            !view.aux.agents.contains_key(legacy_ag),
+            "legacy aux:agent row ignored"
         );
+        assert_eq!(view.aux.agents.len(), 1);
     }
 
     #[test]
@@ -3849,7 +5741,7 @@ mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             self_grant.to_vec(),
         );
 
@@ -3860,7 +5752,7 @@ mod tests {
         };
         assert_eq!(
             owner_set.get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "creator remains owner"
         );
         assert!(
@@ -3977,7 +5869,7 @@ mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             grant0.to_vec(),
         );
 
@@ -3988,10 +5880,10 @@ mod tests {
 
         // Baseline: both the root creator and the granted member are owners @epoch 0.
         let os = owners(&pv);
-        assert_eq!(os.get(&creator_id), Some(&MemberRole::Owner));
+        assert_eq!(os.get(&creator_id), Some(&MemberRole::Admin));
         assert_eq!(
             os.get(&member_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "member granted owner @role_epoch 0 is an owner",
         );
 
@@ -4000,7 +5892,7 @@ mod tests {
         let os = owners(&pv);
         assert_eq!(
             os.get(&member_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "a generation (K-eviction) bump alone leaves the owner-set intact (⊥)",
         );
 
@@ -4016,7 +5908,7 @@ mod tests {
         );
         assert_eq!(
             os.get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the root creator is an owner by the genesis pin, immune to grant replay",
         );
 
@@ -4035,7 +5927,7 @@ mod tests {
             .role_sig = grant1.to_vec();
         assert_eq!(
             owners(&pv).get(&member_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "re-signing the grant @role_epoch 1 restores the owner",
         );
     }
@@ -4171,20 +6063,20 @@ mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
         assert_eq!(
             owner_set(&pv, vault).get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "root grants A via event",
         );
         // seq 2: A (a NON-root owner) sets B → owner (egalitarian delegation).
-        push_event(&mut pv, vault, &a, "set", &b_id, MemberRole::Owner, 2, 0);
+        push_event(&mut pv, vault, &a, "set", &b_id, MemberRole::Admin, 2, 0);
         assert_eq!(
             owner_set(&pv, vault).get(&b_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "a non-root owner can grant (delegation bit)",
         );
         // seq 3: root removes A → A dropped, B STAYS (non-cascade).
@@ -4202,7 +6094,7 @@ mod tests {
         assert!(!os.contains_key(&a_id), "A removed");
         assert_eq!(
             os.get(&b_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "NON-CASCADE: removing A does not drop B (whom A added)",
         );
     }
@@ -4220,7 +6112,7 @@ mod tests {
             &member,
             "set",
             &member_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
@@ -4248,7 +6140,7 @@ mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
@@ -4259,7 +6151,7 @@ mod tests {
             &creator,
             "set",
             &b_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
@@ -4269,7 +6161,7 @@ mod tests {
         // dropped (the winner is server-independent — same on every implementation).
         assert_eq!(
             os.get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the (seq,sig)-first seq-1 event applies"
         );
         assert!(
@@ -4297,13 +6189,13 @@ mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
         assert_eq!(
             owner_set(&pv, vault).get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "A granted @seq1",
         );
         // Junk @seq2: valid owner granter + self-certifying pubkey, but a ZERO signature
@@ -4317,7 +6209,7 @@ mod tests {
             .push(DelegationEvent {
                 op: "set".into(),
                 subject_id: "us_ghost".into(),
-                role: MemberRole::Owner,
+                role: MemberRole::Admin,
                 granter_id: creator.user_id(),
                 granter_sig_pub: creator.signing().public_bytes().to_vec(),
                 seq: 2,
@@ -4366,20 +6258,20 @@ mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
-        push_event(&mut pv, vault, &a, "set", &b_id, MemberRole::Owner, 2, 0);
+        push_event(&mut pv, vault, &a, "set", &b_id, MemberRole::Admin, 2, 0);
         let os = owner_set(&pv, vault);
         assert_eq!(
             os.get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "A is an owner via the log with no cred row",
         );
         assert_eq!(
             os.get(&b_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "A's grant of B verifies via A's INLINE key — non-cascade survives A having no cred row",
         );
     }
@@ -4433,13 +6325,13 @@ mod tests {
             vec![9u8; 32],
             vec![1u8; 40],
             vec![2u8; 40],
-            MemberRole::Owner,
+            MemberRole::Admin,
             nr_grant.to_vec(),
         );
         let os = owner_set(&pv, vault);
         assert_eq!(
             os.get(&newroot_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "succession installs the new root as the owner authority",
         );
         assert!(
@@ -4484,7 +6376,7 @@ mod tests {
         let os = owner_set(&pv, vault);
         assert_eq!(
             os.get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "a forged succession is ignored; the creator stays root",
         );
         assert!(
@@ -4522,7 +6414,7 @@ mod tests {
         );
         assert_eq!(
             owner_set(&pv, vault).get(&creator_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the last owner (here the creator) can't be removed or demoted away",
         );
     }
@@ -4544,7 +6436,7 @@ mod tests {
             &creator,
             "set",
             &a_id,
-            MemberRole::Owner,
+            MemberRole::Admin,
             1,
             0,
         );
@@ -4565,7 +6457,7 @@ mod tests {
         );
         assert_eq!(
             os.get(&a_id),
-            Some(&MemberRole::Owner),
+            Some(&MemberRole::Admin),
             "the successor owner (added by the creator) stays after the creator leaves",
         );
     }
@@ -4602,7 +6494,7 @@ mod tests {
             .push(DelegationEvent {
                 op: "set".into(),
                 subject_id: a_id.clone(),
-                role: MemberRole::Owner,
+                role: MemberRole::Admin,
                 granter_id: creator_id.clone(),
                 granter_sig_pub: creator.signing().public_bytes().to_vec(),
                 seq: 1,
@@ -4640,7 +6532,7 @@ mod tests {
             matches!(pv.resolve_membership_trust(vault), MembershipTrust::Verified(_)),
             "matching log prefix → Verified",
         );
-        assert_eq!(owner_set(&pv, vault).get(&a_id), Some(&MemberRole::Owner));
+        assert_eq!(owner_set(&pv, vault).get(&a_id), Some(&MemberRole::Admin));
         // Rollback: the server drops the committed event → prefix mismatch → Untrusted
         // (the owner-set is NOT silently recomputed without it).
         pv.keyset.uik.as_mut().unwrap().delegation_log.clear();
@@ -4648,5 +6540,2060 @@ mod tests {
             matches!(pv.resolve_membership_trust(vault), MembershipTrust::Untrusted),
             "a rolled-back log (committed event omitted) is rejected → Untrusted",
         );
+    }
+
+    /// A v1 store holding a legacy `services` record with `entries`.
+    fn v1_with_legacy_services(
+        keys: VaultKeys,
+        vault: &str,
+        entries: serde_json::Value,
+    ) -> PerItemVault {
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        pv.plant::<sudp::primitives::StdPrimitives>(
+            keys,
+            vault,
+            ItemNs::Aux,
+            "services",
+            1,
+            &ItemPayload::live(ItemNs::Aux, "services".to_string(), entries),
+        )
+        .unwrap();
+        pv
+    }
+
+    fn svc_entry(id: &str, host: &str) -> serde_json::Value {
+        serde_json::json!({ "service": format!("[service]\nid = \"{id}\"\nhosts = [\"{host}\"]\n") })
+    }
+
+    /// Services are the union of the legacy record and the native `service`
+    /// items: a native item replaces the legacy entry of its id, a native
+    /// tombstone hides it, a native-only item is added. A native item read at
+    /// another address than its own derived id is not a service.
+    #[test]
+    fn services_fold_unions_legacy_and_native_items() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let vault = "vault-v1";
+        let mut pv = v1_with_legacy_services(
+            keys,
+            vault,
+            serde_json::json!({ "a": svc_entry("a", "a.old"), "b": svc_entry("b", "b.dev") }),
+        );
+        let put = |pv: &mut PerItemVault, p: ItemPayload| {
+            let name = p.name.clone();
+            pv.seal_and_bump::<S>(keys, vault, ItemNs::Service, &name, &p)
+                .unwrap();
+        };
+        put(
+            &mut pv,
+            ItemPayload::live(ItemNs::Service, "a", svc_entry("a", "a.new")),
+        );
+        put(&mut pv, ItemPayload::tombstone(ItemNs::Service, "b"));
+        put(
+            &mut pv,
+            ItemPayload::live(ItemNs::Service, "c", svc_entry("c", "c.dev")),
+        );
+        // A `service` payload sealed at another id is not read as that service.
+        let elsewhere =
+            ItemCtx::for_item::<S>(keys.id_seed, vault, ItemNs::Service, "zz", 1).unwrap();
+        let ct = seal_item::<S>(
+            keys.content,
+            &elsewhere,
+            &ItemPayload::live(ItemNs::Service, "d", svc_entry("d", "d.dev")),
+        )
+        .unwrap();
+        pv.put_raw(elsewhere.item_id_b64(), 1, ct);
+        // Nor one that names another id (`a`) at `zz2`'s address.
+        let elsewhere =
+            ItemCtx::for_item::<S>(keys.id_seed, vault, ItemNs::Service, "zz2", 1).unwrap();
+        let ct = seal_item::<S>(
+            keys.content,
+            &elsewhere,
+            &ItemPayload::live(ItemNs::Service, "a", svc_entry("a", "evil.dev")),
+        )
+        .unwrap();
+        pv.put_raw(elsewhere.item_id_b64(), 1, ct);
+        let services = pv.fold_view::<S>(keys, vault).unwrap().aux.services;
+        assert_eq!(services.keys().collect::<Vec<_>>(), ["a", "c"]);
+        assert_eq!(
+            serde_json::to_value(&services["a"]).unwrap(),
+            svc_entry("a", "a.new")
+        );
+    }
+
+    /// A same-item conflict on a service keeps both, like a connection: the
+    /// daemon's write over a row that changed since its base leaves theirs at
+    /// the canonical id and puts ours beside it as the record `"<id>
+    /// (conflict copy)"` at that name's own id, dirty, so the push sends it as
+    /// a create. The copy folds under its own name and no service is loaded
+    /// from it.
+    #[test]
+    fn service_conflict_keeps_both_and_the_copy_is_not_used() {
+        use crate::storage::item::conflict_copy_name;
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let (vault, _, _, _, _, mut pv) = role_fixture_creator_cred();
+        let mut view = pv.fold_view::<S>(keys, vault).unwrap();
+        let entry = |host: &str| -> crate::service::source::StoredService {
+            serde_json::from_value(svc_entry("acme", host)).unwrap()
+        };
+        view.aux.services.insert("acme".into(), entry("a.base"));
+        pv.reconcile_from_view::<S>(keys, vault, &view, ReconcileBase::OwnFold)
+            .unwrap();
+        let base = ViewBase::of(&pv.fold_view::<S>(keys, vault).unwrap()).unwrap();
+        // Theirs lands (a pull) after our base was taken.
+        let theirs = ItemPayload::live(ItemNs::Service, "acme", svc_entry("acme", "a.theirs"));
+        let (canon, their_version) = pv
+            .seal_and_bump::<S>(keys, vault, ItemNs::Service, "acme", &theirs)
+            .unwrap();
+        // Ours, from the base.
+        let mut ours_view = pv.fold_view::<S>(keys, vault).unwrap();
+        ours_view
+            .aux
+            .services
+            .insert("acme".into(), entry("a.ours"));
+        pv.reconcile_from_view::<S>(keys, vault, &ours_view, ReconcileBase::Since(&base))
+            .unwrap();
+
+        let copy_id =
+            wire_id_for::<S>(keys.id_seed, ItemNs::Service, &conflict_copy_name("acme")).unwrap();
+        let copy = pv.get_item(&copy_id).expect("ours kept as a conflict copy");
+        assert_eq!(copy.synced_version, 0, "dirty: pushed as a create");
+        assert_eq!(
+            pv.get_item(&canon).unwrap().version,
+            their_version,
+            "theirs stays"
+        );
+        let services = pv.fold_view::<S>(keys, vault).unwrap().aux.services;
+        assert_eq!(
+            serde_json::to_value(&services["acme"]).unwrap(),
+            svc_entry("acme", "a.theirs")
+        );
+        let copy_name = conflict_copy_name("acme");
+        assert_eq!(copy_name, "acme (conflict copy)");
+        assert_eq!(
+            serde_json::to_value(&services[&copy_name]).unwrap(),
+            svc_entry("acme", "a.ours")
+        );
+        let (_, skipped) = crate::service::vault_custom_services(
+            &services,
+            true,
+            &crate::service::ServiceRegistry::load(),
+        );
+        assert!(skipped
+            .iter()
+            .any(|(id, why)| id == &copy_name && why == crate::service::CONFLICT_COPY_REASON));
+        // A later write of the view never rewrites or deletes the copy.
+        let before = pv.items.len();
+        let mut again = pv.fold_view::<S>(keys, vault).unwrap();
+        let base = ViewBase::of(&again).unwrap();
+        again.aux.services.insert("other".into(), entry("o.dev"));
+        pv.reconcile_from_view::<S>(keys, vault, &again, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(pv.items.len(), before + 1, "only `other` was written");
+    }
+
+    /// Native service items are data records: written unsigned by the daemon's
+    /// reconcile on every keyset (a v2 keyset too, where they are honored
+    /// unsigned), never as the legacy record; a dropped service, legacy-only
+    /// included, becomes a native tombstone.
+    #[test]
+    fn reconcile_writes_services_as_native_items_on_every_keyset() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let (v2_vault, _, _, _, _, v2) = role_fixture_creator_cred();
+        let v1_vault = "vault-v1";
+        let v1 = v1_with_legacy_services(
+            keys,
+            v1_vault,
+            serde_json::json!({ "old": svc_entry("old", "o.dev") }),
+        );
+        for (vault, mut pv) in [(v1_vault, v1), (v2_vault, v2)] {
+            let legacy_id = wire_id_for::<S>(keys.id_seed, ItemNs::Aux, "services").unwrap();
+            let legacy_before = pv.items.get(&legacy_id).map(|r| (r.version, r.ct.clone()));
+            let mut view = pv.fold_view::<S>(keys, vault).unwrap();
+            let base = ViewBase::of(&view).unwrap();
+            view.aux.services.insert(
+                "acme".into(),
+                serde_json::from_value(svc_entry("acme", "a.dev")).unwrap(),
+            );
+            view.aux.services.remove("old");
+            pv.reconcile_from_view::<S>(keys, vault, &view, ReconcileBase::Since(&base))
+                .unwrap();
+
+            let acme = wire_id_for::<S>(keys.id_seed, ItemNs::Service, "acme").unwrap();
+            let row = &pv.items[&acme];
+            assert!(
+                row.sig.is_none() && row.signer.is_none(),
+                "{vault}: unsigned"
+            );
+            assert!(
+                row.version > row.synced_version,
+                "{vault}: dirty, pushed by the sync"
+            );
+            assert_eq!(
+                pv.items.get(&legacy_id).map(|r| (r.version, r.ct.clone())),
+                legacy_before,
+                "{vault}: the legacy record is never rewritten"
+            );
+            let services = pv.fold_view::<S>(keys, vault).unwrap().aux.services;
+            assert_eq!(services.keys().collect::<Vec<_>>(), ["acme"], "{vault}");
+        }
+    }
+
+    /// The owner's switch for installed services lives in the `policy:`
+    /// record: written only when on (absent = off), kept through the
+    /// normalized form every client compares, and reassembled by the fold.
+    #[test]
+    fn the_installed_services_switch_is_in_the_policy_record() {
+        type S = sudp::primitives::StdPrimitives;
+        let on = crate::core::policy::Policy {
+            allow_installed_services: true,
+            ..crate::core::policy::Policy::default()
+        };
+        let root = policy_items(&on).unwrap()[0].1.clone();
+        assert_eq!(root["allow_installed_services"], serde_json::json!(true));
+        assert_eq!(
+            owner_config_typed(ItemNs::Policy, "", &root).unwrap()["allow_installed_services"],
+            serde_json::json!(true)
+        );
+        let off = crate::core::policy::Policy {
+            allow_installed_services: false,
+            ..on.clone()
+        };
+        assert!(policy_items(&off).unwrap()[0].1.get("allow_installed_services").is_none());
+        assert!(!crate::core::policy::Policy::effective(None).allow_installed_services);
+        assert!(crate::core::policy::Policy::effective(Some(&on)).allow_installed_services);
+
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let vault = "vault-switch";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        pv.plant::<S>(
+            keys,
+            vault,
+            ItemNs::Policy,
+            "",
+            1,
+            &ItemPayload::live(ItemNs::Policy, "", root),
+        )
+        .unwrap();
+        let aux = pv.fold_view::<S>(keys, vault).unwrap().aux;
+        assert!(aux.allows_installed_services());
+    }
+
+    /// Seal `payload` at `(ns, name)` version 1 and sign it as `signer`
+    /// (sidecar, record type `ty`): a row an owner's console wrote.
+    pub(crate) fn plant_signed(
+        pv: &mut PerItemVault,
+        keys: VaultKeys,
+        vault: &str,
+        signer: &crate::crypto::vault_key::UikRoot,
+        ty: &str,
+        payload: &ItemPayload,
+    ) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        type S = sudp::primitives::StdPrimitives;
+        let ctx =
+            ItemCtx::for_item::<S>(keys.id_seed, vault, payload.ns, &payload.name, 1).unwrap();
+        let ct = seal_item::<S>(keys.content, &ctx, payload).unwrap();
+        let input = crate::identity::record_signature_input(
+            ty,
+            ctx.id_bytes(),
+            1,
+            vault,
+            &ct,
+            !payload.is_tombstone(),
+            &signer.user_id(),
+        );
+        let sig = STANDARD.encode(signer.signing().sign(&input));
+        pv.put_raw_signed(ctx.item_id_b64(), 1, ct, Some(sig), Some(signer.user_id()));
+        ctx.item_id_b64()
+    }
+
+    /// LEGACY(services row) migration, on a vault without a keyset: every
+    /// entry the fold reads from the legacy record without a native row is
+    /// copied to a native item (object form); the legacy record is
+    /// tombstoned once every copy is held; the same services are read.
+    /// Idempotent. A vault with a keyset is the owner's console's: nothing is
+    /// written.
+    #[test]
+    fn legacy_services_migrate_to_native_items() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let fold =
+            |pv: &PerItemVault, vault: &str| pv.fold_view::<S>(keys, vault).unwrap().aux.services;
+
+        // v1: `a` already native (wins), `b` legacy-only and plain text (moves).
+        let vault = "vault-v1";
+        let mut v1 = v1_with_legacy_services(
+            keys,
+            vault,
+            serde_json::json!({ "a": svc_entry("a", "a.old"), "b": "[service]\nid = \"b\"\n" }),
+        );
+        v1.seal_and_bump::<S>(
+            keys,
+            vault,
+            ItemNs::Service,
+            "a",
+            &ItemPayload::live(ItemNs::Service, "a", svc_entry("a", "a.new")),
+        )
+        .unwrap();
+        let before: Vec<String> = fold(&v1, vault).keys().cloned().collect();
+        let a_id = wire_id_for::<S>(keys.id_seed, ItemNs::Service, "a").unwrap();
+        let a_version = v1.items[&a_id].version;
+        let changed = v1.migrate_legacy_copies::<S>(keys, vault);
+        assert_eq!(changed.len(), 1, "b copied");
+        let changed = v1.retire_legacy_rows::<S>(keys, vault, false);
+        assert_eq!(changed.len(), 1, "the legacy record tombstoned");
+        assert_eq!(v1.items[&a_id].version, a_version, "the native item wins");
+        assert!(v1
+            .open_item::<S>(keys, vault, ItemNs::Aux, "services")
+            .unwrap()
+            .unwrap()
+            .is_tombstone());
+        assert_eq!(
+            v1.open_item::<S>(keys, vault, ItemNs::Service, "b")
+                .unwrap()
+                .unwrap()
+                .body,
+            serde_json::json!({ "service": "[service]\nid = \"b\"\n" })
+        );
+        let after = fold(&v1, vault);
+        assert_eq!(after.keys().cloned().collect::<Vec<_>>(), before);
+        assert_eq!(
+            serde_json::to_value(&after["a"]).unwrap(),
+            svc_entry("a", "a.new")
+        );
+        assert!(v1.migrate_legacy_copies::<S>(keys, vault).is_empty());
+        assert!(v1.retire_legacy_rows::<S>(keys, vault, false).is_empty());
+
+        // v2 with an owner-signed legacy record: read, but left to the console.
+        let (vault, creator, _, _, _, mut v2) = role_fixture_creator_cred();
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "services",
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "services",
+                serde_json::json!({ "x": svc_entry("x", "x.dev") }),
+            ),
+        );
+        assert!(fold(&v2, vault).contains_key("x"));
+        let n = v2.items.len();
+        assert!(v2.migrate_legacy_copies::<S>(keys, vault).is_empty());
+        assert!(v2.retire_legacy_rows::<S>(keys, vault, false).is_empty());
+        assert_eq!(v2.items.len(), n, "nothing written with a keyset");
+        // An unsigned legacy record on a v2 keyset is not read at all.
+        let (vault, _, _, _, _, mut v2u) = role_fixture_creator_cred();
+        v2u.plant::<S>(
+            keys,
+            vault,
+            ItemNs::Aux,
+            "services",
+            1,
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "services",
+                serde_json::json!({ "y": svc_entry("y", "y.dev") }),
+            ),
+        )
+        .unwrap();
+        assert!(fold(&v2u, vault).is_empty());
+    }
+
+    /// A policy with every part, stores, store order and retention, for the
+    /// owner-config tests.
+    fn full_aux() -> crate::storage::plaintext::VaultAux {
+        let mut aux = crate::storage::plaintext::VaultAux::initial();
+        aux.policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "timeout": 120,
+                "default": { "read": "allow", "write": "ask", "ttl": 60 },
+                "categories": {
+                    "ai": { "read": "allow", "write": "allow" },
+                    "payments": { "write": "deny" }
+                },
+                "connections": {
+                    "gmail": { "default": { "write": "ask" } },
+                    "stripe-work": { "rules": { "pay": { "level": "deny" } } }
+                }
+            }))
+            .unwrap(),
+        );
+        aux.stores.insert(
+            "gcp-1".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "gcp-sm", "category": "value", "project_id": "p1"
+            }))
+            .unwrap(),
+        );
+        aux.store_order = vec!["native-secrets".into(), "gcp-1".into()];
+        aux.audit_retention_days = Some(30);
+        aux
+    }
+
+    /// The owner-config fields as JSON, to compare two views.
+    fn config_json(aux: &crate::storage::plaintext::VaultAux) -> serde_json::Value {
+        serde_json::json!({
+            "policy": aux.policy,
+            "stores": aux.stores,
+            "store_order": aux.store_order,
+            "audit_retention_days": aux.audit_retention_days,
+        })
+    }
+
+    /// A store on a vault without a keyset.
+    fn v1_store() -> PerItemVault {
+        PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap()
+    }
+
+    /// A row this key cannot open is never written over: a change that
+    /// would (an upsert of its record, the native tombstone that removes a
+    /// legacy-only service) is refused and reported, the row is left as it
+    /// is, and every other change still applies.
+    #[test]
+    fn a_row_that_cannot_be_read_is_never_written_over() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x66u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-unreadable";
+        let mut pv = v1_store();
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "services",
+            1,
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "services",
+                serde_json::json!({ "acme": svc_entry("acme", "a.dev") }),
+            ),
+        )
+        .unwrap();
+        // Rows sealed under another key at `service:acme` and `secret:B`.
+        let garbage = vec![7u8; 60];
+        let svc_wire = wire_id_for::<S>(&k, ItemNs::Service, "acme").unwrap();
+        let b_wire = wire_id_for::<S>(&k, ItemNs::Secret, "B").unwrap();
+        pv.put_raw(svc_wire.clone(), 3, garbage.clone());
+        pv.put_raw(b_wire.clone(), 2, garbage.clone());
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        assert!(view.aux.services.contains_key("acme"), "the legacy entry reads");
+        let base = ViewBase::of(&view).unwrap();
+        let mut changed = pv.fold_view::<S>(keys, vid).unwrap();
+        changed.aux.services.remove("acme");
+        changed.native_secrets.insert("B".into(), b"new".to_vec());
+        changed.native_secrets.insert("C".into(), b"c".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &changed, ReconcileBase::Since(&base))
+            .unwrap();
+        let refused: Vec<&String> = r.refused.iter().map(|(id, _)| id).collect();
+        assert_eq!(refused.len(), 2, "{:?}", r.refused);
+        assert!(refused.contains(&&svc_wire) && refused.contains(&&b_wire));
+        assert!(r
+            .refused
+            .iter()
+            .all(|(_, why)| why.contains("changed with a vault key this device does not have")));
+        for (wire, v) in [(&svc_wire, 3), (&b_wire, 2)] {
+            let row = pv.get_item(wire).unwrap();
+            assert_eq!((row.version, &row.ct), (v, &garbage), "left as it is");
+        }
+        // The rest applied.
+        assert_eq!(r.changed.len(), 1);
+        assert_eq!(pv.fold_view::<S>(keys, vid).unwrap().native_secrets["C"], b"c");
+
+        // After a keyset refresh, with keys of the current generation, both
+        // still open under no key this member holds: confirmed, and the same
+        // change now goes over them at their next versions.
+        assert!(pv.confirm_unreadable::<S>(keys, vid));
+        assert!(pv.get_item(&svc_wire).unwrap().unreadable_confirmed);
+        assert!(!pv.confirm_unreadable::<S>(keys, vid), "nothing new");
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        let base = ViewBase::of(&view).unwrap();
+        let mut changed = pv.fold_view::<S>(keys, vid).unwrap();
+        changed.aux.services.remove("acme");
+        changed.native_secrets.insert("B".into(), b"new".to_vec());
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &changed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(r.refused.is_empty(), "{:?}", r.refused);
+        assert_eq!(pv.get_item(&svc_wire).unwrap().version, 4);
+        assert!(pv.get_item(&svc_wire).unwrap().tombstone);
+        assert_eq!(pv.get_item(&b_wire).unwrap().version, 3);
+        assert!(!pv.get_item(&b_wire).unwrap().unreadable_confirmed);
+        let after = pv.fold_view::<S>(keys, vid).unwrap();
+        assert_eq!(after.native_secrets["B"], b"new");
+        assert!(!after.aux.services.contains_key("acme"));
+
+        // Keys of an earlier generation (a session from before the key
+        // changed) confirm nothing.
+        let fx = rekeyed_fixture();
+        let mut stale = fx.pv.clone();
+        stale.put_raw(svc_wire.clone(), 3, garbage.clone());
+        let old_bundle = crate::storage::item::vault_key_bundle(&fx.id_seed, &fx.c_old);
+        assert!(!stale.confirm_unreadable::<S>(VaultKeys::from_material(&old_bundle), fx.vault));
+        assert!(!stale.get_item(&svc_wire).unwrap().unreadable_confirmed);
+    }
+
+    /// Owner-config is written at its native records, one per edit unit
+    /// (`policy:`, `policy:category:<tag>`, `policy:connection:<id>`,
+    /// `store:<id>`, `store_order:`, `audit_retention_days:`), and the fold
+    /// reassembles exactly the same fields. Nothing at `aux:*`. On a keyset
+    /// vault this process writes no owner-config.
+    #[test]
+    fn owner_config_round_trips_through_its_native_records() {
+        use crate::storage::plaintext::VaultPlaintextView;
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x61u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-cfg";
+        let view = VaultPlaintextView {
+            aux: full_aux(),
+            native_secrets: Default::default(),
+            native_secret_notes: Default::default(),
+        };
+        // Seed (enroll) and reconcile both write the native records.
+        let mut seeded = v1_store();
+        seeded.seed_items_from_view::<S>(keys, vid, &view).unwrap();
+        let mut reconciled = v1_store();
+        reconciled
+            .reconcile_from_view::<S>(keys, vid, &view, ReconcileBase::OwnFold)
+            .unwrap();
+        for pv in [&seeded, &reconciled] {
+            let folded = pv.fold_view::<S>(keys, vid).unwrap();
+            assert_eq!(config_json(&folded.aux), config_json(&view.aux));
+            for (ns, name) in [
+                (ItemNs::Policy, ""),
+                (ItemNs::Policy, "category:ai"),
+                (ItemNs::Policy, "category:payments"),
+                (ItemNs::Policy, "connection:gmail"),
+                (ItemNs::Policy, "connection:stripe-work"),
+                (ItemNs::Store, "native-secrets"),
+                (ItemNs::Store, "gcp-1"),
+                (ItemNs::StoreOrder, ""),
+                (ItemNs::AuditRetentionDays, ""),
+            ] {
+                assert!(
+                    pv.open_item::<S>(keys, vid, ns, name).unwrap().is_some(),
+                    "{ns:?}:{name}"
+                );
+            }
+            for field in ["policy", "stores", "store_order", "audit_retention_days"] {
+                assert!(pv
+                    .open_item::<S>(keys, vid, ItemNs::Aux, field)
+                    .unwrap()
+                    .is_none());
+            }
+            assert_eq!(
+                pv.open_item::<S>(keys, vid, ItemNs::Policy, "")
+                    .unwrap()
+                    .unwrap()
+                    .body,
+                serde_json::json!({ "timeout": 120, "default": { "read": "allow", "write": "ask", "ttl": 60 } }),
+                "the policy's own fields only"
+            );
+        }
+        // An edit is one record: dropping a category tombstones only it.
+        let mut pv = reconciled;
+        let base = ViewBase::of(&pv.fold_view::<S>(keys, vid).unwrap()).unwrap();
+        let mut edited = pv.fold_view::<S>(keys, vid).unwrap();
+        edited
+            .aux
+            .policy
+            .as_mut()
+            .unwrap()
+            .categories
+            .remove("payments");
+        let r = pv
+            .reconcile_from_view::<S>(keys, vid, &edited, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(
+            r.changed,
+            [wire_id_for::<S>(&k, ItemNs::Policy, "category:payments").unwrap()]
+        );
+        assert_eq!(
+            config_json(&pv.fold_view::<S>(keys, vid).unwrap().aux),
+            config_json(&edited.aux)
+        );
+
+        // A keyset vault: no owner-config is written by this process.
+        let (vault, _, _, _, _, mut v2) = role_fixture_creator_cred();
+        let r = v2
+            .reconcile_from_view::<S>(keys, vault, &view, ReconcileBase::OwnFold)
+            .unwrap();
+        assert!(r.changed.is_empty(), "{:?}", r.changed);
+        assert!(v2
+            .seal_and_bump::<S>(
+                keys,
+                vault,
+                ItemNs::Policy,
+                "",
+                &ItemPayload::live(ItemNs::Policy, "", serde_json::json!({})),
+            )
+            .is_err());
+    }
+
+    /// The fold reads owner-config per key: an honored native record (live or
+    /// tombstone) wins its key; every other key comes from the legacy row.
+    /// A half-finished migration (some native policy records written, the
+    /// legacy row still live) reads the full, correct policy. An unknown
+    /// `policy` name is ignored. On a keyset vault an unsigned native record
+    /// is not honored (its key falls back to the legacy row); an owner-signed
+    /// one wins.
+    #[test]
+    fn owner_config_reads_native_first_per_key() {
+        use crate::storage::plaintext::VaultAux;
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x62u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-half";
+        let legacy = full_aux();
+        let legacy_policy = serde_json::to_value(&legacy.policy).unwrap();
+        let mut pv = v1_store();
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "policy",
+            1,
+            &ItemPayload::live(ItemNs::Aux, "policy", legacy_policy.clone()),
+        )
+        .unwrap();
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "stores",
+            1,
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "stores",
+                serde_json::to_value(&legacy.stores).unwrap(),
+            ),
+        )
+        .unwrap();
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "audit_retention_days",
+            1,
+            &ItemPayload::live(ItemNs::Aux, "audit_retention_days", serde_json::json!(30)),
+        )
+        .unwrap();
+        // The legacy rows alone read as before.
+        let only_legacy = pv.fold_view::<S>(keys, vid).unwrap().aux;
+        assert_eq!(
+            serde_json::to_value(&only_legacy.policy).unwrap(),
+            legacy_policy
+        );
+        assert_eq!(only_legacy.stores.len(), 2);
+
+        // Half-finished: the global part and one category written natively
+        // (with new values), one connection deleted natively; the rest only
+        // in the legacy row.
+        let put = |pv: &mut PerItemVault, ns: ItemNs, name: &str, p: ItemPayload| {
+            pv.seal_and_bump::<S>(keys, vid, ns, name, &p).unwrap();
+        };
+        put(
+            &mut pv,
+            ItemNs::Policy,
+            "",
+            ItemPayload::live(ItemNs::Policy, "", serde_json::json!({ "timeout": 300 })),
+        );
+        put(
+            &mut pv,
+            ItemNs::Policy,
+            "category:ai",
+            ItemPayload::live(
+                ItemNs::Policy,
+                "category:ai",
+                serde_json::json!({ "write": "ask" }),
+            ),
+        );
+        put(
+            &mut pv,
+            ItemNs::Policy,
+            "connection:gmail",
+            ItemPayload::tombstone(ItemNs::Policy, "connection:gmail"),
+        );
+        put(
+            &mut pv,
+            ItemNs::Store,
+            "gcp-1",
+            ItemPayload::tombstone(ItemNs::Store, "gcp-1"),
+        );
+        // An unknown policy name is ignored, whatever it holds.
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Policy,
+            "rules:pay",
+            1,
+            &ItemPayload::live(
+                ItemNs::Policy,
+                "rules:pay",
+                serde_json::json!({ "level": "allow" }),
+            ),
+        )
+        .unwrap();
+        let aux: VaultAux = pv.fold_view::<S>(keys, vid).unwrap().aux;
+        let mut want =
+            serde_json::from_value::<crate::core::policy::Policy>(legacy_policy.clone()).unwrap();
+        want.timeout = Some(300);
+        want.default = None; // the native global part has none: it wins
+        want.categories.insert(
+            "ai".into(),
+            serde_json::from_value(serde_json::json!({ "write": "ask" })).unwrap(),
+        );
+        want.connections.remove("gmail");
+        assert_eq!(
+            serde_json::to_value(&aux.policy).unwrap(),
+            serde_json::to_value(Some(&want)).unwrap(),
+            "native keys win, every other key from the legacy row"
+        );
+        assert!(aux
+            .policy
+            .as_ref()
+            .unwrap()
+            .categories
+            .contains_key("payments"));
+        assert!(aux
+            .policy
+            .as_ref()
+            .unwrap()
+            .connections
+            .contains_key("stripe-work"));
+        assert_eq!(
+            aux.stores.keys().collect::<Vec<_>>(),
+            ["native-secrets"],
+            "a native tombstone hides the legacy store"
+        );
+        assert_eq!(
+            aux.audit_retention_days,
+            Some(30),
+            "legacy, no native record"
+        );
+
+        // A keyset vault: an unsigned native record is not honored; an
+        // owner-signed one wins its key.
+        let (vault, creator, _, _, _, mut v2) = role_fixture_creator_cred();
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "policy",
+            &ItemPayload::live(ItemNs::Aux, "policy", legacy_policy.clone()),
+        );
+        v2.plant::<S>(
+            keys,
+            vault,
+            ItemNs::Policy,
+            "",
+            1,
+            &ItemPayload::live(ItemNs::Policy, "", serde_json::json!({ "timeout": 1 })),
+        )
+        .unwrap();
+        let read = v2.fold_view::<S>(keys, vault).unwrap().aux.policy.unwrap();
+        assert_eq!(read.timeout, Some(120), "unsigned native: not honored");
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "policy",
+            &ItemPayload::live(
+                ItemNs::Policy,
+                "category:ai",
+                serde_json::json!({ "write": "deny" }),
+            ),
+        );
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "policy",
+            &ItemPayload::tombstone(ItemNs::Policy, "connection:gmail"),
+        );
+        let read = v2.fold_view::<S>(keys, vault).unwrap().aux.policy.unwrap();
+        assert_eq!(
+            serde_json::to_value(&read.categories["ai"]).unwrap(),
+            serde_json::json!({ "write": "deny" }),
+            "owner-signed native wins its key"
+        );
+        assert!(
+            !read.connections.contains_key("gmail"),
+            "a signed tombstone wins"
+        );
+        assert!(read.categories.contains_key("payments"));
+    }
+
+    /// Defaults and first writes: a kind with no native record and no legacy
+    /// row reads its default (the native-secrets store); its first write
+    /// writes the whole kind, so adding a store keeps the default one; once a
+    /// native record of the kind exists there is no implicit default.
+    /// Removing a key that only the legacy row holds writes a native
+    /// tombstone, so the legacy entry does not come back.
+    #[test]
+    fn owner_config_first_write_and_legacy_only_removal() {
+        use crate::storage::plaintext::NATIVE_SECRETS_ID;
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x64u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-first";
+        let gcp: crate::storage::plaintext::Store =
+            serde_json::from_value(serde_json::json!({ "kind": "gcp-sm", "category": "value" }))
+                .unwrap();
+
+        // No owner-config record at all: the defaults.
+        let mut pv = v1_store();
+        let view = pv.fold_view::<S>(keys, vid).unwrap();
+        assert_eq!(
+            view.aux.stores.keys().collect::<Vec<_>>(),
+            [NATIVE_SECRETS_ID]
+        );
+        // Add a store: the whole kind is written, the default store stays.
+        let base = ViewBase::of(&view).unwrap();
+        let mut added = pv.fold_view::<S>(keys, vid).unwrap();
+        added.aux.stores.insert("gcp-1".into(), gcp.clone());
+        pv.reconcile_from_view::<S>(keys, vid, &added, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(pv
+            .open_item::<S>(keys, vid, ItemNs::Store, NATIVE_SECRETS_ID)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            pv.fold_view::<S>(keys, vid)
+                .unwrap()
+                .aux
+                .stores
+                .keys()
+                .collect::<Vec<_>>(),
+            ["gcp-1", NATIVE_SECRETS_ID]
+        );
+
+        // A native store record alone: no implicit default.
+        let mut only = v1_store();
+        only.seal_and_bump::<S>(
+            keys,
+            vid,
+            ItemNs::Store,
+            "gcp-1",
+            &ItemPayload::live(ItemNs::Store, "gcp-1", serde_json::to_value(&gcp).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            only.fold_view::<S>(keys, vid)
+                .unwrap()
+                .aux
+                .stores
+                .keys()
+                .collect::<Vec<_>>(),
+            ["gcp-1"]
+        );
+
+        // Remove a store only the legacy row holds: a native tombstone.
+        let mut legacy = v1_store();
+        let mut stores = crate::storage::plaintext::VaultAux::initial().stores;
+        stores.insert("gcp-1".into(), gcp);
+        legacy
+            .plant::<S>(
+                keys,
+                vid,
+                ItemNs::Aux,
+                "stores",
+                1,
+                &ItemPayload::live(
+                    ItemNs::Aux,
+                    "stores",
+                    serde_json::to_value(&stores).unwrap(),
+                ),
+            )
+            .unwrap();
+        let view = legacy.fold_view::<S>(keys, vid).unwrap();
+        let base = ViewBase::of(&view).unwrap();
+        let mut removed = legacy.fold_view::<S>(keys, vid).unwrap();
+        removed.aux.stores.remove("gcp-1");
+        legacy
+            .reconcile_from_view::<S>(keys, vid, &removed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert!(legacy
+            .open_item::<S>(keys, vid, ItemNs::Store, "gcp-1")
+            .unwrap()
+            .unwrap()
+            .is_tombstone());
+        assert_eq!(
+            legacy
+                .fold_view::<S>(keys, vid)
+                .unwrap()
+                .aux
+                .stores
+                .keys()
+                .collect::<Vec<_>>(),
+            [NATIVE_SECRETS_ID],
+            "the legacy entry does not come back; the other one still reads"
+        );
+    }
+
+    /// Mark every dirty row of `pv` as pushed (the cloud now holds it),
+    /// except `keep_dirty`.
+    fn mark_pushed(pv: &mut PerItemVault, keep_dirty: &[&str]) {
+        for (id, row) in pv.items.iter_mut() {
+            if !keep_dirty.contains(&id.as_str()) {
+                row.synced_version = row.version;
+            }
+        }
+    }
+
+    /// LEGACY(aux addressing) migration on a vault without a keyset. Step 1
+    /// copies every entry of every legacy row the fold reads to its native
+    /// record (a key that already has an honored native record keeps it);
+    /// the legacy rows stay. Step 2 tombstones a legacy row only once every
+    /// one of its copies is held on the cloud: a copy that did not land
+    /// keeps its row live. The fold reads the same throughout; `aux:secret_order`
+    /// (the console's) is never touched. Idempotent. A keyset vault: nothing.
+    #[test]
+    fn legacy_rows_are_retired_only_after_their_copies_land() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x63u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-mig";
+        let legacy = full_aux();
+        let mut pv = v1_store();
+        for (field, body) in [
+            ("policy", serde_json::to_value(&legacy.policy).unwrap()),
+            ("stores", serde_json::to_value(&legacy.stores).unwrap()),
+            (
+                "store_order",
+                serde_json::to_value(&legacy.store_order).unwrap(),
+            ),
+            ("audit_retention_days", serde_json::json!(30)),
+            ("secret_order", serde_json::json!(["A", "B"])),
+            (
+                "services",
+                serde_json::json!({ "acme": svc_entry("acme", "a.dev") }),
+            ),
+        ] {
+            pv.plant::<S>(
+                keys,
+                vid,
+                ItemNs::Aux,
+                field,
+                1,
+                &ItemPayload::live(ItemNs::Aux, field, body),
+            )
+            .unwrap();
+        }
+        // Half-finished already: one native category with another value.
+        pv.seal_and_bump::<S>(
+            keys,
+            vid,
+            ItemNs::Policy,
+            "category:ai",
+            &ItemPayload::live(
+                ItemNs::Policy,
+                "category:ai",
+                serde_json::json!({ "write": "deny" }),
+            ),
+        )
+        .unwrap();
+        mark_pushed(&mut pv, &[]);
+        let ai_id = wire_id_for::<S>(&k, ItemNs::Policy, "category:ai").unwrap();
+        let ai_version = pv.items[&ai_id].version;
+        let read = |pv: &PerItemVault| {
+            let v = pv.fold_view::<S>(keys, vid).unwrap();
+            (
+                config_json(&v.aux),
+                serde_json::to_value(&v.aux.services).unwrap(),
+            )
+        };
+        let before = read(&pv);
+        let secret_order_id = wire_id_for::<S>(&k, ItemNs::Aux, "secret_order").unwrap();
+        let secret_order_row = pv.items[&secret_order_id].clone();
+        let legacy_live = |pv: &PerItemVault, field: &str| {
+            !pv.open_item::<S>(keys, vid, ItemNs::Aux, field)
+                .unwrap()
+                .unwrap()
+                .is_tombstone()
+        };
+
+        // Step 1: policy root + payments + 2 connections (ai kept); stores: 2;
+        // store_order; retention; the service. No legacy row is touched.
+        let copies = pv.migrate_legacy_copies::<S>(keys, vid);
+        assert_eq!(copies.len(), 4 + 2 + 1 + 1 + 1, "{copies:?}");
+        assert_eq!(
+            pv.items[&ai_id].version, ai_version,
+            "a native key keeps its record"
+        );
+        // Each copy is marked as written by SafeClaw's automatic upgrade.
+        assert!(copies.iter().all(|id| pv.items[id].upgrade));
+        assert!(!pv.items[&ai_id].upgrade);
+        for field in [
+            "policy",
+            "stores",
+            "store_order",
+            "audit_retention_days",
+            "services",
+        ] {
+            assert!(
+                legacy_live(&pv, field),
+                "aux:{field} stays until its copies land"
+            );
+        }
+        assert_eq!(read(&pv), before, "the same configuration is read");
+
+        // Nothing pushed yet: nothing retired.
+        assert!(pv.retire_legacy_rows::<S>(keys, vid, true).is_empty());
+        // Every copy landed but `store_order:` (an error, a refusal, a
+        // conflict left for later): its legacy row stays live, the others go.
+        let order_id = wire_id_for::<S>(&k, ItemNs::StoreOrder, "").unwrap();
+        mark_pushed(&mut pv, &[order_id.as_str()]);
+        let retired = pv.retire_legacy_rows::<S>(keys, vid, true);
+        assert_eq!(retired.len(), 4, "{retired:?}");
+        assert!(retired.iter().all(|id| pv.items[id].upgrade));
+        assert!(legacy_live(&pv, "store_order"));
+        for field in ["policy", "stores", "audit_retention_days", "services"] {
+            assert!(!legacy_live(&pv, field), "aux:{field} retired");
+        }
+        assert_eq!(read(&pv), before);
+        // A later run, once it landed, retires it.
+        mark_pushed(&mut pv, &[]);
+        assert_eq!(pv.retire_legacy_rows::<S>(keys, vid, true).len(), 1);
+        assert!(!legacy_live(&pv, "store_order"));
+        let row = &pv.items[&secret_order_id];
+        assert!(row.version == secret_order_row.version && row.ct == secret_order_row.ct);
+        assert_eq!(read(&pv), before, "the same configuration is read");
+        mark_pushed(&mut pv, &[]);
+        assert!(
+            pv.migrate_legacy_copies::<S>(keys, vid).is_empty(),
+            "idempotent"
+        );
+        assert!(
+            pv.retire_legacy_rows::<S>(keys, vid, true).is_empty(),
+            "idempotent"
+        );
+        // A person's later write of a record is theirs, not the upgrade's.
+        let (iid, _) = pv
+            .seal_and_bump::<S>(
+                keys,
+                vid,
+                ItemNs::AuditRetentionDays,
+                "",
+                &ItemPayload::live(ItemNs::AuditRetentionDays, "", serde_json::json!(60)),
+            )
+            .unwrap();
+        assert!(!pv.items[&iid].upgrade);
+
+        // Each row on its own: an unparseable `aux:services` or
+        // `aux:store_order` is left as it is and blocks nothing else.
+        let mut bad = v1_store();
+        for (field, body) in [
+            ("store_order", serde_json::json!({ "not": "a list" })),
+            ("services", serde_json::json!("not a map")),
+            ("audit_retention_days", serde_json::json!(7)),
+        ] {
+            bad.plant::<S>(
+                keys,
+                vid,
+                ItemNs::Aux,
+                field,
+                1,
+                &ItemPayload::live(ItemNs::Aux, field, body),
+            )
+            .unwrap();
+        }
+        assert_eq!(bad.migrate_legacy_copies::<S>(keys, vid).len(), 1);
+        assert_eq!(bad.retire_legacy_rows::<S>(keys, vid, false).len(), 1);
+        assert!(!bad
+            .open_item::<S>(keys, vid, ItemNs::Aux, "store_order")
+            .unwrap()
+            .unwrap()
+            .is_tombstone());
+        assert!(!bad
+            .open_item::<S>(keys, vid, ItemNs::Aux, "services")
+            .unwrap()
+            .unwrap()
+            .is_tombstone());
+
+        // A keyset vault: the owner's console migrates; nothing is written here.
+        let (vault, creator, _, _, _, mut v2) = role_fixture_creator_cred();
+        plant_signed(
+            &mut v2,
+            keys,
+            vault,
+            &creator,
+            "policy",
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "policy",
+                serde_json::to_value(&legacy.policy).unwrap(),
+            ),
+        );
+        let n = v2.items.len();
+        assert!(v2.migrate_legacy_copies::<S>(keys, vault).is_empty());
+        assert!(v2.retire_legacy_rows::<S>(keys, vault, false).is_empty());
+        assert_eq!(v2.items.len(), n);
+        assert!(v2.fold_view::<S>(keys, vault).unwrap().aux.policy.is_some());
+    }
+
+    /// A row counts only at the derived id of its own (ns, name), whatever
+    /// its name: one anywhere else is never read, a "copy"-named one
+    /// included. A conflict copy is the record of its own name at that name's
+    /// id: it folds like any record, and a tombstone there removes it.
+    #[test]
+    fn rows_count_only_at_their_own_address_copies_included() {
+        use crate::storage::item::{conflict_copy_name, seal_wire_item};
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x5au8; 32];
+        let keys = VaultKeys::single(&k);
+        let vault = "vault-v1";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        // Rows away from their own address (planted at another name's id).
+        let elsewhere = [
+            ItemPayload::live(
+                ItemNs::Policy,
+                String::new(),
+                serde_json::json!({ "timeout": 1 }),
+            ),
+            ItemPayload::live(
+                ItemNs::Store,
+                "gcp-1 (conflict copy)".to_string(),
+                serde_json::json!({ "kind": "gcp-sm", "category": "value" }),
+            ),
+            ItemPayload::live(
+                ItemNs::Connecting,
+                "gmail".to_string(),
+                serde_json::json!({ "service": "gmail" }),
+            ),
+            ItemPayload::live(ItemNs::Secret, conflict_copy_name("A"), serde_json::json!("v")),
+        ];
+        for (i, ours) in elsewhere.iter().enumerate() {
+            let wire = wire_id_for::<S>(&k, ItemNs::Secret, &format!("other-{}", i)).unwrap();
+            let ct = seal_wire_item::<S>(keys, vault, &wire, 1, ours).unwrap();
+            pv.put_raw(wire, 1, ct);
+        }
+        let view = pv.fold_view::<S>(keys, vault).unwrap();
+        assert!(view.aux.policy.is_none());
+        assert!(!view.aux.stores.contains_key("gcp-1 (conflict copy)"));
+        assert!(view.aux.connecting.is_empty());
+        assert!(view.native_secrets.is_empty());
+
+        // A copy at its own name's id folds; its removal sticks.
+        let copy = conflict_copy_name("A");
+        pv.seal_and_bump::<S>(
+            keys,
+            vault,
+            ItemNs::Secret,
+            &copy,
+            &ItemPayload::secret_live(copy.clone(), "ours"),
+        )
+        .unwrap();
+        let view = pv.fold_view::<S>(keys, vault).unwrap();
+        assert_eq!(view.native_secrets[&copy], b"ours");
+        let base = ViewBase::of(&view).unwrap();
+        let mut removed = pv.fold_view::<S>(keys, vault).unwrap();
+        removed.native_secrets.remove(&copy);
+        let r = pv
+            .reconcile_from_view::<S>(keys, vault, &removed, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(r.changed.len(), 1);
+        for _ in 0..2 {
+            let view = pv.fold_view::<S>(keys, vault).unwrap();
+            assert!(!view.native_secrets.contains_key(&copy), "removal sticks");
+            let base = ViewBase::of(&view).unwrap();
+            let again = pv
+                .reconcile_from_view::<S>(keys, vault, &view, ReconcileBase::Since(&base))
+                .unwrap();
+            assert!(again.changed.is_empty());
+        }
+        // The same for a connection copy.
+        let conn = conflict_copy_name("gmail");
+        pv.seal_and_bump::<S>(
+            keys,
+            vault,
+            ItemNs::Connection,
+            &conn,
+            &ItemPayload::live(
+                ItemNs::Connection,
+                conn.clone(),
+                serde_json::json!({ "service": "gmail" }),
+            ),
+        )
+        .unwrap();
+        let view = pv.fold_view::<S>(keys, vault).unwrap();
+        assert!(view.aux.connections.contains_key(&conn));
+        let base = ViewBase::of(&view).unwrap();
+        let mut removed = pv.fold_view::<S>(keys, vault).unwrap();
+        removed.aux.connections.remove(&conn);
+        pv.reconcile_from_view::<S>(keys, vault, &removed, ReconcileBase::Since(&base))
+            .unwrap();
+        let view = pv.fold_view::<S>(keys, vault).unwrap();
+        assert!(!view.aux.connections.contains_key(&conn), "removal sticks");
+    }
+
+    /// The old in-body owner wrapper `{data, uik_sig, uik_sign_pub}` over
+    /// `data`, signed by `signer` as `config_name` at `version`.
+    pub(crate) fn in_body_signed(
+        vault: &str,
+        signer: &crate::crypto::vault_key::UikRoot,
+        config_name: &str,
+        version: u64,
+        data: &serde_json::Value,
+    ) -> serde_json::Value {
+        use base64::engine::general_purpose::STANDARD;
+        let canonical = crate::crypto::canonical::canonicalize(data);
+        let input = crate::identity::config_sig_input(
+            vault,
+            config_name,
+            version,
+            Some(&canonical),
+            &signer.user_id(),
+        );
+        serde_json::json!({
+            "data": data,
+            "uik_sig": STANDARD.encode(signer.signing().sign(&input)),
+            "uik_sign_pub": STANDARD.encode(signer.signing().public_bytes()),
+        })
+    }
+
+    /// Native owner-config is sidecar-only: an owner's in-body wrapper counts
+    /// only on a legacy `aux:<field>` row. The same wrapper re-sealed at
+    /// `policy:connection:<id>` (its signature is not bound to that name)
+    /// is not honored, so it cannot erase that connection's rules. Without a
+    /// keyset, a native body claiming a signature is not honored either.
+    #[test]
+    fn native_owner_config_is_sidecar_only() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x71u8; 32];
+        let keys = VaultKeys::single(&k);
+        let (vault, creator, _, _, _, mut pv) = role_fixture_creator_cred();
+        let legacy = serde_json::to_value(&full_aux().policy).unwrap();
+        let wrapper = in_body_signed(vault, &creator, "policy", 1, &legacy);
+        pv.plant::<S>(
+            keys,
+            vault,
+            ItemNs::Aux,
+            "policy",
+            1,
+            &ItemPayload::live(ItemNs::Aux, "policy", wrapper.clone()),
+        )
+        .unwrap();
+        let rules = |pv: &PerItemVault| {
+            let p = pv.fold_view::<S>(keys, vault).unwrap().aux.policy.unwrap();
+            serde_json::to_value(&p.connections["stripe-work"]).unwrap()
+        };
+        let before = rules(&pv);
+        assert_eq!(
+            before,
+            serde_json::json!({ "rules": { "pay": { "level": "deny" } } }),
+            "the legacy row's in-body owner signature is honored"
+        );
+        // A member replays it as a native record, at the version it was signed at.
+        for name in ["connection:stripe-work", ""] {
+            pv.plant::<S>(
+                keys,
+                vault,
+                ItemNs::Policy,
+                name,
+                1,
+                &ItemPayload::live(ItemNs::Policy, name, wrapper.clone()),
+            )
+            .unwrap();
+        }
+        assert_eq!(rules(&pv), before, "the replayed wrapper is not honored");
+        assert_eq!(
+            pv.fold_view::<S>(keys, vault)
+                .unwrap()
+                .aux
+                .policy
+                .unwrap()
+                .timeout,
+            Some(120)
+        );
+
+        // No keyset: a plain native body is honored, one claiming a signature not.
+        let vid = "vault-v1";
+        let mut v1 = v1_store();
+        v1.seal_and_bump::<S>(
+            keys,
+            vid,
+            ItemNs::Policy,
+            "",
+            &ItemPayload::live(ItemNs::Policy, "", serde_json::json!({ "timeout": 5 })),
+        )
+        .unwrap();
+        v1.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Policy,
+            "category:ai",
+            1,
+            &ItemPayload::live(
+                ItemNs::Policy,
+                "category:ai",
+                in_body_signed(
+                    vid,
+                    &creator,
+                    "policy",
+                    1,
+                    &serde_json::json!({ "write": "deny" }),
+                ),
+            ),
+        )
+        .unwrap();
+        let p = v1.fold_view::<S>(keys, vid).unwrap().aux.policy.unwrap();
+        assert_eq!(p.timeout, Some(5));
+        assert!(p.categories.is_empty());
+    }
+
+    /// A record is identified by its address: a row at the derived id of its
+    /// own (ns, name) is that record whatever its name, so a connection
+    /// really named "gmail (conflict copy)" keeps its policy, migrated or
+    /// not, and a secret named like a copy is read under that name. A record
+    /// of any kind at another record's address (secret, legacy row) is not
+    /// read.
+    #[test]
+    fn records_are_identified_by_address_not_by_name() {
+        use crate::storage::item::conflict_copy_name;
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x72u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-copies";
+        let named = conflict_copy_name("gmail");
+        let mut pv = v1_store();
+        let legacy_policy = serde_json::json!({
+            "connections": { named.clone(): { "default": { "write": "deny" } } }
+        });
+        pv.plant::<S>(
+            keys,
+            vid,
+            ItemNs::Aux,
+            "policy",
+            1,
+            &ItemPayload::live(ItemNs::Aux, "policy", legacy_policy),
+        )
+        .unwrap();
+        pv.seal_and_bump::<S>(
+            keys,
+            vid,
+            ItemNs::Connection,
+            &named,
+            &ItemPayload::live(
+                ItemNs::Connection,
+                named.clone(),
+                serde_json::json!({ "service": "gmail" }),
+            ),
+        )
+        .unwrap();
+        let read = |pv: &PerItemVault| pv.fold_view::<S>(keys, vid).unwrap();
+        let level = |pv: &PerItemVault| {
+            serde_json::to_value(&read(pv).aux.policy.unwrap().connections[&named]).unwrap()
+        };
+        let want = serde_json::json!({ "default": { "write": "deny" } });
+        assert!(read(&pv).aux.connections.contains_key(&named));
+        assert_eq!(level(&pv), want, "legacy");
+        // Migrated: its native record is at its own id and is read.
+        assert_eq!(pv.migrate_legacy_copies::<S>(keys, vid).len(), 2);
+        assert_eq!(pv.retire_legacy_rows::<S>(keys, vid, false).len(), 1);
+        assert_eq!(level(&pv), want, "migrated");
+
+        // A secret named like a copy, at its own id, is read under its name.
+        pv.seal_and_bump::<S>(
+            keys,
+            vid,
+            ItemNs::Secret,
+            &conflict_copy_name("A"),
+            &ItemPayload::secret_live(conflict_copy_name("A"), "real"),
+        )
+        .unwrap();
+        assert_eq!(read(&pv).native_secrets[&conflict_copy_name("A")], b"real");
+
+        // A record sealed at another record's address is not read: a secret
+        // `B` at `Z`'s, a legacy row at another field's.
+        let at = |ns, name: &str| ItemCtx::for_item::<S>(keys.id_seed, vid, ns, name, 1).unwrap();
+        let z = at(ItemNs::Secret, "Z");
+        let ct = seal_item::<S>(keys.content, &z, &ItemPayload::secret_live("B", "b")).unwrap();
+        pv.put_raw(z.item_id_b64(), 1, ct);
+        let other = at(ItemNs::Aux, "stores");
+        let ct = seal_item::<S>(
+            keys.content,
+            &other,
+            &ItemPayload::live(ItemNs::Aux, "audit_retention_days", serde_json::json!(9)),
+        )
+        .unwrap();
+        pv.put_raw(other.item_id_b64(), 1, ct);
+        let v = read(&pv);
+        assert!(!v.native_secrets.contains_key("B"));
+        assert_eq!(v.aux.audit_retention_days, None);
+    }
+
+    /// Defaults, one rule: a kind reads its default iff no entry survives the
+    /// per-key merge (no live native record, no legacy entry a native
+    /// tombstone does not remove). A tombstone alone never cancels a default:
+    /// a tombstoned `store_order:` is the default order (so secrets still
+    /// resolve). A legacy `aux:stores = {}` and empty-key policy entries
+    /// read the same before and after the migration. A change to a kind that
+    /// reads its default writes the whole kind.
+    #[test]
+    fn a_kind_reads_its_default_only_when_no_entry_survives() {
+        use crate::storage::plaintext::{VaultAux, NATIVE_SECRETS_ID};
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x73u8; 32];
+        let keys = VaultKeys::single(&k);
+        let vid = "vault-defaults";
+        let defaults = VaultAux::initial();
+        let read = |pv: &PerItemVault| pv.fold_view::<S>(keys, vid).unwrap().aux;
+        let tomb = |pv: &mut PerItemVault, ns: ItemNs, name: &str| {
+            pv.seal_and_bump::<S>(keys, vid, ns, name, &ItemPayload::tombstone(ns, name))
+                .unwrap();
+        };
+        let legacy = |pv: &mut PerItemVault, field: &str, body: serde_json::Value| {
+            pv.plant::<S>(
+                keys,
+                vid,
+                ItemNs::Aux,
+                field,
+                1,
+                &ItemPayload::live(ItemNs::Aux, field, body),
+            )
+            .unwrap();
+        };
+
+        // Tombstones alone.
+        let mut pv = v1_store();
+        tomb(&mut pv, ItemNs::StoreOrder, "");
+        tomb(&mut pv, ItemNs::Store, "gcp-1");
+        tomb(&mut pv, ItemNs::AuditRetentionDays, "");
+        tomb(&mut pv, ItemNs::Policy, "");
+        let aux = read(&pv);
+        assert_eq!(aux.store_order, defaults.store_order, "the default order");
+        assert_eq!(config_json(&aux), config_json(&defaults));
+
+        // A legacy row whose every entry a native tombstone removes.
+        let mut pv = v1_store();
+        legacy(&mut pv, "store_order", serde_json::json!(["gcp-1"]));
+        legacy(
+            &mut pv,
+            "stores",
+            serde_json::json!({ "gcp-1": { "kind": "gcp-sm", "category": "value" } }),
+        );
+        tomb(&mut pv, ItemNs::StoreOrder, "");
+        tomb(&mut pv, ItemNs::Store, "gcp-1");
+        assert_eq!(config_json(&read(&pv)), config_json(&defaults));
+
+        // Adding a store then writes the whole kind: the default store stays.
+        let base = ViewBase::of(&pv.fold_view::<S>(keys, vid).unwrap()).unwrap();
+        let mut added = pv.fold_view::<S>(keys, vid).unwrap();
+        added.aux.stores.insert(
+            "gcp-2".into(),
+            serde_json::from_value(serde_json::json!({ "kind": "gcp-sm", "category": "value" }))
+                .unwrap(),
+        );
+        pv.reconcile_from_view::<S>(keys, vid, &added, ReconcileBase::Since(&base))
+            .unwrap();
+        assert_eq!(
+            read(&pv).stores.keys().collect::<Vec<_>>(),
+            ["gcp-2", NATIVE_SECRETS_ID]
+        );
+
+        // Before and after the migration: `aux:stores = {}`, `aux:store_order
+        // = []`, a null retention, empty-key categories and connections.
+        let mut pv = v1_store();
+        legacy(&mut pv, "stores", serde_json::json!({}));
+        legacy(&mut pv, "store_order", serde_json::json!([]));
+        legacy(&mut pv, "audit_retention_days", serde_json::Value::Null);
+        legacy(
+            &mut pv,
+            "policy",
+            serde_json::json!({
+                "timeout": 10,
+                "categories": { "": { "write": "deny" }, "ai": { "write": "ask" } },
+                "connections": { "": { "default": { "read": "deny" } } }
+            }),
+        );
+        let before = config_json(&read(&pv));
+        assert_eq!(
+            before["stores"],
+            serde_json::to_value(&defaults.stores).unwrap()
+        );
+        assert_eq!(before["store_order"], serde_json::json!([]));
+        assert_eq!(
+            before["policy"],
+            serde_json::json!({ "timeout": 10, "categories": { "ai": { "write": "ask" } } })
+        );
+        pv.migrate_legacy_copies::<S>(keys, vid);
+        pv.retire_legacy_rows::<S>(keys, vid, false);
+        for field in ["stores", "store_order", "audit_retention_days", "policy"] {
+            assert!(pv
+                .open_item::<S>(keys, vid, ItemNs::Aux, field)
+                .unwrap()
+                .unwrap()
+                .is_tombstone());
+        }
+        assert_eq!(
+            config_json(&read(&pv)),
+            before,
+            "the same after the migration"
+        );
+    }
+
+    /// The last honored owner-config value is kept: on a vault with a
+    /// keyset, a row the fold would not honor (an unsigned tombstone over an
+    /// owner-signed legacy `aux:policy`, an unsigned native record over an
+    /// owner-signed one) or cannot read never replaces an honored one; an
+    /// owner-signed row does. Not owner-config, or no keyset: always adopted.
+    #[test]
+    fn honored_owner_config_is_kept_over_an_unhonored_row() {
+        use sudp::primitives::StdPrimitives;
+        type S = StdPrimitives;
+        let k = [0x74u8; 32];
+        let keys = VaultKeys::single(&k);
+        let (vault, creator, member, _, _, mut pv) = role_fixture_creator_cred();
+        let legacy = serde_json::to_value(&full_aux().policy).unwrap();
+        pv.plant::<S>(
+            keys,
+            vault,
+            ItemNs::Aux,
+            "policy",
+            1,
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "policy",
+                in_body_signed(vault, &creator, "policy", 1, &legacy),
+            ),
+        )
+        .unwrap();
+        let wire = wire_id_for::<S>(keys.id_seed, ItemNs::Aux, "policy").unwrap();
+        // An incoming row at version 2, as sealed by `seal` and signed by `by`.
+        let incoming = |p: &ItemPayload, by: Option<&crate::crypto::vault_key::UikRoot>| {
+            let mut scratch = role_fixture_creator_cred().5;
+            let id = match by {
+                Some(s) => {
+                    let ctx =
+                        ItemCtx::for_item::<S>(keys.id_seed, vault, p.ns, &p.name, 2).unwrap();
+                    let ct = seal_item::<S>(keys.content, &ctx, p).unwrap();
+                    let ty = crate::storage::item::rule(p.ns, &p.name)
+                        .and_then(|r| r.signature_type(&p.name))
+                        .unwrap();
+                    let input = crate::identity::record_signature_input(
+                        ty,
+                        ctx.id_bytes(),
+                        2,
+                        vault,
+                        &ct,
+                        !p.is_tombstone(),
+                        &s.user_id(),
+                    );
+                    use base64::engine::general_purpose::STANDARD;
+                    let sig = STANDARD.encode(s.signing().sign(&input));
+                    scratch.put_raw_signed(ctx.item_id_b64(), 2, ct, Some(sig), Some(s.user_id()));
+                    ctx.item_id_b64()
+                }
+                None => scratch
+                    .plant::<S>(keys, vault, p.ns, &p.name, 2, p)
+                    .unwrap(),
+            };
+            scratch.items[&id].clone()
+        };
+        let tomb = ItemPayload::tombstone(ItemNs::Aux, "policy");
+        assert!(pv.keeps_honored_owner_config::<S>(keys, vault, &wire, &incoming(&tomb, None)));
+        assert!(pv.keeps_honored_owner_config::<S>(
+            keys,
+            vault,
+            &wire,
+            &incoming(&tomb, Some(&member))
+        ));
+        assert!(!pv.keeps_honored_owner_config::<S>(
+            keys,
+            vault,
+            &wire,
+            &incoming(&tomb, Some(&creator))
+        ));
+        let mut unreadable = incoming(&tomb, Some(&creator));
+        unreadable.ct[5] ^= 1;
+        assert!(pv.keeps_honored_owner_config::<S>(keys, vault, &wire, &unreadable));
+        // Each says why.
+        assert_eq!(
+            pv.unhonored_replacement::<S>(keys, vault, &wire, &unreadable),
+            Some(HELD_UNREADABLE)
+        );
+        assert_eq!(
+            pv.unhonored_replacement::<S>(keys, vault, &wire, &incoming(&tomb, Some(&member))),
+            Some(HELD_NOT_OWNER_SIGNED)
+        );
+
+        // A native record signed by an owner, replaced unsigned.
+        let cat = ItemPayload::live(
+            ItemNs::Policy,
+            "category:ai",
+            serde_json::json!({ "write": "deny" }),
+        );
+        let cat_wire = plant_signed(&mut pv, keys, vault, &creator, "policy", &cat);
+        let cat2 = ItemPayload::live(
+            ItemNs::Policy,
+            "category:ai",
+            serde_json::json!({ "write": "allow" }),
+        );
+        assert!(pv.keeps_honored_owner_config::<S>(keys, vault, &cat_wire, &incoming(&cat2, None)));
+        assert!(!pv.keeps_honored_owner_config::<S>(
+            keys,
+            vault,
+            &cat_wire,
+            &incoming(&cat2, Some(&creator))
+        ));
+
+        // Not owner-config: adopted.
+        let s_wire = pv
+            .plant::<S>(
+                keys,
+                vault,
+                ItemNs::Secret,
+                "A",
+                1,
+                &ItemPayload::secret_live("A", "a"),
+            )
+            .unwrap();
+        let s2 = incoming(&ItemPayload::tombstone(ItemNs::Secret, "A"), None);
+        assert!(!pv.keeps_honored_owner_config::<S>(keys, vault, &s_wire, &s2));
+
+        // No keyset: never.
+        let vid = "vault-v1";
+        let mut v1 = v1_store();
+        let w = v1
+            .plant::<S>(
+                keys,
+                vid,
+                ItemNs::Aux,
+                "policy",
+                1,
+                &ItemPayload::live(ItemNs::Aux, "policy", legacy),
+            )
+            .unwrap();
+        let ctx = ItemCtx::for_item::<S>(keys.id_seed, vid, ItemNs::Aux, "policy", 2).unwrap();
+        let t = StoredItem {
+            version: 2,
+            ct: seal_item::<S>(keys.content, &ctx, &tomb).unwrap(),
+            synced_version: 2,
+            tombstone: false,
+            sig: None,
+            signer: None,
+            base: None,
+            upgrade: false,
+            generation: None,
+            unreadable_confirmed: false,
+        };
+        assert!(!v1.keeps_honored_owner_config::<S>(keys, vid, &w, &t));
+    }
+
+    // ── admin role rename + approval authority ─────────────────────────────
+
+    /// A record signed before the rename carries `"owner"`: it folds as an ADMIN
+    /// (checkpoint grant and delegation event alike), and keeps its spelling so a
+    /// re-emitted record still carries the exact bytes its signature covers.
+    #[test]
+    fn legacy_owner_token_folds_as_admin_and_round_trips() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, creator, member, creator_id, member_id, mut pv) = role_fixture_creator_cred();
+
+        let legacy: MemberRole = serde_json::from_value(serde_json::json!("owner")).unwrap();
+        assert!(legacy.is_admin());
+        assert_eq!(legacy, MemberRole::Admin, "a legacy owner IS an admin");
+        assert_ne!(legacy, MemberRole::Member);
+
+        // Checkpoint grant: creator-signed over "owner", role read off the wire.
+        let grant = creator.signing().sign(&crate::identity::role_grant_input(
+            vault, &member_id, "owner", 0,
+        ));
+        pv.set_uik_cred(
+            "cid-member".into(),
+            member_id.clone(),
+            member.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            legacy,
+            grant.to_vec(),
+        );
+        assert!(owner_set(&pv, vault).get(&member_id).is_some_and(|r| r.is_admin()));
+        assert_eq!(
+            serde_json::to_value(pv.uik_cred("cid-member").unwrap().role).unwrap(),
+            serde_json::json!("owner"),
+            "the legacy spelling survives re-emission",
+        );
+
+        // Delegation event as an old console wrote it: role "owner", signed over "owner".
+        let c = UikRoot::from_root([0x66u8; 32]);
+        let c_id = c.user_id();
+        cred_no_grant(&mut pv, "cid-c", &c, &c_id);
+        let sig = creator.signing().sign(&crate::identity::delegation_event_input(
+            vault, "set", &c_id, "owner", &creator_id, 1, 0,
+        ));
+        let wire = serde_json::json!({
+            "op": "set",
+            "subject_id": c_id,
+            "role": "owner",
+            "granter_id": creator_id,
+            "granter_sig_pub": STANDARD.encode(creator.signing().public_bytes()),
+            "seq": 1,
+            "role_epoch": 0,
+            "sig": STANDARD.encode(sig),
+        });
+        let ev: DelegationEvent = serde_json::from_value(wire.clone()).unwrap();
+        pv.keyset.uik.as_mut().unwrap().delegation_log.push(ev);
+        assert_eq!(owner_set(&pv, vault).get(&c_id), Some(&MemberRole::Admin));
+        assert_eq!(
+            serde_json::to_value(&pv.keyset.uik.as_ref().unwrap().delegation_log[0]).unwrap(),
+            wire,
+            "the legacy event re-emits byte-identical",
+        );
+    }
+
+    /// The rename never lets one role's signature stand for another: a grant
+    /// over "owner"/"admin" does not seat a cred claiming Member, and a grant over
+    /// "member" does not seat a cred claiming Admin (either spelling).
+    #[test]
+    fn role_spelling_never_crosses_roles() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, creator, _m, _cid, _mid, mut pv) = role_fixture_creator_cred();
+        let seat = |pv: &mut PerItemVault, cid: &str, who: &UikRoot, role: MemberRole, tok: &str| {
+            let g = creator.signing().sign(&crate::identity::role_grant_input(
+                vault,
+                &who.user_id(),
+                tok,
+                0,
+            ));
+            pv.set_uik_cred(
+                cid.into(),
+                who.user_id(),
+                who.signing().public_bytes().to_vec(),
+                vec![9u8; 32],
+                vec![1u8; 40],
+                vec![2u8; 40],
+                role,
+                g.to_vec(),
+            );
+        };
+        let (a, b, c) = (
+            UikRoot::from_root([0x71u8; 32]),
+            UikRoot::from_root([0x72u8; 32]),
+            UikRoot::from_root([0x73u8; 32]),
+        );
+        seat(&mut pv, "cid-a", &a, MemberRole::Member, "owner");
+        seat(&mut pv, "cid-b", &b, MemberRole::Member, "admin");
+        seat(&mut pv, "cid-c", &c, MemberRole::Admin, "member");
+        let set = owner_set(&pv, vault);
+        for who in [&a, &b, &c] {
+            assert!(!set.contains_key(&who.user_id()), "a role signature never seats another role");
+        }
+    }
+
+    /// The first signing token of every role IS its serde spelling, so the bytes
+    /// a record verifies against are the bytes it carries.
+    #[test]
+    fn role_signing_token_is_the_serde_spelling() {
+        use crate::storage::plaintext::MemberRole;
+        for r in [MemberRole::Admin, MemberRole::Member, MemberRole::LegacyOwner] {
+            assert_eq!(serde_json::to_value(r).unwrap(), serde_json::json!(role_str(r)));
+        }
+    }
+
+    /// New records are written and signed as "admin".
+    #[test]
+    fn new_role_records_emit_admin() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        assert_eq!(serde_json::to_value(MemberRole::Admin).unwrap(), serde_json::json!("admin"));
+        assert_eq!(serde_json::to_value(MemberRole::Member).unwrap(), serde_json::json!("member"));
+        assert_eq!(role_str(MemberRole::Admin), "admin");
+
+        let (vault, creator, _m, creator_id, _mid, mut pv) = role_fixture_creator_cred();
+        // Checkpoint grant signed over "admin".
+        let b = UikRoot::from_root([0x81u8; 32]);
+        let b_id = b.user_id();
+        let g = creator.signing().sign(&crate::identity::role_grant_input(vault, &b_id, "admin", 0));
+        pv.set_uik_cred(
+            "cid-b".into(),
+            b_id.clone(),
+            b.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Admin,
+            g.to_vec(),
+        );
+        assert_eq!(owner_set(&pv, vault).get(&b_id), Some(&MemberRole::Admin));
+        assert_eq!(
+            serde_json::to_value(pv.uik_cred("cid-b").unwrap().role).unwrap(),
+            serde_json::json!("admin")
+        );
+
+        // Delegation event: signed over "admin", serialized as "admin".
+        let a = UikRoot::from_root([0x82u8; 32]);
+        let a_id = a.user_id();
+        cred_no_grant(&mut pv, "cid-a", &a, &a_id);
+        push_event(&mut pv, vault, &creator, "set", &a_id, MemberRole::Admin, 1, 0);
+        assert_eq!(owner_set(&pv, vault).get(&a_id), Some(&MemberRole::Admin));
+        let ev = &pv.keyset.uik.as_ref().unwrap().delegation_log[0];
+        assert_eq!(serde_json::to_value(ev).unwrap()["role"], serde_json::json!("admin"));
+        let sig: [u8; 64] = ev.sig.as_slice().try_into().unwrap();
+        assert!(crate::identity::verify(
+            &creator.signing().public_bytes(),
+            &crate::identity::delegation_event_input(vault, "set", &a_id, "admin", &creator_id, 1, 0),
+            &sig,
+        ));
+    }
+
+    /// Authority fixture: the creator (root) is an admin; B and C are members
+    /// (creator-signed member grants), each seated under its own passkey id.
+    /// Roots: creator 0x11, B 0x22, C 0x33.
+    fn authority_fixture() -> (&'static str, String, String, String, PerItemVault) {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, creator, b, creator_id, b_id, mut pv) = role_fixture_creator_cred();
+        let c = UikRoot::from_root([0x33u8; 32]);
+        let c_id = c.user_id();
+        for (cid, who) in [("cid-b", &b), ("cid-c", &c)] {
+            let g = creator.signing().sign(&crate::identity::role_grant_input(
+                vault,
+                &who.user_id(),
+                "member",
+                0,
+            ));
+            pv.set_uik_cred(
+                cid.into(),
+                who.user_id(),
+                who.signing().public_bytes().to_vec(),
+                vec![9u8; 32],
+                vec![1u8; 40],
+                vec![2u8; 40],
+                MemberRole::Member,
+                g.to_vec(),
+            );
+        }
+        (vault, creator_id, b_id, c_id, pv)
+    }
+
+    fn ids(xs: &[&str]) -> std::collections::BTreeSet<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn requester_can_approve_own_op() {
+        let (vault, _a, b_id, _c, pv) = authority_fixture();
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), &b_id),
+            ApprovalAuthority::Requester
+        );
+    }
+
+    #[test]
+    fn admin_can_approve_another_members_op() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, a_id, b_id, c_id, mut pv) = authority_fixture();
+        // The creator (root admin) approves B's op.
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), &a_id),
+            ApprovalAuthority::Admin
+        );
+        // C promoted to admin by a LEGACY "owner" delegation event: approves B's op.
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        let creator_id = creator.user_id();
+        let sig = creator.signing().sign(&crate::identity::delegation_event_input(
+            vault, "set", &c_id, "owner", &creator_id, 1, 0,
+        ));
+        pv.keyset.uik.as_mut().unwrap().delegation_log.push(DelegationEvent {
+            op: "set".into(),
+            subject_id: c_id.clone(),
+            role: MemberRole::LegacyOwner,
+            granter_id: creator_id,
+            granter_sig_pub: creator.signing().public_bytes().to_vec(),
+            seq: 1,
+            role_epoch: 0,
+            sig: sig.to_vec(),
+        });
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), &c_id),
+            ApprovalAuthority::Admin
+        );
+    }
+
+    #[test]
+    fn other_member_is_refused() {
+        let (vault, _a, b_id, c_id, pv) = authority_fixture();
+        assert!(matches!(
+            pv.approval_authority(vault, &ids(&[&b_id]), &c_id),
+            ApprovalAuthority::Refused(_)
+        ));
+        assert!(matches!(
+            pv.approval_authority(vault, &ids(&[&b_id]), "us_nobody"),
+            ApprovalAuthority::Refused(_)
+        ));
+    }
+
+    /// A promoted admin approves; demoted again, refused, whatever passkey
+    /// material is still on the daemon.
+    #[test]
+    fn admin_authority_follows_the_fold() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, _a, b_id, c_id, mut pv) = authority_fixture();
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        let requester = ids(&[&b_id]);
+        push_event(&mut pv, vault, &creator, "set", &c_id, MemberRole::Admin, 1, 0);
+        assert_eq!(
+            pv.approval_authority(vault, &requester, &c_id),
+            ApprovalAuthority::Admin
+        );
+        push_event(&mut pv, vault, &creator, "set", &c_id, MemberRole::Member, 2, 0);
+        assert!(matches!(
+            pv.approval_authority(vault, &requester, &c_id),
+            ApprovalAuthority::Refused(_)
+        ));
+    }
+
+    /// The signing key of an identity: a self-certifying keyset entry or the
+    /// vault root; a key labeled with someone else's id never resolves.
+    #[test]
+    fn identity_sig_pub_self_certifies() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (vault, a_id, b_id, c_id, mut pv) = authority_fixture();
+        let b = UikRoot::from_root([0x22u8; 32]);
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        assert_eq!(pv.identity_sig_pub(vault, &b_id), Some(b.signing().public_bytes()));
+        assert_eq!(pv.identity_sig_pub(vault, &a_id), Some(creator.signing().public_bytes()));
+        assert_eq!(pv.identity_sig_pub(vault, "us_nobody"), None);
+        // A poisoned entry: C's id with B's key. Never C's key.
+        pv.set_uik_cred(
+            "cid-c".into(),
+            c_id.clone(),
+            b.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Member,
+            Vec::new(),
+        );
+        assert_eq!(pv.identity_sig_pub(vault, &c_id), None);
+    }
+
+    /// No confirmable admin set (anchor stripped): the requester still approves
+    /// their own op; nobody else does.
+    #[test]
+    fn untrusted_fold_keeps_requester_and_refuses_others() {
+        let (vault, a_id, b_id, _c, mut pv) = authority_fixture();
+        pv.keyset.uik.as_mut().unwrap().creator_sig_pub.clear();
+        assert_eq!(
+            pv.approval_authority(vault, &ids(&[&b_id]), &b_id),
+            ApprovalAuthority::Requester
+        );
+        assert!(matches!(
+            pv.approval_authority(vault, &ids(&[&b_id]), &a_id),
+            ApprovalAuthority::Refused(_)
+        ));
+    }
+
+    /// A v1 keyset (a personal vault) has no fold: only the requester approves.
+    #[test]
+    fn v1_keyset_admits_only_the_requester() {
+        let pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        assert_eq!(
+            pv.approval_authority("v", &ids(&["us_me"]), "us_me"),
+            ApprovalAuthority::Requester
+        );
+        assert!(matches!(
+            pv.approval_authority("v", &ids(&["us_me"]), "us_other"),
+            ApprovalAuthority::Refused(_)
+        ));
+        assert_eq!(pv.identity_sig_pub("v", "us_me"), None);
+    }
+
+    /// The requester fallback: identities seated under a passkey this device
+    /// holds (a registry pubkey), never another member's `us_…`-keyed entry.
+    #[test]
+    fn own_identities_are_the_registry_keyed_entries() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        let (_vault, _a, b_id, _c, mut pv) = authority_fixture();
+        assert!(pv.own_identities().is_empty(), "no entry under a registered passkey");
+        let me = UikRoot::from_root([0x22u8; 32]);
+        // build_initial registered passkey b"c" (url-safe "Yw").
+        pv.set_uik_cred(
+            "Yw".into(),
+            b_id.clone(),
+            me.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Member,
+            Vec::new(),
+        );
+        assert_eq!(pv.own_identities(), ids(&[&b_id]));
     }
 }

@@ -282,50 +282,30 @@ fn required_keys(def: &ServiceDef) -> Vec<String> {
     def.service.secrets.clone()
 }
 
-fn policy_for(
-    services: &ServiceRegistry,
-    id: &str,
-    include_rules: bool,
-) -> Option<RegistryServicePolicy> {
-    let p = services.policy_file(id)?;
-    let defaults = p
-        .default
-        .as_ref()
-        .map(|m| RegistryPolicyDefaults {
-            read: m.get("read").cloned(),
-            write: m.get("write").cloned(),
-            ttl: m.get("ttl").and_then(|v| v.parse().ok()),
-        })
-        .unwrap_or(RegistryPolicyDefaults {
-            read: None,
-            write: None,
-            ttl: None,
-        });
-    let rules = if include_rules {
-        Some(
-            p.rule
-                .iter()
-                .map(|r| {
-                    let level = r
-                        .level
-                        .as_deref()
-                        .and_then(crate::core::policy::AccessLevel::parse)
-                        .map(|l| l.to_string());
-                    RegistryPolicyRule {
-                        id: r.id.clone(),
-                        label: r.label.clone(),
-                        match_pattern: r.match_pattern.clone(),
-                        body: r.body.clone(),
-                        when: r.when.clone(),
-                        level,
-                        ttl: r.ttl,
-                    }
-                })
-                .collect(),
-        )
-    } else {
-        None
+/// The registry view of a definition's policy (as the gate compiled it).
+/// `None` when the definition declares no policy.
+fn policy_for(def: &ServiceDef, include_rules: bool) -> Option<RegistryServicePolicy> {
+    let p = def.policy.as_ref()?;
+    let level = |l: Option<crate::core::policy::AccessLevel>| l.map(|l| l.to_string());
+    let defaults = RegistryPolicyDefaults {
+        read: level(p.defaults.as_ref().and_then(|d| d.read)),
+        write: level(p.defaults.as_ref().and_then(|d| d.write)),
+        ttl: p.defaults.as_ref().and_then(|d| d.ttl),
     };
+    let rules = include_rules.then(|| {
+        p.rules
+            .iter()
+            .map(|r| RegistryPolicyRule {
+                id: r.id.clone().unwrap_or_default(),
+                label: r.label.clone().unwrap_or_default(),
+                match_pattern: r.match_patterns.clone(),
+                body: r.body.as_ref().map(|b| b.as_str().to_string()),
+                when: r.when.clone(),
+                level: level(r.level),
+                ttl: r.ttl,
+            })
+            .collect()
+    });
     Some(RegistryServicePolicy { defaults, rules })
 }
 
@@ -359,7 +339,7 @@ fn build_service(
         };
     }
 
-    let policy = policy_for(services, id, include_policy_rules);
+    let policy = policy_for(def, include_policy_rules);
     let auth = def.auth.as_ref().map(|a| match a {
         crate::service::AuthDef::Oauth2(o) => RegistryServiceAuth::Oauth2 {
             // Wire shape stays a plain string; a fully-inline section (no
@@ -463,7 +443,7 @@ fn build_connection(
 fn console_url(state: &AppState, vault_id: &str) -> String {
     // Deep-link to THIS vault so the agent can hand the user a link that lands
     // straight on their vault. Demo vaults (minted by /try) live on /try.
-    let origin = state.config.origin.trim_end_matches('/');
+    let origin = crate::passkey::webauthn::console_link_origin(&state.config.origin);
     if vault_id.starts_with("demo-") {
         format!("{}/try", origin)
     } else {
@@ -700,7 +680,7 @@ mod setup_tests {
         // descriptor by id returned None for it, so the console never saw it as
         // connectable — resolve from the def instead.
         let services = crate::service::ServiceRegistry::load();
-        let def: ServiceDef = toml::from_str(
+        let def: ServiceDef = crate::service::gate::admit_toml(
             r#"
 [service]
 id = "acme"
@@ -745,12 +725,14 @@ name = "GitHub"
 hosts = ["github.com"]
 secrets = ["GITHUB_TOKEN"]
 "#;
-        let def: ServiceDef = toml::from_str(toml).unwrap();
+        let def: ServiceDef = crate::service::gate::admit_toml(toml).unwrap();
         let s = render_setup(&def).expect("setup passthrough");
         assert!(s.contains("sc run --"), "{}", s);
 
-        let no_setup: ServiceDef =
-            toml::from_str("[service]\nid=\"x\"\nname=\"X\"\nhosts=[\"x.com\"]\n").unwrap();
+        let no_setup: ServiceDef = crate::service::gate::admit_toml(
+            "[service]\nid=\"x\"\nname=\"X\"\nhosts=[\"x.com\"]\n",
+        )
+        .unwrap();
         assert!(render_setup(&no_setup).is_none());
     }
 
@@ -819,6 +801,7 @@ secrets = ["GITHUB_TOKEN"]
             hosts: Some(vec!["api.stripe.com".to_string()]),
             secrets: Some(vec!["STRIPE_KEY".to_string()]),
             keys: None,
+            written: None,
         };
         let present: HashSet<String> = ["STRIPE_KEY".to_string()].into_iter().collect();
         let empty: HashSet<String> = HashSet::new();
