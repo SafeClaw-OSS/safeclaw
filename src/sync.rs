@@ -1382,13 +1382,10 @@ fn attached_membership_excludes_us(
     {
         return false;
     }
-    // `members` is a complete snapshot. Remove stale local seats in this copy
-    // before adopting it, while retaining the pinned anchor and signed history
-    // needed to verify the resulting fold.
-    if let Some(uik) = pv.keyset.uik.as_mut() {
-        uik.creds.clear();
-        uik.approver_cids.clear();
-    }
+    // Adopt as everywhere else: an append-only union with what this device already
+    // verified. A roster that merely omits us proves nothing (the server writes it);
+    // only a signed `remove` in the delegation log (or a signed succession) can
+    // unseat us, so deletion rests on a signature, never on the server's word.
     adopt_membership_triple(&mut pv, vault, anchor, body).is_ok()
         && pv.verified_membership(vault, &us) == Some(false)
 }
@@ -1442,12 +1439,6 @@ async fn teardown_vault_access(
         semaphore.close();
     }
     state.access_probes.lock().unwrap().remove(vault);
-    // These stores are not vault-indexed. Clear their bounded process-local
-    // contents so no object belonging to the removed vault can remain.
-    state.challenges.lock().unwrap().clear();
-    state.batch_roots.lock().unwrap().clear();
-    state.oauth_redeemed_codes.lock().unwrap().clear();
-    state.op_payloads.lock().unwrap().clear();
     state.audits.forget(vault);
 
     let rejected = state
@@ -6703,59 +6694,85 @@ mod peritem_tests {
             "an unpinned response triple keeps disk"
         );
 
-        let deleted = "vault-signed-exclusion";
+        // This device's account was seated (a creator-signed checkpoint grant) when it
+        // last synced. The refusal's roster then omits it. Omission alone is the
+        // server's word and keeps the disk; a creator-signed `remove` deletes it.
         let creator = UikRoot::from_root([0x61; 32]);
         let creator_id = creator.user_id();
         let creator_pub = creator.signing().public_bytes();
-        let role_sig = STANDARD.encode(creator.signing().sign(
-            &crate::identity::role_grant_input(deleted, &creator_id, "owner", 0),
-        ));
-        let prior = serde_json::json!({
-            "anchor": STANDARD.encode(creator_pub),
-            "keyset_seq": 1,
-            "members": {
-                (creator_id.clone()): { "role": "owner", "role_sig": role_sig.clone() }
-            },
-            "identities": {
-                (creator_id.clone()): { "sig_pub": STANDARD.encode(creator_pub), "enc_pub": STANDARD.encode([9u8; 32]) }
-            },
-            "proof": { "delegation_log": [], "succession": [], "generation": 0 }
-        });
-        let mut local = empty_keyset_store();
-        adopt_membership_triple(
-            &mut local,
-            deleted,
-            prior["anchor"].as_str().unwrap(),
-            &prior,
-        )
-        .unwrap();
-        assert_eq!(
-            local.verified_membership(deleted, "us_removed"),
-            Some(false)
-        );
-        write_per_item_store(&state_dir, deleted, &local).unwrap();
-
-        let membership = serde_json::json!({
-            "anchor": STANDARD.encode(creator_pub),
-            "keyset_seq": 1,
-            "members": {
-                (creator_id.clone()): { "role": "owner", "role_sig": role_sig }
-            },
-            "identities": {
-                (creator_id): { "sig_pub": STANDARD.encode(creator_pub), "enc_pub": STANDARD.encode([9u8; 32]) }
-            },
-            "proof": { "delegation_log": [], "succession": [], "generation": 0 }
-        });
+        let me = UikRoot::from_root([0x62; 32]);
+        let me_id = me.user_id();
+        let me_pub = me.signing().public_bytes();
         let mut cli = crate::cli::active::CliConfig::default();
-        cli.account_uik = Some("us_removed".into());
+        cli.account_uik = Some(me_id.clone());
         crate::cli::active::save(&cli).unwrap();
-        assert!(attached_membership_excludes_us(
-            &state,
-            deleted,
-            Some(&membership)
+        let seated_locally = |vault: &str| {
+            let grant = |id: &str, role: &str| {
+                STANDARD.encode(creator.signing().sign(&crate::identity::role_grant_input(vault, id, role, 0)))
+            };
+            let prior = serde_json::json!({
+                "anchor": STANDARD.encode(creator_pub),
+                "keyset_seq": 1,
+                "members": {
+                    (creator_id.clone()): { "role": "owner", "role_sig": grant(&creator_id, "owner") },
+                    (me_id.clone()): { "role": "member", "role_sig": grant(&me_id, "member") }
+                },
+                "identities": {
+                    (creator_id.clone()): { "sig_pub": STANDARD.encode(creator_pub), "enc_pub": STANDARD.encode([9u8; 32]) },
+                    (me_id.clone()): { "sig_pub": STANDARD.encode(me_pub), "enc_pub": STANDARD.encode([8u8; 32]) }
+                },
+                "proof": { "delegation_log": [], "succession": [], "generation": 0 }
+            });
+            let mut local = empty_keyset_store();
+            adopt_membership_triple(&mut local, vault, prior["anchor"].as_str().unwrap(), &prior).unwrap();
+            assert_eq!(local.verified_membership(vault, &me_id), Some(true), "seated before the refusal");
+            write_per_item_store(&state_dir, vault, &local).unwrap();
+        };
+        let refusal = |vault: &str, log: serde_json::Value| {
+            serde_json::json!({
+                "anchor": STANDARD.encode(creator_pub),
+                "keyset_seq": 2,
+                "members": {
+                    (creator_id.clone()): {
+                        "role": "owner",
+                        "role_sig": STANDARD.encode(creator.signing().sign(&crate::identity::role_grant_input(vault, &creator_id, "owner", 0)))
+                    }
+                },
+                "identities": {
+                    (creator_id.clone()): { "sig_pub": STANDARD.encode(creator_pub), "enc_pub": STANDARD.encode([9u8; 32]) }
+                },
+                "proof": { "delegation_log": log, "succession": [], "generation": 0 }
+            })
+        };
+
+        let omitted = "vault-omitted-only";
+        seated_locally(omitted);
+        let membership = refusal(omitted, serde_json::json!([]));
+        assert!(!attached_membership_excludes_us(&state, omitted, Some(&membership)));
+        revoke_vault_access(&state, omitted, Some(membership)).await;
+        assert!(state.vaults.dir_for(omitted).unwrap().exists(), "a roster that only omits us keeps disk");
+        assert!(state.is_vault_revoked(omitted), "but the vault is still locked out");
+
+        let removed = "vault-signed-remove";
+        seated_locally(removed);
+        let remove_sig = creator.signing().sign(&crate::identity::delegation_event_input(
+            removed, "remove", &me_id, "", &creator_id, 1, 0,
         ));
-        revoke_vault_access(&state, deleted, Some(membership)).await;
-        assert!(!state.vaults.dir_for(deleted).unwrap().exists());
+        let membership = refusal(
+            removed,
+            serde_json::json!([{
+                "op": "remove",
+                "subject_id": me_id.clone(),
+                "granter_id": creator_id.clone(),
+                "granter_sig_pub": STANDARD.encode(creator_pub),
+                "seq": 1,
+                "role_epoch": 0,
+                "sig": STANDARD.encode(remove_sig)
+            }]),
+        );
+        assert!(attached_membership_excludes_us(&state, removed, Some(&membership)));
+        revoke_vault_access(&state, removed, Some(membership)).await;
+        assert!(!state.vaults.dir_for(removed).unwrap().exists(), "a creator-signed remove deletes the local copy");
 
         match previous_home {
             Some(value) => std::env::set_var("HOME", value),
