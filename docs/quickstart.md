@@ -26,17 +26,22 @@ sc setup
 
 `--name <a short name for the agent>` is optional and defaults to the agent's
 product name, such as `claude-code` or `codex`.
-`sc setup` never prompts. It prints one sentence for the agent to relay and the
-next command. The agent repeats this loop until setup reports `done`:
+`sc setup` never prompts. Each run prints what it needs from the person, if
+anything, and the command to run next:
 
-- `action_required`: relay `say` exactly, then run `next_step`. The sentence
-  tells the person to open the `/pair` address and type the code shown, or open
-  a link and approve with a passkey.
-- `waiting`: run the same `next_step` again.
-- `done`: if it has a `next_step`, run it. After the machine and agent are
-  approved, this is `sc unlock`, which prints an unlock link and the `sc op wait`
-  command. Continue to the next section after approval.
-- `error`: run `fix`, then continue the loop.
+```
+To pair this machine, open this link and enter the code:
+  https://app.safeclaw.pro/pair
+  Code: 4821-0937-5563 (expires in about 15 minutes)
+Next: sc setup --name codex --wait
+```
+
+The agent gives the person the link and code, runs `Next:`, and repeats until a
+run prints no `Next:`. After an error it runs the printed `Fix:`. The last
+`Next:` is usually `sc unlock`, which prints an unlock link and an `sc op wait`
+command. Continue to the next section after approval. With `--json`, each run
+prints one object whose `status` is `action_required`, `waiting`, `done` or
+`error`, with the same values as fields.
 
 In the browser, the person signs in or creates an account the first time,
 creates a passkey, and approves the machine. The passkey also creates the

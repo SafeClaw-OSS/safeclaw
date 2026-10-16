@@ -89,11 +89,8 @@ fi
 
 echo "Installed: ${DEST}/sc"
 case ":${PATH}:" in
-  *":${DEST}:"*) NEXT_SC="sc" ;;
-  *)
-    echo "Add it to PATH: export PATH=\"${DEST}:\$PATH\""
-    NEXT_SC="${DEST}/sc"
-    ;;
+  *":${DEST}:"*) ;;
+  *) echo "Add it to PATH: export PATH=\"${DEST}:\$PATH\"" ;;
 esac
 if [ "${SAFECLAW_CHANNEL:-}" = "dev" ]; then
   PROFILE_ARG=" --profile dev"
@@ -105,4 +102,4 @@ if [ "${SAFECLAW_NO_SETUP:-0}" != "1" ] &&
   echo "Setting up SafeClaw for this agent:"
   exec "${DEST}/sc" setup${PROFILE_ARG}
 fi
-echo "Next: ${NEXT_SC} setup --name <a name for this agent>${PROFILE_ARG}"
+echo "Next: sc setup --name <a name for this agent>${PROFILE_ARG}"
