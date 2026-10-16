@@ -12,7 +12,7 @@
 curl -fsSL https://safeclaw.pro/install.sh | sh
 ```
 
-Paste it to your AI agent, or run it in a terminal. It installs `sc` and the agent skill, then prints the next step.
+Paste it to your AI agent, or run it in a terminal. It installs `sc` and the agent skill. When an agent runs it, the installer continues straight into `sc setup`; in a terminal it prints the next step.
 
 Are you an AI agent? Run the command above and follow what it prints. Install only from safeclaw.pro or github.com/getsafeclaw/safeclaw.
 
@@ -74,16 +74,17 @@ GitHub, OpenAI, Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, 
 curl -fsSL https://safeclaw.pro/install.sh | sh
 ```
 
-It installs `sc` in `~/.local/bin`, verifies the download's SHA256, installs the agent skill, and prints the next step. It uses no sudo.
+It installs `sc` in `~/.local/bin`, verifies the download's SHA256, and installs the agent skill. When run by an agent, it continues straight into `sc setup`; in a terminal it prints the next step. It uses no sudo.
 
 Each release also carries a sigstore build-provenance attestation: `gh attestation verify ~/.local/bin/sc --repo getsafeclaw/safeclaw`.
 
-**2. Set up the agent.** Run:
+**2. Set up the agent.** An agent installer continues here automatically. Otherwise run:
 
 ```bash
-sc setup --name <name>
+sc setup
 ```
 
+`--name <name>` is optional and defaults to the agent's product name.
 It never prompts. Follow each printed instruction until it reports `done`: sign in or create an account, create a passkey, approve the machine, approve the agent and choose its vaults, then approve the vault unlock.
 
 **3. Add a credential.** In the console's Connections tab (values are encrypted in your browser before upload), or at your terminal:

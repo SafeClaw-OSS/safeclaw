@@ -10,7 +10,8 @@
 #     config changes, no telemetry.
 #   * Installs the SafeClaw agent skill with `sc skill install` (skip with
 #     --no-skill or SAFECLAW_NO_SKILL=1).
-#   * Prints one next step: `sc setup --name <name>`.
+#   * When an AI agent runs it, continues with `sc setup`; skip this with
+#     SAFECLAW_NO_SETUP=1. Otherwise, prints one next step.
 set -eu
 
 REPO="getsafeclaw/safeclaw"
@@ -98,5 +99,10 @@ if [ "${SAFECLAW_CHANNEL:-}" = "dev" ]; then
   PROFILE_ARG=" --profile dev"
 else
   PROFILE_ARG=""
+fi
+if [ "${SAFECLAW_NO_SETUP:-0}" != "1" ] &&
+  "${DEST}/sc" setup --detect-agent >/dev/null 2>&1; then
+  echo "Setting up SafeClaw for this agent:"
+  exec "${DEST}/sc" setup${PROFILE_ARG}
 fi
 echo "Next: ${NEXT_SC} setup --name <a name for this agent>${PROFILE_ARG}"

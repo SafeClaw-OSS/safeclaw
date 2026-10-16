@@ -26,12 +26,15 @@ curl -fsSL https://safeclaw.pro/install.sh | sh
 ```
 
 The installer verifies the download's SHA256, puts `sc` in `~/.local/bin`,
-installs this skill, and prints the next step. Then run:
+installs this skill, and continues straight into `sc setup` when an agent runs
+it. In a terminal, it prints the next step. Run:
 
 ```bash
-sc setup --name <a short name for the agent>
+sc setup
 ```
 
+`--name <a short name for the agent>` is optional and defaults to the agent's
+product name, such as `claude-code` or `codex`.
 `sc setup` never prompts. Read its status and follow the loop until it reports
 `done`:
 

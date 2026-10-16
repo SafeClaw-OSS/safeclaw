@@ -23,12 +23,27 @@ enum Progress {
 }
 
 pub async fn run(args: SetupArgs, json_output: bool) -> Result<(), i32> {
+    if args.detect_agent {
+        if let Some(name) = crate::cli::agent_detect::detect() {
+            println!("{}", name);
+            return Ok(());
+        }
+        return Err(1);
+    }
+
     if args.worker {
         return run_worker(args).await;
     }
 
-    let name = match args.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(name) => name.to_string(),
+    let name = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(crate::cli::agent_detect::detect);
+    let name = match name {
+        Some(name) => name,
         None => {
             emit_error(
                 json_output,
@@ -172,23 +187,26 @@ async fn preconditions(
     name: String,
     profile: Option<String>,
 ) -> Result<Context, (String, String, i32)> {
-    let cfg = crate::cli::active::load()
-        .map_err(|e| (format!("SafeClaw configuration could not be read: {}", e), "Fix ~/.safeclaw/config.toml, then re-run setup.".to_string(), 1))?;
+    let cfg = crate::cli::active::load().map_err(|e| {
+        (
+            format!("SafeClaw configuration could not be read: {}", e),
+            format!(
+                "Fix ~/.safeclaw/config.toml, then re-run: {}",
+                setup_command(&name, profile.as_deref())
+            ),
+            1,
+        )
+    })?;
     let cloud = match profile.as_deref() {
-        Some(profile) => crate::cli::login::env_selector_to_url(profile).map_err(|e| {
-            (
-                e,
-                format!("sc setup --name {} --profile prod", shell_word(&name)),
-                2,
-            )
-        })?,
+        Some(profile) => crate::cli::login::env_selector_to_url(profile)
+            .map_err(|e| (e, setup_command(&name, Some(profile)), 2))?,
         None => cfg
             .cloud_backend
             .clone()
             .filter(|s| !s.is_empty())
             .map(Ok)
             .unwrap_or_else(|| crate::cli::login::resolve_custodian(None))
-            .map_err(|e| (e, format!("sc setup --name {}", shell_word(&name)), 1))?,
+            .map_err(|e| (e, setup_command(&name, None), 1))?,
     };
     let cloud = cloud.trim_end_matches('/').to_string();
     let has_pairing = cfg
@@ -226,21 +244,18 @@ async fn preconditions(
     let home = dirs::home_dir().ok_or_else(|| {
         (
             "SafeClaw could not locate the home directory.".to_string(),
-            format!("Re-run outside the sandbox with network access: sc setup --name {}", shell_word(&name)),
+            format!(
+                "Re-run outside the sandbox with network access: {}",
+                setup_command(&name, profile.as_deref())
+            ),
             1,
         )
     })?;
     let setup_dir = home.join(".safeclaw").join("setup");
-    let retry = {
-        let mut command = format!(
-            "Re-run outside the sandbox with network access: sc setup --name {}",
-            shell_word(&name)
-        );
-        if let Some(profile) = profile.as_deref() {
-            command.push_str(&format!(" --profile {}", profile));
-        }
-        command
-    };
+    let retry = format!(
+        "Re-run outside the sandbox with network access: {}",
+        setup_command(&name, profile.as_deref())
+    );
     if let Err(e) = ensure_writable(&setup_dir) {
         return Err((
             format!("SafeClaw's setup directory is not writable: {}", e),
@@ -641,11 +656,57 @@ fn next_command(context: &Context) -> String {
 }
 
 fn base_command(context: &Context) -> String {
-    let mut command = format!("sc setup --name {}", shell_word(&context.name));
-    if let Some(profile) = context.profile.as_deref() {
-        command.push_str(&format!(" --profile {}", profile));
+    setup_command(&context.name, context.profile.as_deref())
+}
+
+fn setup_command(name: &str, profile: Option<&str>) -> String {
+    let mut command = format!(
+        "{} setup --name {}",
+        shell_word(&running_binary()),
+        shell_word(name)
+    );
+    if let Some(profile) = profile {
+        command.push_str(&format!(" --profile {}", shell_word(profile)));
     }
     command
+}
+
+fn running_binary() -> String {
+    let current = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return "sc".to_string(),
+    };
+    let current = fs::canonicalize(&current).unwrap_or(current);
+    let resolved = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|dir| dir.join("sc"))
+        .filter(|path| executable_on_path(path))
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .next();
+    if resolved.as_ref() == Some(&current) {
+        "sc".to_string()
+    } else {
+        current.display().to_string()
+    }
+}
+
+fn executable_on_path(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn shell_word(value: &str) -> String {

@@ -608,6 +608,9 @@ pub struct SetupArgs {
     /// Internal detached-worker entrypoint.
     #[arg(long, hide = true)]
     pub worker: bool,
+    /// Print the detected agent name and exit.
+    #[arg(long, hide = true)]
+    pub detect_agent: bool,
     /// Internal setup phase run by the detached worker.
     #[arg(long, hide = true, value_enum)]
     pub phase: Option<SetupPhase>,

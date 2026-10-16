@@ -9,7 +9,8 @@ curl -fsSL https://safeclaw.pro/install.sh | sh
 ```
 
 The installer uses no sudo, verifies the download's SHA256, puts `sc` in
-`~/.local/bin`, installs the skill at `skills/safeclaw/SKILL.md`, and prints one
+`~/.local/bin`, and installs the skill at `skills/safeclaw/SKILL.md`. When run by
+an agent, it continues straight into `sc setup`; in a terminal it prints one
 next step. It also installs the skill with `sc skill install`. Official sources
 are [safeclaw.pro](https://safeclaw.pro) and
 [github.com/getsafeclaw/safeclaw](https://github.com/getsafeclaw/safeclaw).
@@ -20,9 +21,11 @@ Supported platforms: [Platform support](reference/platform-support.md).
 Run this as the person or as their agent:
 
 ```bash
-sc setup --name <a short name for the agent>
+sc setup
 ```
 
+`--name <a short name for the agent>` is optional and defaults to the agent's
+product name, such as `claude-code` or `codex`.
 `sc setup` never prompts. It prints one sentence for the agent to relay and the
 next command. The agent repeats this loop until setup reports `done`:
 
