@@ -133,10 +133,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<(), String> {
 }
 
 pub fn wait_command(op_id: &str) -> String {
-    format!(
-        "To wait: sc op wait {}   (background it; its exit is the signal)",
-        op_id
-    )
+    format!("To wait: sc op wait {}", op_id)
 }
 
 /// Once the browser's PAKE message has been accepted, the short code is spent.
