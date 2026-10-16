@@ -58,6 +58,11 @@ pub async fn passkeys(
     Path(vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     validate_vault_id(&vault_id)?;
+    // A vault this device lost access to says why (removed, deleted, device revoked),
+    // not that it never existed.
+    if let Some(gone) = state.vault_gone_error(&vault_id) {
+        return Err(gone);
+    }
     // Per-item vault (vault.per-item.json) is the current keyset home; fall back
     // to the legacy vault.dat for vaults predating the per-item rework. This
     // handler used to read ONLY vault.dat, so a per-item-enrolled vault (keyset
