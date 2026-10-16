@@ -104,8 +104,12 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
     // only: device A's pending unlock never answers device B, and the
     // ceremony key is per vault.
     if matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock") {
-        if let Some(pending) = pending_unlock_response(&state, &vault_id) {
-            return Ok(pending);
+        // A ceremony minted before a detected re-key may deliver the old key.
+        // Skip reuse so this request creates a fresh approval for the new key.
+        if !state.is_vault_key_changed(&vault_id) {
+            if let Some(pending) = pending_unlock_response(&state, &vault_id) {
+                return Ok(pending);
+            }
         }
     }
     // ONE approval window (SSOT, user decision 2026-07-14): ops that arrive
@@ -641,6 +645,51 @@ mod tests {
         assert!(pending_unlock_response(&state, "v1").is_none());
     }
 
+    #[tokio::test]
+    async fn a_key_change_requires_a_fresh_unlock_approval() {
+        let state = Arc::new(test_state());
+        let unlock: Operation = serde_json::from_value(json!({
+            "act": { "type": { "custom": "vault-unlock" }, "target": "v1", "scope": {} },
+            "bind": { "redeemer": "v1" },
+            "valid": { "iat": 0, "multiplicity": 1 }
+        }))
+        .unwrap();
+        let first_id = state
+            .approvals
+            .lock()
+            .unwrap()
+            .create("v1".into(), unlock.clone(), "r-one".into());
+        state
+            .live_ceremony_ops
+            .lock()
+            .unwrap()
+            .insert(("v1".into(), "vault-unlock".into()), first_id.clone());
+        state.mark_vault_key_changed("v1");
+
+        let next = create_op::<crate::service::source::github::GitHubHttp>(
+            &state,
+            "v1".into(),
+            unlock,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(next["op_id"], json!(first_id));
+        assert!(matches!(
+            state
+                .approvals
+                .lock()
+                .unwrap()
+                .get_any(&first_id)
+                .unwrap()
+                .status,
+            crate::approval::store::ApprovalStatus::Rejected { .. }
+        ));
+    }
+
     #[test]
     fn reject_retired_whole_blob_write() {
         match reject_broker_kind(&ActType::Write) {
@@ -958,11 +1007,13 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         for (device, code) in [
             (DeviceGate::NotAdmitted, "device_not_admitted"),
+            (DeviceGate::AccountMissing, "device_not_admitted"),
             (DeviceGate::Stale, "ledger_stale"),
         ] {
             state.set_ledger(LedgerGate {
                 device,
                 agents: None,
+                checked_at: None,
             });
             let err = create(
                 State(state.clone()),

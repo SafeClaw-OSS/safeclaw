@@ -1237,6 +1237,24 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                // The general read seam can return a partial per-item view so
+                // existing rows remain usable. Unlock is stricter: the new key
+                // must open every current row before this flag is cleared.
+                let has_per_item = state
+                    .vaults
+                    .per_item_path(&vault_id)
+                    .ok()
+                    .is_some_and(|p| p.exists());
+                if has_per_item {
+                    view = crate::sync::fold_with_key(&state, &vault_id, &unlock_key)
+                        .ok_or_else(|| {
+                            AppError::Unauthorized(
+                                "the approved key does not open the vault's current rows".into(),
+                            )
+                        })?;
+                } else {
+                    state.clear_vault_key_changed(&vault_id);
+                }
                 // Before the vault serves: every held row is offered again under
                 // the key, then the cloud is pulled. A failed pull keeps
                 // retrying in the background and is reported (`sc status`).

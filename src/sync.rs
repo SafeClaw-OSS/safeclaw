@@ -603,9 +603,15 @@ pub(crate) fn fold_with_key(
     key: &[u8],
 ) -> Option<crate::storage::plaintext::VaultPlaintextView> {
     let pv = read_per_item_store(&state.config.state_dir, vault)?;
-    match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(key, &pv, vault) {
-        Ok(view) => Some(view),
+    match crate::server::handlers::metadata::decrypt_vault_view_peritem_complete_with_key(
+        key, &pv, vault,
+    ) {
+        Ok(view) => {
+            state.clear_vault_key_changed(vault);
+            Some(view)
+        }
         Err(e) => {
+            state.mark_vault_key_changed(vault);
             tracing::warn!(vault = %vault, "fold after the unlock pull failed (serving the view opened at unlock): {}", e);
             None
         }
@@ -623,8 +629,11 @@ pub(crate) fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
     let Some(pv) = read_per_item_store(&state.config.state_dir, vault) else {
         return;
     };
-    match crate::server::handlers::metadata::decrypt_vault_view_peritem_with_key(&k, &pv, vault) {
+    match crate::server::handlers::metadata::decrypt_vault_view_peritem_complete_with_key(
+        &k, &pv, vault,
+    ) {
         Ok(view) => {
+            state.clear_vault_key_changed(vault);
             let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
             state.unlock_vault(vault.to_string(), cache, k);
             tracing::info!(vault = %vault, "per-item pull: cache refreshed from item rows");
@@ -632,6 +641,7 @@ pub(crate) fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
             crate::server::handlers::service_ops::requests::after_sync(state, vault);
         }
         Err(_) => {
+            state.mark_vault_key_changed(vault);
             tracing::warn!(
                 vault = %vault,
                 "per-item pull: retained K can't unseal a row (rotated K?); lock+unlock to see new state"
@@ -1407,6 +1417,7 @@ async fn teardown_vault_access(
     state.cloud_contact.lock().unwrap().remove(vault);
     state.vault_shared.lock().unwrap().remove(vault);
     state.vault_upgrade_required.lock().unwrap().remove(vault);
+    state.vault_key_changed.lock().unwrap().remove(vault);
     state.sync_conflicts.lock().unwrap().remove(vault);
     state.catch_up_failures.lock().unwrap().remove(vault);
     state.pending_format_mark.lock().unwrap().remove(vault);
@@ -1685,11 +1696,20 @@ fn refresh_after_pull(state: &Arc<AppState>, vault: &str) {
     };
     match crate::server::handlers::metadata::decrypt_vault_view_with_key(&k, &sealed) {
         Ok(view) => {
+            let has_per_item = state
+                .vaults
+                .per_item_path(vault)
+                .ok()
+                .is_some_and(|p| p.exists());
+            if !has_per_item {
+                state.clear_vault_key_changed(vault);
+            }
             let cache = crate::server::handlers::approve::bootstrap_cache_from_view(&view, state);
             state.unlock_vault(vault.to_string(), cache, k);
             tracing::info!(vault = %vault, "cloud sync: cache refreshed after pull (no re-unlock)");
         }
         Err(_) => {
+            state.mark_vault_key_changed(vault);
             tracing::warn!(
                 vault = %vault,
                 "cloud sync: retained key can't open pulled ciphertext (rotated K?); lock+unlock to see new state"
@@ -6440,6 +6460,7 @@ mod peritem_tests {
             cloud_contact: _,
             vault_shared: _,
             vault_upgrade_required: _,
+            vault_key_changed: _,
             sync_conflicts: _,
             catch_up_failures: _,
             pending_rotations: _,
@@ -6551,6 +6572,7 @@ mod peritem_tests {
             .lock()
             .unwrap()
             .insert(vault.into());
+        state.mark_vault_key_changed(vault);
         state.note_sync(vault, "item", crate::state::SyncNote::Refused("x".into()));
         state.note_catch_up(vault, "x");
         state.note_rotation_pending(vault, "conn", "role", "token", "x");
@@ -6619,6 +6641,7 @@ mod peritem_tests {
         assert!(!state.cloud_contact.lock().unwrap().contains_key(vault));
         assert!(!state.vault_shared.lock().unwrap().contains_key(vault));
         assert!(!state.vault_upgrade_required.lock().unwrap().contains(vault));
+        assert!(!state.is_vault_key_changed(vault));
         assert!(!state.sync_conflicts.lock().unwrap().contains_key(vault));
         assert!(!state.catch_up_failures.lock().unwrap().contains_key(vault));
         assert!(!state.pending_rotations.lock().unwrap().contains_key(vault));
@@ -6813,6 +6836,31 @@ mod peritem_tests {
             vec![0u8; 48],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unsealable_current_rows_mark_the_key_changed_until_a_key_opens_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(test_config(dir.path()));
+        let vault = "v-key-changed";
+        let old = [0x31u8; 32];
+        let new = [0x32u8; 32];
+        let mut pv = empty_pv();
+        pv.seal_and_upsert::<StdPrimitives>(
+            VaultKeys::single(&new),
+            vault,
+            ItemNs::Secret,
+            "NEW",
+            1,
+            &crate::storage::item::ItemPayload::secret_live("NEW", "value"),
+        )
+        .unwrap();
+        write_per_item_store(dir.path(), vault, &pv).unwrap();
+
+        assert!(fold_with_key(&state, vault, &old).is_none());
+        assert!(state.is_vault_key_changed(vault));
+        assert!(fold_with_key(&state, vault, &new).is_some());
+        assert!(!state.is_vault_key_changed(vault));
     }
 
     /// Adopt replaces a strictly-newer version and advances the cursor; a stale

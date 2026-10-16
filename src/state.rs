@@ -387,6 +387,10 @@ pub struct AppState {
     /// "run `sc upgrade`" instead of a silent parked-sync failure. In-memory only,
     /// (re)set by the sync path; cleared when a sync succeeds again.
     pub vault_upgrade_required: Mutex<std::collections::HashSet<String>>,
+    /// Vaults whose current cloud rows cannot be opened by the retained session
+    /// key. The old cache remains usable, but a fresh unlock must obtain the
+    /// replacement key before newly added rows can be seen.
+    pub vault_key_changed: Mutex<std::collections::HashSet<String>>,
     /// Local changes the sync did not apply, vault → item id → why
     /// ([`SyncNote`]). Shown by `sc sync` and `sc status`; cleared when a
     /// later write or push of that row lands. In-memory only.
@@ -630,6 +634,7 @@ impl AppState {
             cloud_contact: Mutex::new(HashMap::new()),
             vault_shared: Mutex::new(HashMap::new()),
             vault_upgrade_required: Mutex::new(std::collections::HashSet::new()),
+            vault_key_changed: Mutex::new(std::collections::HashSet::new()),
             sync_conflicts: Mutex::new(HashMap::new()),
             catch_up_failures: Mutex::new(HashMap::new()),
             pending_rotations: Mutex::new(HashMap::new()),
@@ -765,6 +770,7 @@ impl AppState {
             for st in states.values_mut() {
                 *st = VaultState::Locked;
             }
+            self.vault_key_changed.lock().unwrap().clear();
         }
     }
 
@@ -775,6 +781,7 @@ impl AppState {
         match self.ledger.lock().unwrap().device {
             DeviceGate::Open => None,
             DeviceGate::NotAdmitted => Some(crate::error::AppError::DeviceNotAdmitted),
+            DeviceGate::AccountMissing => Some(crate::error::AppError::DeviceAccountMissing),
             DeviceGate::Stale => Some(crate::error::AppError::LedgerStale),
             DeviceGate::Revoked => Some(crate::error::AppError::LedgerDeviceRevoked),
         }
@@ -797,6 +804,7 @@ impl AppState {
         self.set_ledger(crate::principal_ledger::LedgerGate {
             device: crate::principal_ledger::DeviceGate::Open,
             agents: Some(agents.iter().map(|s| s.to_string()).collect()),
+            checked_at: Some(crate::util::now_unix()),
         });
     }
 
@@ -913,6 +921,21 @@ impl AppState {
         !matches!(states.get(vault_id), Some(VaultState::Unlocked { .. }))
     }
 
+    pub fn mark_vault_key_changed(&self, vault_id: &str) {
+        self.vault_key_changed
+            .lock()
+            .unwrap()
+            .insert(vault_id.to_string());
+    }
+
+    pub fn clear_vault_key_changed(&self, vault_id: &str) {
+        self.vault_key_changed.lock().unwrap().remove(vault_id);
+    }
+
+    pub fn is_vault_key_changed(&self, vault_id: &str) -> bool {
+        self.vault_key_changed.lock().unwrap().contains(vault_id)
+    }
+
     /// True when at least one vault is currently unlocked.
     pub fn has_unlocked_vault(&self) -> bool {
         let states = self.vault_states.lock().unwrap();
@@ -1009,6 +1032,7 @@ impl AppState {
     pub fn lock_vault(&self, vault_id: &str) {
         let mut states = self.vault_states.lock().unwrap();
         states.insert(vault_id.to_string(), VaultState::Locked);
+        self.clear_vault_key_changed(vault_id);
     }
 
     /// Retention setting for this vault's audit log. `None` when the vault

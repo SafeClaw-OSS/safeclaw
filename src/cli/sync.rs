@@ -32,14 +32,17 @@ pub async fn run(_args: SyncArgs) -> Result<(), String> {
             .get("pulled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let key_changed = body
+            .get("vault_key_changed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         eprintln!(
             "safeclaw sync — ok ({})",
-            if pulled {
-                "pulled new state from cloud"
-            } else {
-                "already current"
-            }
+            sync_summary(pulled, key_changed)
         );
+        if key_changed {
+            eprintln!("  {}", crate::error::VAULT_KEY_CHANGED_STATUS_MSG);
+        }
         report_connects(body.get("connects"));
         report_conflicts(body.get("conflicts"));
         report_notes(body.get("notes"));
@@ -54,6 +57,16 @@ pub async fn run(_args: SyncArgs) -> Result<(), String> {
             .and_then(|v| v.as_str())
             .unwrap_or("sync failed");
         Err(crate::cli::neterr::with_proxy_hint(raw))
+    }
+}
+
+fn sync_summary(pulled: bool, key_changed: bool) -> &'static str {
+    if key_changed {
+        "items are waiting for the vault's new key"
+    } else if pulled {
+        "pulled new state from cloud"
+    } else {
+        "already current"
     }
 }
 
@@ -143,5 +156,19 @@ fn report_conflicts(conflicts: Option<&serde_json::Value>) {
             "  {}: changed elsewhere meanwhile; your change was set aside and not applied. Re-run it.",
             crate::util::terminal_safe(r)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sync_summary;
+
+    #[test]
+    fn a_changed_key_never_reads_as_already_current() {
+        assert_eq!(
+            sync_summary(false, true),
+            "items are waiting for the vault's new key"
+        );
+        assert_eq!(sync_summary(false, false), "already current");
     }
 }

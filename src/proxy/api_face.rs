@@ -165,6 +165,9 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
             vaults.push(json!({
                 "vid": vid,
                 "locked": locked,
+                "vault_key_changed": state.is_vault_key_changed(&vid),
+                "vault_key_changed_message": state.is_vault_key_changed(&vid)
+                    .then_some(crate::error::VAULT_KEY_CHANGED_MSG),
                 "connections": conns,
             }));
         }

@@ -514,11 +514,11 @@ impl BrokerHandler {
                         written: None,
                     }
                 } else {
-                    return err_response(
-                        ScCode::UnknownConnection,
-                        &format!("unknown connection '{}'", conn),
-                    )
-                    .into();
+                    let (code, message) = unknown_connection_refusal(
+                        self.state.is_vault_key_changed(&vault_id),
+                        &conn,
+                    );
+                    return err_response(code, &message).into();
                 }
             }
         };
@@ -1242,6 +1242,20 @@ impl BrokerHandler {
     }
 }
 
+fn unknown_connection_refusal(key_changed: bool, conn: &str) -> (ScCode, String) {
+    if key_changed {
+        (
+            ScCode::VaultKeyChanged,
+            crate::error::VAULT_KEY_CHANGED_MSG.to_string(),
+        )
+    } else {
+        (
+            ScCode::UnknownConnection,
+            format!("unknown connection '{}'", conn),
+        )
+    }
+}
+
 /// Stamp what approving a Use op grants into its (signed) scope, so what the
 /// approver reads is what apply does (design/approvals-inbox.md D1): `level`,
 /// then the reuse fields and `window_s` from [`crate::approval::Reuse`] (the
@@ -1734,6 +1748,17 @@ fn write_forward_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_connection_names_a_changed_key_only_when_flagged() {
+        let (code, message) = unknown_connection_refusal(false, "future");
+        assert_eq!(code, ScCode::UnknownConnection);
+        assert_eq!(message, "unknown connection 'future'");
+
+        let (code, message) = unknown_connection_refusal(true, "future");
+        assert_eq!(code, ScCode::VaultKeyChanged);
+        assert_eq!(message, crate::error::VAULT_KEY_CHANGED_MSG);
+    }
 
     fn b64(s: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(s)

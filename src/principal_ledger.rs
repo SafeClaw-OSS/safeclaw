@@ -120,14 +120,30 @@ fn decode_b64_any(s: &str) -> Option<Vec<u8>> {
 
 /// GET the account ledger, authenticated by this device's DIK proof of
 /// possession ALONE (W4: no bearer, so a device whose key the backend dropped on
-/// revoke still receives its own revoke). Any failure is an `Err`, which the
-/// caller treats as hold (I3: a bare 401/403 is never acted on).
+/// revoke still receives its own revoke). The one actionable unsigned response
+/// is the backend's explicit `SC_DEVICE_UNKNOWN`: it parks this process without
+/// changing the persisted signed decision. Every other failure is held.
+#[derive(Debug)]
+enum FetchError {
+    DeviceUnknown,
+    Other(String),
+}
+
+fn is_device_unknown_response(status: reqwest::StatusCode, body: &[u8]) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+            .as_deref()
+            == Some("SC_DEVICE_UNKNOWN")
+}
+
 async fn fetch_ledger(
     client: &reqwest::Client,
     cloud: &str,
     anchor_uik: &str,
     signer: &DeviceRequestSigner,
-) -> Result<LedgerJson, String> {
+) -> Result<LedgerJson, FetchError> {
     // `uik` names the pinned account explicitly (the backend would otherwise
     // pick the account with the newest event naming this device).
     let url = format!(
@@ -135,16 +151,27 @@ async fn fetch_ledger(
         cloud.trim_end_matches('/'),
         urlencoding::encode(anchor_uik)
     );
-    let path = crate::device_auth::path_and_query(&url).ok_or("unparseable cloud URL")?;
+    let path = crate::device_auth::path_and_query(&url)
+        .ok_or_else(|| FetchError::Other("unparseable cloud URL".into()))?;
     let mut rb = client.get(&url);
     for (k, v) in signer.headers("GET", &path, crate::util::now_unix(), &[]) {
         rb = rb.header(k, v);
     }
-    let resp = rb.send().await.map_err(|e| format!("fetch: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+    let resp = rb
+        .send()
+        .await
+        .map_err(|e| FetchError::Other(format!("fetch: {}", e)))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.bytes().await.unwrap_or_default();
+        if is_device_unknown_response(status, &body) {
+            return Err(FetchError::DeviceUnknown);
+        }
+        return Err(FetchError::Other(format!("HTTP {}", status)));
     }
-    resp.json().await.map_err(|e| format!("parse: {}", e))
+    resp.json()
+        .await
+        .map_err(|e| FetchError::Other(format!("parse: {}", e)))
 }
 
 // ── Strict verify + fold ─────────────────────────────────────────────────────
@@ -391,6 +418,9 @@ pub enum DeviceGate {
     Open,
     /// Park: not admitted (or no anchor / no DIK). Refuse unlock and broker.
     NotAdmitted,
+    /// The backend completed the lookup and no account names this device.
+    /// Unsigned and process-local: park without deleting local data.
+    AccountMissing,
     /// Lock: the lease ran out. Refuse unlock until a fresh verified pull.
     Stale,
     /// A verified revoke of this device: wipe.
@@ -433,6 +463,9 @@ pub struct LedgerGate {
     pub device: DeviceGate,
     /// The account's admitted agents; `None` = no verified decision.
     pub agents: Option<HashSet<String>>,
+    /// Unix time of the signed ledger pull, or the explicit account-missing
+    /// check, that produced this standing.
+    pub checked_at: Option<u64>,
 }
 
 impl Default for LedgerGate {
@@ -441,6 +474,7 @@ impl Default for LedgerGate {
         Self {
             device: DeviceGate::NotAdmitted,
             agents: None,
+            checked_at: None,
         }
     }
 }
@@ -559,9 +593,25 @@ fn context(state: &AppState) -> Option<Ctx> {
 }
 
 /// Publish a standing: not open evicts K from every vault (park / lock / wipe).
-fn publish(state: &AppState, device: DeviceGate, floor: &LedgerFloor) {
+fn publish(
+    state: &AppState,
+    device: DeviceGate,
+    floor: &LedgerFloor,
+    checked_at: Option<u64>,
+) {
     let agents = (device == DeviceGate::Open).then(|| floor.agents.iter().cloned().collect());
-    state.set_ledger(LedgerGate { device, agents });
+    state.set_ledger(LedgerGate {
+        device,
+        agents,
+        checked_at,
+    });
+}
+
+fn held_gate(current: DeviceGate, persisted: DeviceGate) -> DeviceGate {
+    match current {
+        DeviceGate::AccountMissing => current,
+        _ => persisted,
+    }
 }
 
 /// The standing at startup, from the persisted decision alone (no network): a
@@ -575,7 +625,12 @@ pub fn init_gate(state: &AppState) {
     if g != DeviceGate::Open {
         tracing::warn!(standing = ?g, "principal ledger: this device is not serving until a verified pull admits it");
     }
-    publish(state, g, &floor);
+    publish(
+        state,
+        g,
+        &floor,
+        (floor.fresh_at != 0).then_some(floor.fresh_at),
+    );
 }
 
 /// One pull → verify → decide → persist → publish, serialized by
@@ -585,17 +640,25 @@ async fn pull_now(state: &AppState, timeout: Duration) -> DeviceGate {
     let mut floor = load_floor(&state_dir);
     let now = crate::util::now_unix();
     let Some(ctx) = context(state) else {
-        publish(state, DeviceGate::NotAdmitted, &floor);
+        publish(state, DeviceGate::NotAdmitted, &floor, None);
         return DeviceGate::NotAdmitted;
     };
+    let current = state.ledger.lock().unwrap().clone();
     let before = floor.clone();
     floor.max_wall = floor.max_wall.max(now);
     let pulled = match crate::cli::egress_proxy::client(timeout) {
         Ok(client) => fetch_ledger(&client, &ctx.cloud, &ctx.anchor_uik, &ctx.signer).await,
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(FetchError::Other(e.to_string())),
     };
+    let mut accepted = false;
     match pulled {
-        Err(e) => tracing::debug!("principal ledger: fetch failed ({}); holding", e),
+        Err(FetchError::DeviceUnknown) => {
+            publish(state, DeviceGate::AccountMissing, &floor, Some(now));
+            return DeviceGate::AccountMissing;
+        }
+        Err(FetchError::Other(e)) => {
+            tracing::debug!("principal ledger: fetch failed ({}); holding", e)
+        }
         Ok(ledger) => match verify_strict(&ledger, &ctx.anchor_uik) {
             Err(why) => tracing::warn!(
                 code = "ledger_head_invalid",
@@ -610,7 +673,10 @@ async fn pull_now(state: &AppState, timeout: Duration) -> DeviceGate {
                     &ctx.sc_pk,
                     now,
                 ) {
-                    Ok(f) => floor = f,
+                    Ok(f) => {
+                        floor = f;
+                        accepted = true;
+                    }
                     Err(why) => tracing::warn!("principal ledger: {}; holding", why),
                 }
             }
@@ -619,8 +685,21 @@ async fn pull_now(state: &AppState, timeout: Duration) -> DeviceGate {
     if floor != before {
         store_floor(&state_dir, &floor);
     }
-    let g = gate(&floor, now, true, true);
-    publish(state, g, &floor);
+    let persisted = gate(&floor, now, true, true);
+    let g = if accepted {
+        persisted
+    } else {
+        held_gate(current.device, persisted)
+    };
+    if g == DeviceGate::AccountMissing {
+        return g;
+    }
+    publish(
+        state,
+        g,
+        &floor,
+        (floor.fresh_at != 0).then_some(floor.fresh_at),
+    );
     g
 }
 
@@ -638,6 +717,10 @@ pub async fn principal_ledger_loop(state: Arc<AppState>) {
             DeviceGate::NotAdmitted => tracing::warn!(
                 code = "device_not_admitted",
                 "principal ledger: this device is not admitted to the account; run `sc login`"
+            ),
+            DeviceGate::AccountMissing => tracing::warn!(
+                code = "device_not_admitted",
+                "principal ledger: this device is no longer paired with a SafeClaw account; run `sc login`"
             ),
             DeviceGate::Stale => tracing::warn!(
                 code = "ledger_stale",
@@ -1131,7 +1214,7 @@ mod tests {
         let f = paired_at(1);
         let g = gate(&f, T0 + LEASE_SECS + 1, true, true);
         assert_eq!(g, DeviceGate::Stale);
-        publish(&state, g, &f);
+        publish(&state, g, &f, Some(f.fresh_at));
         assert!(state.is_vault_locked("v1"), "K evicted");
         assert!(
             blob.join("vault.per-item.json").exists(),
@@ -1141,6 +1224,76 @@ mod tests {
             state.ledger_refusal().unwrap().code().0.as_str(),
             "ledger_stale"
         );
+    }
+
+    #[test]
+    fn only_the_named_401_is_the_account_missing_signal() {
+        use reqwest::StatusCode;
+        let named = br#"{"code":"SC_DEVICE_UNKNOWN","error":"SC_DEVICE_UNKNOWN"}"#;
+        assert!(is_device_unknown_response(StatusCode::UNAUTHORIZED, named));
+        for (status, body) in [
+            (StatusCode::UNAUTHORIZED, br#"{"code":"OTHER"}"#.as_slice()),
+            (StatusCode::UNAUTHORIZED, b"not-json".as_slice()),
+            (StatusCode::FORBIDDEN, named.as_slice()),
+            (StatusCode::INTERNAL_SERVER_ERROR, named.as_slice()),
+        ] {
+            assert!(!is_device_unknown_response(status, body));
+        }
+        assert_eq!(
+            held_gate(DeviceGate::AccountMissing, DeviceGate::Open),
+            DeviceGate::AccountMissing,
+            "an ordinary failure holds the account-missing decision"
+        );
+        assert_eq!(
+            held_gate(DeviceGate::Open, DeviceGate::Open),
+            DeviceGate::Open
+        );
+    }
+
+    #[test]
+    fn an_account_missing_signal_parks_and_keeps_local_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = AppState::new(cfg);
+        let blob = dir.path().join("vaults").join("v1").join("sentinel");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"keep").unwrap();
+        state.open_ledger_for_tests(&[]);
+        state.unlock_vault(
+            "v1".into(),
+            crate::state::SecretsCache::default(),
+            zeroize::Zeroizing::new(vec![0x42u8; 32]),
+        );
+
+        publish(
+            &state,
+            DeviceGate::AccountMissing,
+            &paired_at(1),
+            Some(T0),
+        );
+
+        assert!(state.is_vault_locked("v1"), "the retained key is evicted");
+        assert!(blob.exists(), "the unsigned signal deletes nothing");
+        let refusal = state.ledger_refusal().unwrap();
+        assert_eq!(refusal.code().0.as_str(), "device_not_admitted");
+        assert_eq!(
+            refusal.code().1,
+            crate::error::DEVICE_ACCOUNT_MISSING_MSG
+        );
+        assert_eq!(state.ledger.lock().unwrap().checked_at, Some(T0));
     }
 
     /// The pull authenticates by DIK proof of possession alone, so a revoked

@@ -266,6 +266,11 @@ pub struct RegistryResponse {
     pub vault_entries: Option<Option<Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub console_url: Option<String>,
+    /// The daemon retained an older readable cache after the vault was re-keyed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault_key_changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault_key_changed_message: Option<String>,
     /// Consent descriptors for the vault's own control-plane acts (acts.toml,
     /// raw templates — the client interpolates over the signed op it holds).
     /// Only on the published SSoT catalog (`sc registry --json` → registry.json,
@@ -475,6 +480,8 @@ pub fn render_catalog(
         locked: None,
         vault_entries: None,
         console_url: None,
+        vault_key_changed: None,
+        vault_key_changed_message: None,
         acts: include_policy_rules.then(crate::protocol::consent::act_catalog),
     })
 }
@@ -664,6 +671,10 @@ pub fn vault_registry_value(
         locked: Some(locked),
         vault_entries,
         console_url: Some(console_url(state, vault_id)),
+        vault_key_changed: Some(state.is_vault_key_changed(vault_id)),
+        vault_key_changed_message: state
+            .is_vault_key_changed(vault_id)
+            .then(|| crate::error::VAULT_KEY_CHANGED_MSG.to_string()),
         acts: None,
     };
     Ok(serde_json::to_value(body)?)
@@ -763,6 +774,34 @@ secrets = ["GITHUB_TOKEN"]
         assert!(!q(None, None).is_summary());
         assert!(!q(None, Some("full")).is_summary());
         assert!(q(None, Some("summary")).is_summary());
+    }
+
+    #[test]
+    fn a_vault_registry_tells_agents_its_key_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = AppState::new(cfg);
+        state.mark_vault_key_changed("v1");
+        let body = vault_registry_value(&state, "v1", &q(None, None), Some("ag_test"))
+            .unwrap();
+        assert_eq!(body["vault_key_changed"], serde_json::json!(true));
+        assert_eq!(
+            body["vault_key_changed_message"],
+            serde_json::json!(crate::error::VAULT_KEY_CHANGED_MSG)
+        );
     }
 
     #[test]

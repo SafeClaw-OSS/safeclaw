@@ -590,6 +590,9 @@ pub(crate) async fn apply_pending_connects(
     let (mut m, base) = match open_m_for_write(state, vault_id, &k, vault_dat.as_ref()) {
         Ok(v) => v,
         Err(e) => {
+            if e.contains("undecryptable with retained K") {
+                state.mark_vault_key_changed(vault_id);
+            }
             tracing::debug!(vault = %vault_id, "oauth connect: skipping scan: {}", e);
             return ConnectReport::default();
         }
