@@ -54,9 +54,11 @@ that setup prints and run the next command it prints.
 
 ## Per-agent identity
 
-Each agent has its own identity under `~/.safeclaw/agents/<name>/`. With one
-agent on the machine, `sc` picks it automatically. With several agents, load
-your own `~/.safeclaw/agents/<name>/agent.env` before running `sc`; it sets:
+Each agent has its own identity under `~/.safeclaw/agents/<name>/`. If
+`SAFECLAW_AGENT_IDENTITY` is unset, the agent loads its own env file before
+running `sc`: `set -a; . ~/.safeclaw/agents/<name>/agent.env; set +a`. With one
+directory there, that one is the agent's; with several, it uses the name it set up
+with. `sc setup` prints this line when it reports `done`. The file sets:
 
 | Variable | Meaning |
 |---|---|
