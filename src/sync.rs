@@ -832,8 +832,7 @@ fn remember_discovered(
 fn restore_discovered_access(state: &AppState, discovered: &[DiscoveredVault]) -> Vec<String> {
     let mut restored = Vec::new();
     for dv in discovered {
-        if state.tombstone_reason(&dv.id).is_some() {
-            state.restore_vault(&dv.id);
+        if state.tombstone_reason(&dv.id).is_some() && state.restore_vault(&dv.id).is_some() {
             tracing::info!(vault = %dv.id, "vault discovery: access restored; watcher may restart after unlock");
             restored.push(dv.id.clone());
         }

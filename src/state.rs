@@ -675,8 +675,14 @@ impl AppState {
         }
     }
 
-    pub fn restore_vault(&self, vault_id: &str) -> Arc<crate::vault_runtime::VaultRuntime> {
+    /// Re-admit a tombstoned vault with a fresh runtime. `None` while a runtime for it
+    /// is still present: a closing one whose `close_vault` has not run yet must not be
+    /// replaced (that would leave two writers); discovery retries on its next pass.
+    pub fn restore_vault(&self, vault_id: &str) -> Option<Arc<crate::vault_runtime::VaultRuntime>> {
         let mut runtimes = self.vault_runtimes.lock().unwrap();
+        if runtimes.contains_key(vault_id) {
+            return None;
+        }
         let hosts = self
             .vault_tombstones
             .lock()
@@ -689,7 +695,7 @@ impl AppState {
             hosts,
         ));
         runtimes.insert(vault_id.to_string(), runtime.clone());
-        runtime
+        Some(runtime)
     }
 
     pub async fn close_vault(
@@ -761,6 +767,10 @@ impl AppState {
         &self,
         vault_id: &str,
     ) -> crate::error::Result<Arc<crate::audit::AuditStore>> {
+        // Only a vault held on disk gets a runtime for its audit log.
+        if !self.vaults.dir_for(vault_id)?.exists() {
+            return Err(self.vault_gone_error(vault_id).unwrap_or(crate::error::AppError::NotFound));
+        }
         let runtime = self
             .runtime(vault_id)
             .map_err(crate::vault_runtime::VaultGone::app_error)?;
@@ -1124,10 +1134,13 @@ impl AppState {
                 });
             }
         }
+        // Checked under the state lock: close() marks the runtime closed before it
+        // stores Locked under this lock, so its Locked store is always the last one.
+        let mut runtime_state = runtime.state.lock().unwrap();
         if runtime.is_closed() {
             return;
         }
-        *runtime.state.lock().unwrap() = VaultState::Unlocked {
+        *runtime_state = VaultState::Unlocked {
                 cache,
                 state_key,
                 unlocked_at,
@@ -2275,14 +2288,18 @@ impl AppState {
             hit |= hosts
                 .iter()
                 .any(|anchor| crate::core::host::host_anchor_matches(host, anchor));
-            remembered.insert(runtime.vault_id.clone(), hosts);
+            if !hosts.is_empty() {
+                remembered.insert(runtime.vault_id.clone(), hosts);
+            }
         }
         for (vid, tombstone) in self.vault_tombstones.lock().unwrap().iter() {
             hit |= tombstone
                 .hosts
                 .iter()
                 .any(|anchor| crate::core::host::host_anchor_matches(host, anchor));
-            remembered.insert(vid.clone(), tombstone.hosts.clone());
+            if !tombstone.hosts.is_empty() {
+                remembered.insert(vid.clone(), tombstone.hosts.clone());
+            }
         }
         let json = canonical_unions_json(&remembered);
         let mut persisted = self.host_unions_persisted.lock().unwrap();

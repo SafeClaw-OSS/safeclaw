@@ -534,12 +534,14 @@ pub fn vault_registry_value(
         std::collections::HashMap<String, Connection>,
         bool,
     ) = {
-        let runtime = state
-            .runtime(vault_id)
-            .map_err(crate::vault_runtime::VaultGone::app_error)?;
-        let runtime_state = runtime.state.lock().unwrap();
-        match &*runtime_state {
-            VaultState::Unlocked { cache, .. } => {
+        if let Some(gone) = state.vault_gone_error(vault_id) {
+            return Err(gone);
+        }
+        // A read: no runtime means locked here, and listing must not create one.
+        let runtime = state.runtime_if_present(vault_id);
+        let runtime_state = runtime.as_ref().map(|r| r.state.lock().unwrap());
+        match runtime_state.as_deref() {
+            Some(VaultState::Unlocked { cache, .. }) => {
                 let mut custom: Vec<(String, ServiceDef)> = cache
                     .custom_services
                     .iter()
