@@ -1,42 +1,52 @@
 # Quickstart
 
-Zero to an agent making authenticated API calls with a key it never saw.
-Takes about five minutes.
+This page explains how to install SafeClaw, run agent-driven setup, approve the browser steps, and make the first brokered call.
 
 ## 1. Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/getsafeclaw/safeclaw/main/install.sh | sh
+curl -fsSL https://safeclaw.pro/install.sh | sh
 ```
 
-Puts the `sc` binary in `~/.local/bin` after verifying its `SHA256SUMS`. No
-sudo, no system changes. `sc --version` to confirm. Supported platforms and how
-to verify the download: [Platform support](reference/platform-support.md).
+The installer uses no sudo, verifies the download's SHA256, puts `sc` in
+`~/.local/bin`, installs the skill at `skills/safeclaw/SKILL.md`, and prints one
+next step. It also installs the skill with `sc skill install`. Official sources
+are [safeclaw.pro](https://safeclaw.pro) and
+[github.com/getsafeclaw/safeclaw](https://github.com/getsafeclaw/safeclaw).
+Supported platforms: [Platform support](reference/platform-support.md).
 
-## 2. Create your vault
+## 2. Run setup
 
-Sign in at [safeclaw.pro](https://safeclaw.pro) and register a passkey when
-prompted. The passkey is the root of everything: your vault's contents are
-sealed under it, and it is what you tap to approve sensitive actions later.
-There is no password.
-
-## 3. Pair this machine and your agent
-
-In the console, "Connect a new agent" gives you an install prompt. Paste it
-to your agent and it does the rest. What it runs:
+Run this as the person or as their agent:
 
 ```bash
-sc login                      # pair this machine; brings the daemon up and
-                              # prints a passkey-approval link you open once
-sc agent add my-agent >> .env # register the agent the same way (one more link),
-                              # then append its env lines:
-                              # SAFECLAW_BROKER_URL / SAFECLAW_AGENT_IDENTITY
+sc setup --name <a short name for the agent>
 ```
 
-The approval is a passkey tap in your browser. After this, `sc status` shows
-the daemon up and the vault unlocked.
+`sc setup` never prompts. It prints one sentence for the agent to relay and the
+next command. The agent repeats this loop until setup reports `done`:
 
-## 4. Add a credential
+- `action_required`: relay `say` exactly, then run `next_step`. The sentence
+  tells the person to open the `/pair` address and type the code shown, or open
+  a link and approve with a passkey.
+- `waiting`: run the same `next_step` again.
+- `done`: continue to the next section.
+- `error`: run `fix`, then continue the loop.
+
+In the browser, the person signs in or creates an account the first time,
+creates a passkey, and approves the machine. The passkey also creates the
+first vault. They then approve the agent and choose which vaults it may use,
+then approve the vault unlock. Under the hood, setup runs `sc login` if the
+machine is not paired and `sc agent add` if the agent is not registered. It
+writes `~/.safeclaw/agents/<name>/agent.env`, installs the skill, and asks for
+the unlock. It is safe to run again.
+
+At a terminal, a person can still use `sc login` to pair a machine or `sc agent
+add <name>` to add an agent by hand, such as a second agent. `sc setup` runs
+whichever of those is still needed and also handles the env file, skill, and
+unlock.
+
+## 3. Add a credential
 
 Two doors, same result: a **connection** with hosts and a **phantom**.
 
@@ -54,7 +64,7 @@ Prompts for the value, asks for one passkey approval, and mints the phantom
 `__sc__hf_token__` anchored to `huggingface.co`. Entered this way the value
 never leaves your machine.
 
-## 5. First brokered call
+## 4. First brokered call
 
 Put the phantom where the credential belongs and route the command through
 `sc run --`:
@@ -68,14 +78,14 @@ The proxy swaps the phantom for the real value on the way out, only toward
 that connection's own hosts. The command gets the API response; the
 environment, the shell history, and the agent hold only the phantom.
 
-## 6. When an approval is needed
+## 5. When an approval is needed
 
 Policy-gated uses don't fail silently: the command's error output carries an
 approval link. Open it, tap your passkey, re-run the same command. Agents can
 block on `sc op wait <op_id>` instead of asking you to say "done". Approvals
 are cached per policy, so routine calls don't nag.
 
-## 7. Daily rhythm
+## 6. Daily rhythm
 
 ```bash
 sc up      # start of day: daemon up + vault unlocked, one passkey tap

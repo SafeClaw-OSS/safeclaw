@@ -6,6 +6,16 @@
 
 <p align="center"><b>Let your AI agent use your API keys. It never holds them.</b></p>
 
+## Set up
+
+```bash
+curl -fsSL https://safeclaw.pro/install.sh | sh
+```
+
+Paste it to your AI agent, or run it in a terminal. It installs `sc` and the agent skill, then prints the next step.
+
+Are you an AI agent? Run the command above and follow what it prints. Install only from safeclaw.pro or github.com/getsafeclaw/safeclaw.
+
 <p align="center">
   <a href="https://github.com/getsafeclaw/safeclaw/releases"><img src="https://img.shields.io/github/v/release/getsafeclaw/safeclaw?label=release&color=2ea44f" alt="release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="license"></a>
@@ -58,25 +68,25 @@ GitHub, OpenAI, Anthropic, Gemini, Gmail, Google Drive, GCP, Supabase, Railway, 
 
 ## Quickstart
 
-**1. Install.** Downloads the prebuilt binary for your platform to `~/.local/bin` and verifies its `SHA256SUMS`; no sudo, no system changes. (Or `cargo build --release`.)
+**1. Install.** Run the one setup command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/getsafeclaw/safeclaw/main/install.sh | sh
+curl -fsSL https://safeclaw.pro/install.sh | sh
 ```
+
+It installs `sc` in `~/.local/bin`, verifies the download's SHA256, installs the agent skill, and prints the next step. It uses no sudo.
 
 Each release also carries a sigstore build-provenance attestation: `gh attestation verify ~/.local/bin/sc --repo getsafeclaw/safeclaw`.
 
-**2. Create your vault** at [safeclaw.pro](https://safeclaw.pro): sign in and register a passkey. No password to invent, nothing to remember.
-
-**3. Connect your agent.** The console's "Connect a new agent" gives you an install prompt to paste to your agent. Under the hood it runs:
+**2. Set up the agent.** Run:
 
 ```bash
-sc login                        # pair this machine: prints a link + code you approve in the browser
-sc agent add my-agent >> .env   # register the agent the same way; appends its two env lines
-                                # (SAFECLAW_BROKER_URL / SAFECLAW_AGENT_IDENTITY, neither is a secret)
+sc setup --name <name>
 ```
 
-**4. Add a credential.** In the console's Connections tab (values are encrypted in your browser before upload), or at your terminal:
+It never prompts. Follow each printed instruction until it reports `done`: sign in or create an account, create a passkey, approve the machine, approve the agent and choose its vaults, then approve the vault unlock.
+
+**3. Add a credential.** In the console's Connections tab (values are encrypted in your browser before upload), or at your terminal:
 
 ```bash
 sc set HF_TOKEN --host huggingface.co   # prompts for the value; one passkey approval
@@ -85,7 +95,7 @@ sc set HF_TOKEN --host huggingface.co   # prompts for the value; one passkey app
 
 Entered this way, the value never leaves your machine.
 
-**5. Use it.** The agent puts the phantom where the credential belongs and routes the command through the proxy:
+**4. Use it.** The agent puts the phantom where the credential belongs and routes the command through the proxy:
 
 ```bash
 HF_TOKEN=__sc__hf_token__ sc run -- python train.py
@@ -95,12 +105,12 @@ Full walkthrough: [docs/quickstart.md](docs/quickstart.md).
 
 ## Teach your agent
 
-Agents learn SafeClaw from one file: [safeclaw-skill.md](static/safeclaw-skill.md). The console's install prompt already includes it; to hand it to an agent yourself, see [docs/for-your-agent.md](docs/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/sc-run.md](docs/sc-run.md).
+Agents learn SafeClaw from [skills/safeclaw/SKILL.md](skills/safeclaw/SKILL.md), in Agent Skills format. The installer adds it with `sc skill install` and `sc upgrade` installs it again. Without `sc`, an agent can add it with `npx skills add getsafeclaw/safeclaw`; see [docs/for-your-agent.md](docs/for-your-agent.md). The one habit that matters: **phantoms, not values**. An agent never needs `sc get`; see [docs/sc-run.md](docs/sc-run.md).
 
 ## CLI
 
 ```text
-Setup         sc login · logout · up · down · restart · status
+Setup         sc setup · login · logout · up · down · restart · status
 Secrets       sc set · get · ls · rm              (aliases of sc secret …)
 Connections   sc connection add|ls|rm · sc run -- <cmd> · sc registry · sc store
 Services      sc service add|update|ls|rm|validate   (from ./folder or github:owner/repo)

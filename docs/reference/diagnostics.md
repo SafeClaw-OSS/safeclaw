@@ -1,12 +1,10 @@
-# Diagnostics — error codes & surfaces
+# Diagnostics: error codes and surfaces
 
-Doctrine: **every problem SafeClaw can see fails loudly, in SafeClaw's name;
-success is silent.** An error that carries no SafeClaw marker is not
-SafeClaw's — with two physical blind spots the broker cannot see (below).
+This page lists SafeClaw error codes, response shapes, actions, and known blind spots. SafeClaw reports problems loudly and leaves unrelated upstream errors without a SafeClaw marker.
 
 `src/error.rs::ScCode` is the single registry; this table is its rendering and
-changes in the same commit. Codes are snake_case and stable — never renumber
-or reuse.
+changes in the same commit. Codes are snake_case and stable, so never renumber
+or reuse them.
 
 ## Wire shapes (one row, three renderings)
 
@@ -18,9 +16,9 @@ or reuse.
 
 `action` = what the agent does next: `unlock` (have the user unlock), `approve`
 (follow the approve URL in the body), `retry`, `configure` (a knob, named in
-the message), `fix_request`, `none` (explicit refusal — don't work around it).
+the message), `fix_request`, `none` (explicit refusal, do not work around it).
 `cause` = attribution: `request`/`auth`/`vault`/`policy`/`config`/`internal`,
-plus `environment` and `upstream` which are NOT SafeClaw problems — reported by
+plus `environment` and `upstream` which are NOT SafeClaw problems, reported by
 SafeClaw because it is the hop that observed them.
 
 ## Codes
@@ -37,18 +35,18 @@ SafeClaw because it is the hop that observed them.
 | `rate_limited` | 429 | retry | request | slow down |
 | `internal` | 500 | retry | internal | daemon bug/failure |
 | `ca_unavailable` | 500 | retry | internal | resident CA unreadable |
-| `agent_key` | 407 | configure | auth | phantom-bearing request without a verified agent identity (run the agent through `sc run`; set it up with `sc agent add`) |
-| `agent_not_admitted` | 403 | configure | auth | the agent proved its identity, but the account's ledger does not admit it (never approved, or revoked); refused on every vault, whatever its Agent access page lists. Fix: run `sc agent add` |
-| `agent_not_in_account` | 403 | configure | auth | (cloud op relay) the agent isn't registered to the account this machine is signed in to. The daemon itself answers `agent_not_admitted`. Fix: run `sc agent add` on this machine |
+| `agent_key` | 407 | configure | auth | phantom-bearing request without a verified agent identity (run the agent through `sc run`; set it up with `sc setup --name <name>` or `sc agent add`) |
+| `agent_not_admitted` | 403 | configure | auth | the agent proved its identity, but the account's ledger does not admit it (never approved, or revoked); refused on every vault, whatever its Agent access page lists. Fix: run `sc setup --name <name>` or `sc agent add` |
+| `agent_not_in_account` | 403 | configure | auth | (cloud op relay) the agent isn't registered to the account this machine is signed in to. The daemon itself answers `agent_not_admitted`. Fix: run `sc setup --name <name>` or `sc agent add` on this machine |
 | `ambiguous_phantom` | 400 | fix_request | request | bare phantom on a multi-secret connection; use a role phantom |
 | `approval_needed` | 401 | approve | policy | policy asks; body carries approve/poll URLs + op id |
 | `approval_register` | 503 | retry | internal | could not open the approval op |
 | `approver_not_authorized` | 403 | none | auth | the passkey that approved is neither the requester nor an admin of this shared vault; the request stays pending |
 | `wk_refused_v2` | 400 | none | request | an approval delivered an unlock secret instead of the vault key and the approver's signature; an approver's identity key never leaves their browser, so the daemon refuses it. The request stays pending; reload the approval page (it needs the current console) |
 | `grant_id_invalid` | 403 | none | auth | the approval's identity signature is missing, does not verify, or names someone other than the owner of the passkey that approved; the request stays pending |
-| `device_not_admitted` | 403 | configure | auth | this device has no valid owner-signed admit over its device and daemon keys, so no approval can be sealed to it. Fix: run `sc login` |
+| `device_not_admitted` | 403 | configure | auth | this device has no valid owner-signed admit over its device and daemon keys, so no approval can be sealed to it. Fix: run `sc setup --name <name>` or `sc login` |
 | `ledger_stale` | 423 | retry | environment | SafeClaw could not pull a verified device list from your account for 7 days; vaults are locked (data stays) until it reconnects |
-| `ledger_device_revoked` | 403 | configure | auth | the account owner revoked this device (a verified revoke in the device list; a newer admit of a re-paired device follows its revoke). The daemon latches it. Fix: run `sc login` to pair again |
+| `ledger_device_revoked` | 403 | configure | auth | the account owner revoked this device (a verified revoke in the device list; a newer admit of a re-paired device follows its revoke). The daemon latches it. Fix: run `sc setup --name <name>` or `sc login` to pair again |
 | `ledger_head_invalid` | 403 | none | auth | the account's device list does not match its owner-signed head (a forged or truncated list); the daemon keeps its previous view |
 | `broker_body_limit` | 413 | configure | config | body exceeds the inspectable cap; raise `--body-cap` if legitimate |
 | `egress_unreachable` | 502 | configure | environment | forward hop failed to connect (NOT a credential problem) |
@@ -77,20 +75,20 @@ rejected`; a rejected op carries `reason`, and waiters distinguish a USER
 rejection from a withdrawal by the requester or a newer request replacing it:
 those say so and ask for a re-run, never "rejected".
 First-class wire statuses (`cancelled` / `superseded` / `expired`) need the
-console's chips to change in the same release — parked as follow-up.
+console's chips to change in the same release: parked as follow-up.
 
 ## Blind spots (the broker cannot yell here)
 
-1. **Not in the path** — the process wasn't routed (no `sc run` / env bundle):
+1. **Not in the path**: the process wasn't routed (no `sc run` / env bundle):
    the phantom reaches the upstream literally. Upstreams reject (401) or
    silently degrade; either way there is no SafeClaw marker. The phantom
    string itself (`__sc__*__`) is the greppable brand; the skill's routing
    check covers this.
-2. **Locked before ever unlocking (this boot)** — anchor hosts live in the
+2. **Locked before ever unlocking (this boot)**: anchor hosts live in the
    sealed blob, so a daemon restarted while locked cannot recognize brokered
    hosts and blind-tunnels them. Once a vault has been unlocked once, its
    anchors are remembered across Lock (`state.last_host_unions`) and a phantom
    sent while locked gets an explicit `vault_locked` instead.
 
 Invariant for new proxy branches: every outcome is either **passthrough**
-(not ours) or a **registry-coded error** — no third state, no silent drop.
+(not ours) or a **registry-coded error**: no third state, no silent drop.

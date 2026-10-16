@@ -1,16 +1,16 @@
 # Service TOML reference (v4)
 
-How to write a SafeClaw service definition. Design rationale lives in
+This page explains how to write a SafeClaw service definition. Design rationale lives in
 [credential-broker.md](https://github.com/getsafeclaw/safeclaw/blob/main/design/credential-broker.md); this page is the authoring
 reference only.
 
-A service is a folder `services/{id}/` — flat, so the filesystem itself
+A service is a folder `services/{id}/`: flat, so the filesystem itself
 enforces id uniqueness. Classification is data (`tags`), not layout.
 
 ```
 services/github/
   service.toml     # this page
-  policy.toml      # per-action rules (each declares a level) — see policy.md; rules match (host, path, method)
+  policy.toml      # per-action rules (each declares a level): see policy.md; rules match (host, path, method)
 ```
 
 Format: TOML (authored by humans/agents; CI publishes `registry.json`).
@@ -106,7 +106,7 @@ How it works:
 [service]
 id = "github"            # required; [a-z0-9_], no "__"; must equal the services/{id}/ dir name
 name = "GitHub"          # display name
-tags = ["app"]           # classification, multiple allowed — see below
+tags = ["app"]           # classification, multiple allowed: see below
 # optional: group, hidden, activation, help, secret_url
 
 hosts = ["api.github.com", "github.com"]
@@ -124,7 +124,7 @@ The only destinations this service's secrets may ever be sent to.
 - Entry = exact FQDN, or `*.suffix` (`*` leftmost only, matches exactly one
   label: `*.openai.azure.com` matches `foo.openai.azure.com`, not
   `a.b.openai.azure.com`). Bare `*` is rejected.
-- Authorities only — no scheme, no path prefix.
+- Authorities only: no scheme, no path prefix.
 - With a wildcard entry, each connection pins its exact host(s) at connect
   time; enforcement always runs against exact FQDNs.
 - Do not add routing/transport info anywhere in the file; tool-native hints
@@ -133,7 +133,7 @@ The only destinations this service's secrets may ever be sent to.
 ### `secrets`
 
 The durable stored keys a connection of this type holds. Keys are `[A-Z0-9_]`
-and are the same list for **every** service — an OAuth2 service lists its
+and are the same list for **every** service: an OAuth2 service lists its
 refresh-token key here too (whatever `[auth].refresh_token` names). Presence of
 all of them is what makes a connection "connected".
 
@@ -141,20 +141,20 @@ all of them is what makes a connection "connected".
   *production* PRODUCES. No section = pass-through: the products are the declared
   `secrets` themselves. A production section (`[auth]`; future `[sigv4]`-class)
   makes its OUTPUT the injectable and marks every secret its fields name (e.g.
-  `refresh_token = "…"`) as a production INPUT — stored, never injectable
+  `refresh_token = "…"`) as a production INPUT: stored, never injectable
   (the proxy answers such a phantom with an explicit `403 refresh_forbidden`).
   The registry's per-connection `phantoms` list is the computed projection of
-  this rule — agents copy from it, never derive.
+  this rule: agents copy from it, never derive.
 - The phantom `__sc__<conn>__` resolves to the sole injectable; if a connection
   has several, agents use `__sc__<conn>__<key>__` (key lowercased).
 - Insertion needs no declaration: the value replaces the phantom wherever the
-  tool puts it — any header, query param, URL path, body, or inside a decoded
+  tool puts it: any header, query param, URL path, body, or inside a decoded
   `Authorization: Basic`. Never in the URL authority.
 
 ### `tags`
 
 Classification, replacing the old `services/{category}/` directory layer.
-Lowercase-kebab slugs, several allowed, no duplicates (validator-enforced —
+Lowercase-kebab slugs, several allowed, no duplicates (validator-enforced :
 shape only, the vocabulary is open).
 
 - Core vocabulary today: `ai` (model providers), `app` (external apps/SaaS),
@@ -162,10 +162,10 @@ shape only, the vocabulary is open).
   `wallet`) coexist freely in the same list.
 - Consumers: the console derives its filter chips and grouping from the tags
   present in the registry (an unknown tag renders verbatim as a chip), and the
-  policy engine matches tags against the per-tag default floors — when several
+  policy engine matches tags against the per-tag default floors: when several
   of a service's tags carry a floor, the most restrictive wins.
-- Untagged (typical for per-vault custom services): no tag floor applies —
-  only the global floor — and the console buckets the service as an app.
+- Untagged (typical for per-vault custom services): no tag floor applies :
+  only the global floor: and the console buckets the service as an app.
 
 ### `secret_url` (optional)
 
@@ -174,7 +174,7 @@ Where a HUMAN mints/manages this service's secret (e.g.
 console renders it as an "Open … → API tokens" helper link and
 `sc connection add --service` prints it ("Get a token: …"). Nothing ever
 fetches a secret from it, and it never participates in routing or policy.
-Must be `http(s)` when present — it is rendered as a link, so the validator
+Must be `http(s)` when present: it is rendered as a link, so the validator
 rejects non-web schemes.
 
 ### `[auth] type = "oauth2"`
@@ -234,13 +234,13 @@ The phantom resolves to the minted access token. Token slots use RFC 6749
 response field names: `refresh_token` (required) maps the durable refresh token
 to the vault secret KEY it lives under; `id_token` (optional) does the same for a
 stored OIDC id token. Naming the durable token explicitly keeps a multi-secret
-service unambiguous. The refresh key is internal to the mint — never injectable.
+service unambiguous. The refresh key is internal to the mint: never injectable.
 `access_token` (minted, ephemeral, never stored) and the flow temps `code` /
 `code_verifier` are NOT in the toml. This is the only auth section; a signing
 family (`[sigv4]`, `[web3sign]`) may be added when real. Sections are named by
 auth mechanism, never by tool.
 
-### Basic auth — nothing to declare
+### Basic auth: nothing to declare
 
 The proxy decodes `Authorization: Basic` and substitutes phantoms inside it.
 Put the phantom where the pair goes:

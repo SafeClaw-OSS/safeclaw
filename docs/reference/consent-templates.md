@@ -1,4 +1,6 @@
-# Consent templates — the ONE grammar for approval copy
+# Consent templates: the ONE grammar for approval copy
+
+This page defines the reviewed consent templates used by SafeClaw approval surfaces.
 
 Two authorship domains, one grammar, one renderer contract:
 
@@ -8,7 +10,7 @@ Two authorship domains, one grammar, one renderer contract:
 | Product (`src/protocol/acts.toml`) | what a VAULT OPERATION means | core, next to the act implementation | the signed op's `target` / `scope` fields |
 
 Every approval surface (grant page, CLI prompt, audit row) renders
-**static reviewed template ⊕ signed op bytes** — requester-authored prose can
+**static reviewed template ⊕ signed op bytes**: requester-authored prose can
 never reach an approval surface (ERC-7730 / RFC 9396 shape).
 
 ## Grammar
@@ -24,7 +26,7 @@ never reach an approval surface (ERC-7730 / RFC 9396 shape).
   console `interpOp` in `components/approvals/approval-view.tsx`) and the
   shared vectors below.
 
-## Value rendering (P3 rules — both renderers MUST match)
+## Value rendering (P3 rules: both renderers MUST match)
 
 - undefined / missing / null → empty string
 - string → verbatim; number → decimal
@@ -37,11 +39,11 @@ never reach an approval surface (ERC-7730 / RFC 9396 shape).
 
 ## acts.toml descriptor fields
 
-`action` (+`action_zh`) — verb-object title, doubles as the approve button
-label. `explain` (+`explain_zh`) — one sentence, ALWAYS rendered inline.
-`tone` — `neutral | info | danger`; advisory upward-only (clients keep a
+`action` (+`action_zh`): verb-object title, doubles as the approve button
+label. `explain` (+`explain_zh`): one sentence, ALWAYS rendered inline.
+`tone`: `neutral | info | danger`; advisory upward-only (clients keep a
 built-in danger floor per act kind; a catalog can raise tone, never lower).
-`facts` — `{label, label_zh?, value}` rows; the `Connection` label maps onto
+`facts`: `{label, label_zh?, value}` rows; the `Connection` label maps onto
 the console's "through" line. A fact renders only daemon-stamped or
 daemon-checked fields, never a requester-supplied list: connection-add's
 facts read the card (`written`, `referenced`, `overwrites`, `destinations`,
@@ -54,7 +56,7 @@ states the source as a fact only when the daemon fetched it again
 
 ## Drift gates
 
-- `consent::tests::dispatch_and_table_agree` — every dispatched custom act has
+- `consent::tests::dispatch_and_table_agree`: every dispatched custom act has
   a descriptor and vice versa (`DISPATCHED_CUSTOM_ACTS` in approve.rs).
 - Shared vectors: `consent::tests` (`renders_action_facts_and_p3_rules`,
   `bool_and_missing_vars_render_per_p3`, `filters_accepted_and_ignored`) are

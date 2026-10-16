@@ -1,5 +1,7 @@
 # Approvals & policy: who decides what runs
 
+This page explains SafeClaw's per-action approval levels, policy sources, and passkey decisions.
+
 Every brokered request gets exactly one decision:
 
 | Level | Behavior |

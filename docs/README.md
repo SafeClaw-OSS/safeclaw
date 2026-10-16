@@ -1,10 +1,8 @@
 # SafeClaw Docs
 
-A systematic tour of SafeClaw, one module per page. Concepts explain how the
-product thinks; guides get a task done; security answers the questions that
-decide trust. `reference/` holds the lookup layer; contributor design docs
-live outside this tree in [`design/`](https://github.com/getsafeclaw/safeclaw/tree/main/design).
-Pages are deliberately short and will deepen over time.
+This documentation explains SafeClaw through concepts, task guides, security
+pages, and reference pages. Contributor design docs live outside this tree in
+[`design/`](https://github.com/getsafeclaw/safeclaw/tree/main/design).
 
 New here? Read [Overview](overview.md), then do the
 [Quickstart](quickstart.md).

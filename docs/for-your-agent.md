@@ -1,61 +1,76 @@
 # For your agent
 
-Agents learn SafeClaw from one file:
-[`safeclaw-skill.md`](https://github.com/getsafeclaw/safeclaw/blob/main/static/safeclaw-skill.md). It is the single
-source of truth for agent behavior: discovery, phantom placement, `sc run`,
-approvals. This page is only about handing it over.
+This page explains how an agent gets the SafeClaw skill, runs setup, loads its identity, and uses SafeClaw without handling credential values.
 
-## The easy way
+## The skill
 
-The console's "Connect a new agent" install prompt already pairs the
-machine, mints the agent's env, and delivers the skill. If you went through
-[Quickstart](quickstart.md) step 3, you are done; this page is for doing it by
-hand.
+The skill lives at [`skills/safeclaw/SKILL.md`](https://github.com/getsafeclaw/safeclaw/blob/main/skills/safeclaw/SKILL.md) in Agent Skills format. It is the source of truth for discovery, phantom placement, `sc run`, approvals, and setup.
 
-## Paste-ready prompt
+The installer adds it with `sc skill install`. `sc upgrade` runs the skill
+install again, so the installed copy stays current. An agent without `sc` can
+add it with:
 
-Machine already paired, agent env already minted (`sc agent add` ran)? Send
-your agent this:
-
-```text
-Fetch https://raw.githubusercontent.com/getsafeclaw/safeclaw/main/static/safeclaw-skill.md
-and save it where you keep always-loaded skills. Follow it whenever a task
-needs an external credential: use the phantom placeholders it describes and
-route those commands through `sc run --`. Never ask me to paste a key and
-never try to read one; if a service isn't connected yet, give me the console
-link as the skill instructs.
+```bash
+npx skills add getsafeclaw/safeclaw
 ```
 
-Agents with filesystem access can equally copy the file from a checkout of
-this repo into their skills directory.
+Install only from [safeclaw.pro](https://safeclaw.pro) or
+[github.com/getsafeclaw/safeclaw](https://github.com/getsafeclaw/safeclaw).
+
+## Set up
+
+If `sc` is not installed, run:
+
+```bash
+curl -fsSL https://safeclaw.pro/install.sh | sh
+```
+
+The installer verifies the download's SHA256, puts `sc` in `~/.local/bin`,
+installs this skill, and prints the next step. Then run:
+
+```bash
+sc setup --name <a short name for the agent>
+```
+
+`sc setup` never prompts. Read its status and follow the loop until it reports
+`done`:
+
+- `action_required`: relay the `say` sentence exactly. It tells the person to
+  open the `/pair` address and type the code shown, or open a link and approve
+  with a passkey. Then run the printed `next_step`.
+- `waiting`: run the printed `next_step` again.
+- `done`: setup is complete.
+- `error`: apply the printed `fix`, then run setup again as directed.
+
+The browser sequence is: the person signs in or creates an account, creates a
+passkey, and approves the machine; approves the agent and chooses which vaults
+it may use; then approves the vault unlock. Under the hood, setup runs `sc
+login` and `sc agent add` when needed, writes
+`~/.safeclaw/agents/<name>/agent.env`, installs the skill, and asks for the
+unlock. It is safe to re-run.
+
+Never ask the person to paste a key or a code into chat. Relay the sentence
+that setup prints and run the next command it prints.
+
+## Per-agent identity
+
+Each agent has its own identity under `~/.safeclaw/agents/<name>/`. With one
+agent on the machine, `sc` picks it automatically. With several agents, load
+your own `~/.safeclaw/agents/<name>/agent.env` before running `sc`; it sets:
+
+| Variable | Meaning |
+|---|---|
+| `SAFECLAW_BROKER_URL` | The local broker, for example `http://127.0.0.1:23294` |
+| `SAFECLAW_AGENT_IDENTITY` | The agent identity file used to sign requests; it is not a credential |
+
+The env file is non-secret. Do not share an identity file between agents.
 
 ## What your agent can propose
 
-Changes to the vault come from you, but an agent may ask for one: a new
-host on a connection (`sc connection add-host`), or a new connection that
-uses a secret already in your vault
-(`sc connection add <id> --service <svc> --from-secret ROLE=KEY`). Each is an
-approval request; nothing changes until you approve it with your passkey,
-and the card lists every key and host involved.
+Changes to the vault come from you, but an agent may ask for one: a new host on a connection (`sc connection add-host`), or a new connection that uses a secret already in your vault (`sc connection add <id> --service <svc> --from-secret ROLE=KEY`). Each is an approval request; nothing changes until you approve it with your passkey, and the card lists every key and host involved.
 
-## What the agent's env means
+## Terminal commands for people
 
-`sc agent add <name>` mints one env block per agent:
-
-| Var | Meaning |
-|---|---|
-| `SAFECLAW_BROKER_URL` | The local broker, e.g. `http://127.0.0.1:23294` |
-| `SAFECLAW_AGENT_IDENTITY` | Path to the agent's identity file (its AIK keypair). NOT a secret — `sc run` signs a fresh per-request proof-of-possession with it; no api key is stored or sent. |
-
-Both lines are non-secret, so the env block is safe to display. The vault is not
-part of the env: each request names one in its URL (`/v/<vault>/…`), and `sc run`
-binds one per launched command (`sc run --vault <id> -- <cmd>` to pick).
-`sc vault ls` lists ids (`*` = default).
-
-One identity per agent keeps the audit trail attributable; don't share an
-identity file across agents, and don't re-run `sc agent add` when the env already
-exists (it registers a duplicate).
-
-These vars steer the *agent's* requests only. Your own `sc` commands read the
-active vault from `~/.safeclaw/config.toml` (set by `sc login` / `sc vault
-use`), so a stale agent env can never hijack what you do at the terminal.
+People can still run `sc login` to pair a machine and `sc agent add <name>` to
+register an agent at a terminal. `sc setup` runs whichever command is still
+needed, then handles the env file, skill, and unlock.

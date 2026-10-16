@@ -37,8 +37,9 @@ On disk, yours or the cloud's, the vault only ever exists sealed. `sc lock`
 The cloud stores the sealed vault for backup and syncs it across your
 machines per item, so two devices editing different entries don't clobber
 each other. The cloud cannot read what it syncs: sealing and unsealing happen
-on your devices only. Pairing a new machine is `sc login` plus a passkey
-approval; unpairing revokes that device's standing cloud-side too.
+on your devices only. Pairing a new machine is part of `sc setup`; at a
+terminal, a person can run `sc login` and approve it with a passkey. Unpairing
+revokes that device's standing cloud-side too.
 
 ## Multiple vaults
 

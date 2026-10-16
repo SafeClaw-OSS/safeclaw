@@ -1,7 +1,6 @@
 # Security model: where your keys actually live
 
-Straight answers to the questions that decide whether you trust a credential
-broker. The cryptographic detail behind each one is in
+This page answers the security questions about SafeClaw's credential broker. The cryptographic detail behind each one is in
 [PROTOCOL.md](https://github.com/getsafeclaw/safeclaw/blob/main/design/protocol.md).
 
 ## Where is the plaintext?
