@@ -156,9 +156,12 @@ type Session = (
 );
 
 fn session(state: &AppState, vault_id: &str) -> std::result::Result<Session, String> {
-    let states = state.vault_states.lock().unwrap();
-    match states.get(vault_id) {
-        Some(VaultState::Unlocked { cache, .. }) => Ok((
+    let runtime = state
+        .runtime_if_present(vault_id)
+        .ok_or_else(|| "vault locked".to_string())?;
+    let runtime_state = runtime.state.lock().unwrap();
+    match &*runtime_state {
+        VaultState::Unlocked { cache, .. } => Ok((
             cache.service_entries.clone(),
             cache.connections.clone(),
             cache.policy.allow_installed_services,

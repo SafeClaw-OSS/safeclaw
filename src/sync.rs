@@ -27,6 +27,10 @@ use crate::state::AppState;
 use crate::storage::sealed_vault::{self, SealedVault};
 use crate::sync_stream::{Mode, StreamHealth, WakeCell, Work};
 
+#[cfg(test)]
+const REVOKED_REASON: &str =
+    "this device can no longer use this vault: your account was removed from it";
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum VaultRefusal {
     AccessRevoked {
@@ -482,13 +486,16 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
         return;
     };
     let Some(dk) = device_key() else { return };
-    let has_ids = state
-        .pending_config_ids
-        .lock()
-        .unwrap()
-        .get(vault_id)
-        .cloned();
-    let has_format = state.pending_format_mark.lock().unwrap().contains(vault_id);
+    let Some(runtime) = state.runtime_if_present(vault_id) else {
+        return;
+    };
+    let has_ids = {
+        let ids = runtime.pending_config_ids.lock().unwrap();
+        (!ids.is_empty()).then(|| ids.clone())
+    };
+    let has_format = runtime
+        .pending_format_mark
+        .load(std::sync::atomic::Ordering::Acquire);
     if has_ids.is_none() && !has_format {
         return;
     }
@@ -508,7 +515,7 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
             .await
         {
             Ok(r) if r.status().is_success() => {
-                state.pending_config_ids.lock().unwrap().remove(vault_id);
+                runtime.pending_config_ids.lock().unwrap().clear();
                 tracing::info!(vault = %vault_id, "owner lock-list registered");
             }
             Ok(r) => {
@@ -537,7 +544,9 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
             .await
         {
             Ok(r) if r.status().is_success() => {
-                state.pending_format_mark.lock().unwrap().remove(vault_id);
+                runtime
+                    .pending_format_mark
+                    .store(false, std::sync::atomic::Ordering::Release);
                 tracing::info!(vault = %vault_id, "vault marked format=2 (unified addressing)");
             }
             Ok(r) => {
@@ -822,9 +831,9 @@ fn remember_discovered(
 
 fn restore_discovered_access(state: &AppState, discovered: &[DiscoveredVault]) -> Vec<String> {
     let mut restored = Vec::new();
-    let mut revoked = state.revoked_vaults.lock().unwrap();
     for dv in discovered {
-        if revoked.remove(&dv.id) {
+        if state.tombstone_reason(&dv.id).is_some() {
+            state.restore_vault(&dv.id);
             tracing::info!(vault = %dv.id, "vault discovery: access restored; watcher may restart after unlock");
             restored.push(dv.id.clone());
         }
@@ -899,45 +908,41 @@ pub(crate) fn ensure_watcher(
     health_rx: tokio::sync::watch::Receiver<StreamHealth>,
     cell: Option<Arc<WakeCell>>,
 ) -> std::sync::Weak<WakeCell> {
-    let revoked = state.revoked_vaults.lock().unwrap();
-    if revoked.contains(&vault) {
+    let Ok(runtime) = state.runtime(&vault) else {
+        return std::sync::Weak::new();
+    };
+    let mut watcher = runtime.watcher.lock().unwrap();
+    if runtime.is_closed() {
         return std::sync::Weak::new();
     }
-    let mut watchers = state.watchers.lock().unwrap();
-    drop(revoked);
-    if watchers.get(&vault).is_some_and(|h| !h.is_finished()) {
-        return state
-            .watcher_cells
+    if watcher.as_ref().is_some_and(|handle| !handle.is_finished()) {
+        return runtime
+            .watcher_cell
             .lock()
             .unwrap()
-            .get(&vault)
+            .as_ref()
             .map(Arc::downgrade)
             .unwrap_or_default();
     }
-    watchers.remove(&vault);
+    watcher.take();
     let cell = cell.unwrap_or_else(|| Arc::new(WakeCell::new()));
     let weak = Arc::downgrade(&cell);
-    state
-        .watcher_cells
-        .lock()
-        .unwrap()
-        .insert(vault.clone(), cell.clone());
+    *runtime.watcher_cell.lock().unwrap() = Some(cell.clone());
     let task_state = state.clone();
     let task_vault = vault.clone();
-    let cleanup_state = state.clone();
-    let cleanup_vault = vault.clone();
+    let cleanup_runtime = runtime.clone();
     let cleanup_cell = cell.clone();
     let handle = tokio::spawn(async move {
         watch_loop(task_state, task_vault, cloud, dk, cell, health_rx).await;
-        let mut cells = cleanup_state.watcher_cells.lock().unwrap();
-        if cells
-            .get(&cleanup_vault)
+        let mut cell = cleanup_runtime.watcher_cell.lock().unwrap();
+        if cell
+            .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, &cleanup_cell))
         {
-            cells.remove(&cleanup_vault);
+            cell.take();
         }
     });
-    watchers.insert(vault, handle);
+    *watcher = Some(handle);
     weak
 }
 
@@ -1390,9 +1395,6 @@ fn attached_membership_excludes_us(
         && pv.verified_membership(vault, &us) == Some(false)
 }
 
-const REVOKED_REASON: &str =
-    "this device can no longer use this vault: your account was removed from it";
-
 /// Complete, idempotent teardown for a vault this process must stop serving.
 /// `verified_delete` is reserved for an already-verified tombstone or device
 /// ledger revocation; ordinary access refusals may delete only through their
@@ -1401,92 +1403,15 @@ async fn teardown_vault_access(
     state: &Arc<AppState>,
     vault: &str,
     membership: Option<serde_json::Value>,
+    reason: crate::vault_runtime::TombstoneReason,
     verified_delete: bool,
 ) {
-    // Latch first: unlock and every queued writer fail from this point onward.
-    state
-        .revoked_vaults
-        .lock()
-        .unwrap()
-        .insert(vault.to_string());
-    state.lock_vault(vault);
-
-    state.cloud_contact.lock().unwrap().remove(vault);
-    state.vault_shared.lock().unwrap().remove(vault);
-    state.vault_upgrade_required.lock().unwrap().remove(vault);
-    state.vault_key_changed.lock().unwrap().remove(vault);
-    state.sync_conflicts.lock().unwrap().remove(vault);
-    state.catch_up_failures.lock().unwrap().remove(vault);
-    state.pending_format_mark.lock().unwrap().remove(vault);
-    state.pending_config_ids.lock().unwrap().remove(vault);
-    state.pending_rotations.lock().unwrap().remove(vault);
-    state
-        .oauth_pending
-        .lock()
-        .unwrap()
-        .retain(|_, p| p.vault_id != vault);
-    state
-        .oauth_reauth_needed
-        .lock()
-        .unwrap()
-        .retain(|(v, _)| v != vault);
-    state
-        .live_ceremony_ops
-        .lock()
-        .unwrap()
-        .retain(|(v, _), _| v != vault);
-    if let Some(semaphore) = state.sse_semaphores.lock().unwrap().remove(vault) {
-        semaphore.close();
-    }
-    state.access_probes.lock().unwrap().remove(vault);
-    state.audits.forget(vault);
-
-    let rejected = state
-        .approvals
-        .lock()
-        .unwrap()
-        .reject_vault(vault, REVOKED_REASON);
-    for approval_id in rejected {
-        let _ = state.events.send(crate::state::ApprovalEvent {
-            vault_id: vault.to_string(),
-            approval_id,
-            kind: "rejected".into(),
-            op_summary: None,
-            response_preview: None,
-            reason: Some(REVOKED_REASON.into()),
-        });
-    }
-
-    if let Some(cell) = state.watcher_cells.lock().unwrap().remove(vault) {
-        cell.set_mode(Mode::Fallback);
-    }
-    let watcher = { state.watchers.lock().unwrap().remove(vault) };
-    if let Some(handle) = watcher {
-        handle.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
-    }
-
-    // Wait out a writer that acquired the mutex before the latch. Later writers
-    // pass through `vault_write_guard` and refuse after acquisition.
-    let lock = {
-        let mut locks = state.vault_write_locks.lock().unwrap();
-        Arc::clone(
-            locks
-                .entry(vault.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
-    };
-    let _guard = lock.lock().await;
+    // Latch first: unlock and every queued writer fail while a supplied
+    // membership proof is checked against the local trust anchor.
+    state.mark_vault_closing(vault, reason);
     let delete =
         verified_delete || attached_membership_excludes_us(state, vault, membership.as_ref());
-    if delete {
-        if let Err(e) = remove_vault_dir(&state.config.state_dir, vault) {
-            tracing::warn!(vault = %vault, "vault access revoked: local copy removal failed: {}", e);
-        }
-    }
-    if let Err(e) = active::forget_vault(vault) {
-        tracing::warn!(vault = %vault, "vault access revoked: failed to forget catalog entry: {}", e);
-    }
+    state.close_vault(vault, reason, delete).await;
     if delete {
         tracing::warn!(vault = %vault, "vault access revoked: locked and forgot vault; local copy deleted (verified authorization)");
     } else {
@@ -1499,11 +1424,25 @@ pub(crate) async fn revoke_vault_access(
     vault: &str,
     membership: Option<serde_json::Value>,
 ) {
-    teardown_vault_access(state, vault, membership, false).await;
+    teardown_vault_access(
+        state,
+        vault,
+        membership,
+        crate::vault_runtime::TombstoneReason::Removed,
+        false,
+    )
+    .await;
 }
 
 pub(crate) async fn revoke_vault_access_verified(state: &Arc<AppState>, vault: &str) {
-    teardown_vault_access(state, vault, None, true).await;
+    teardown_vault_access(
+        state,
+        vault,
+        None,
+        crate::vault_runtime::TombstoneReason::DeviceRevoked,
+        true,
+    )
+    .await;
 }
 
 pub(crate) fn schedule_revoke_vault_access(
@@ -1511,12 +1450,7 @@ pub(crate) fn schedule_revoke_vault_access(
     vault: &str,
     membership: Option<serde_json::Value>,
 ) {
-    state
-        .revoked_vaults
-        .lock()
-        .unwrap()
-        .insert(vault.to_string());
-    state.lock_vault(vault);
+    state.mark_vault_closing(vault, crate::vault_runtime::TombstoneReason::Removed);
     let state = state.clone();
     let vault = vault.to_string();
     tokio::spawn(async move {
@@ -1524,23 +1458,29 @@ pub(crate) fn schedule_revoke_vault_access(
     });
 }
 
-fn schedule_revoke_vault_access_verified(state: &Arc<AppState>, vault: &str) {
-    state
-        .revoked_vaults
-        .lock()
-        .unwrap()
-        .insert(vault.to_string());
-    state.lock_vault(vault);
+fn schedule_revoke_vault_access_verified(
+    state: &Arc<AppState>,
+    vault: &str,
+    reason: crate::vault_runtime::TombstoneReason,
+) {
+    state.mark_vault_closing(vault, reason);
     let state = state.clone();
     let vault = vault.to_string();
     tokio::spawn(async move {
-        revoke_vault_access_verified(&state, &vault).await;
+        teardown_vault_access(&state, &vault, None, reason, true).await;
     });
 }
 
 /// Compatibility name for verified tombstone callers.
 pub(crate) async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) {
-    revoke_vault_access_verified(state, vault).await;
+    teardown_vault_access(
+        state,
+        vault,
+        None,
+        crate::vault_runtime::TombstoneReason::Deleted,
+        true,
+    )
+    .await;
 }
 
 /// §15 leg-B: if THIS account's UIK is VERIFIED-not-a-member of a shared vault (an
@@ -1562,7 +1502,11 @@ async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool
             vault = %vault, us = %us,
             "membership: this account is VERIFIED not a member of this vault (owner offboarded) — locking + wiping local state"
         );
-        schedule_revoke_vault_access_verified(state, vault);
+        schedule_revoke_vault_access_verified(
+            state,
+            vault,
+            crate::vault_runtime::TombstoneReason::Removed,
+        );
         return true;
     }
     false
@@ -2027,7 +1971,7 @@ async fn ship_vault_audit(
 ) {
     // `for_vault` only opens DBs for vaults that exist on disk; a known-but-not-
     // yet-served vault just yields NotFound and is skipped this tick.
-    let store = match state.audits.for_vault(vault) {
+    let store = match state.audit_for_vault(vault) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -2728,7 +2672,7 @@ enum BlobWake {
 /// that path (`pull` / `sc sync` parity) persists WITHOUT the per-vault write
 /// lock — fine pre-serve, a race at watch time (a concurrent approve.rs
 /// re-seal could interleave with the persist's tmp+rename). This handler
-/// persists UNDER `vault_write_locks`, and holds the lock ONLY across the
+/// persists under the runtime's `write_lock`, and holds the lock ONLY across the
 /// persist — never across network calls or `process_vault_connects` (which
 /// takes it itself; the invariant the whole sync module rests on).
 ///
@@ -2761,7 +2705,11 @@ async fn handle_blob_wake_body(
             // This runs inside the vault watcher. Hand teardown to a separate
             // task so aborting the retained watcher handle cannot cancel its
             // own disk removal.
-            schedule_revoke_vault_access_verified(state, vault);
+            schedule_revoke_vault_access_verified(
+                state,
+                vault,
+                crate::vault_runtime::TombstoneReason::Deleted,
+            );
             tracing::info!(vault = %vault, "cloud sync: vault deleted upstream (owner-verified); dropped local state");
             return BlobWake::Stopped;
         }
@@ -3258,7 +3206,7 @@ impl StoreLock<'_> {
     async fn acquire(
         self,
         vault: &str,
-    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, String> {
+    ) -> Result<Option<crate::vault_runtime::VaultWriteGuard>, String> {
         match self {
             StoreLock::Take(state) => state
                 .vault_write_guard(vault)
@@ -4241,6 +4189,8 @@ async fn resolve_rejection(
 /// Warn ONCE per (vault, item, version, status) about a terminal rejection: a
 /// row the server keeps refusing (a refused create on a frozen plan) is
 /// re-offered on every push and must not flood the log.
+/// This remains process-global because it is log de-duplication, not live vault
+/// state; retaining a key across runtime close/re-add suppresses the same row.
 fn warn_rejected_once(vault_id: &str, item: &str, version: u64, status: u16, error: &str) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -6413,11 +6363,10 @@ mod peritem_tests {
     async fn discovery_readd_clears_revocation_and_restarts_the_watcher() {
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(AppState::new(test_config(dir.path())));
-        state
-            .revoked_vaults
-            .lock()
-            .unwrap()
-            .insert("v-readd".into());
+        state.mark_vault_closing(
+            "v-readd",
+            crate::vault_runtime::TombstoneReason::Removed,
+        );
         let discovered = vec![DiscoveredVault {
             id: "v-readd".into(),
             label: Some("Re-added".into()),
@@ -6435,57 +6384,14 @@ mod peritem_tests {
             health_rx,
             None,
         );
-        assert!(state.watchers.lock().unwrap().contains_key("v-readd"));
-        assert!(state.watcher_cells.lock().unwrap().contains_key("v-readd"));
-        let handle = { state.watchers.lock().unwrap().remove("v-readd") };
+        let runtime = state.runtime("v-readd").unwrap();
+        assert!(runtime.watcher.lock().unwrap().is_some());
+        assert!(runtime.watcher_cell.lock().unwrap().is_some());
+        let handle = runtime.watcher.lock().unwrap().take();
         if let Some(handle) = handle {
             handle.abort();
             let _ = handle.await;
         }
-    }
-
-    fn assert_app_state_fields_classified(state: &AppState) {
-        let AppState {
-            config: _,
-            vaults: _,
-            cloud_contact: _,
-            vault_shared: _,
-            vault_upgrade_required: _,
-            vault_key_changed: _,
-            sync_conflicts: _,
-            catch_up_failures: _,
-            pending_rotations: _,
-            team: _,
-            pending_format_mark: _,
-            pending_config_ids: _,
-            challenges: _,
-            approvals: _,
-            batch_roots: _,
-            services: _,
-            events: _,
-            vault_states: _,
-            revoked_vaults: _,
-            last_host_unions: _,
-            host_unions_persisted: _,
-            audits: _,
-            sc: _,
-            vault_write_locks: _,
-            watchers: _,
-            watcher_cells: _,
-            access_probes: _,
-            sse_semaphores: _,
-            ledger: _,
-            ledger_sync: _,
-            external_fill_lock: _,
-            oauth_reauth_needed: _,
-            oauth_redeemed_codes: _,
-            live_ceremony_ops: _,
-            boot_id: _,
-            egress_proxy: _,
-            oauth_pending: _,
-            oauth_listener_running: _,
-            op_payloads: _,
-        } = state;
     }
 
     fn test_config(state_dir: &Path) -> crate::config::Config {
@@ -6522,7 +6428,7 @@ mod peritem_tests {
     }
 
     #[tokio::test]
-    async fn revoke_teardown_clears_every_vault_object_and_deletes_only_with_proof() {
+    async fn closing_a_runtime_is_the_complete_teardown_and_deletes_only_with_proof() {
         use crate::approval::ApprovalStatus;
         use crate::crypto::vault_key::UikRoot;
         use base64::engine::general_purpose::STANDARD;
@@ -6533,7 +6439,6 @@ mod peritem_tests {
         std::env::set_var("HOME", home.path());
         let state_dir = home.path().join("state");
         let state = Arc::new(AppState::new(test_config(&state_dir)));
-        assert_app_state_fields_classified(&state);
         state.open_ledger_for_tests(&[]);
 
         let vault = "vault-lock-only";
@@ -6548,57 +6453,29 @@ mod peritem_tests {
             crate::state::SecretsCache::default(),
             zeroize::Zeroizing::new(vec![7; 32]),
         );
-        state
-            .cloud_contact
-            .lock()
-            .unwrap()
-            .insert(vault.into(), std::time::Instant::now());
-        state
-            .vault_shared
-            .lock()
-            .unwrap()
-            .insert(vault.into(), true);
-        state
-            .vault_upgrade_required
-            .lock()
-            .unwrap()
-            .insert(vault.into());
+        state.record_cloud_contact(vault);
+        state.set_vault_shared(vault, true);
+        state.set_vault_upgrade_required(vault, true);
         state.mark_vault_key_changed(vault);
         state.note_sync(vault, "item", crate::state::SyncNote::Refused("x".into()));
         state.note_catch_up(vault, "x");
         state.note_rotation_pending(vault, "conn", "role", "token", "x");
-        state
+        let runtime = state.runtime(vault).unwrap();
+        runtime
             .pending_format_mark
-            .lock()
-            .unwrap()
-            .insert(vault.into());
-        state
-            .pending_config_ids
-            .lock()
-            .unwrap()
-            .insert(vault.into(), vec!["id".into()]);
+            .store(true, std::sync::atomic::Ordering::Release);
+        runtime.pending_config_ids.lock().unwrap().push("id".into());
         state.note_loopback_pending("oauth-state", vault, "conn", 8765);
-        state
-            .oauth_reauth_needed
-            .lock()
-            .unwrap()
-            .insert((vault.into(), "conn".into()));
-        state
+        state.oauth_mark_reauth(vault, "conn");
+        runtime
             .live_ceremony_ops
             .lock()
             .unwrap()
-            .insert((vault.into(), "unlock".into()), "op".into());
-        state
-            .sse_semaphores
-            .lock()
-            .unwrap()
-            .insert(vault.into(), Arc::new(tokio::sync::Semaphore::new(1)));
-        state.access_probes.lock().unwrap().insert(vault.into());
-        state
-            .last_host_unions
-            .lock()
-            .unwrap()
-            .insert(vault.into(), vec!["api.example".into()]);
+            .insert("unlock".into(), "op".into());
+        runtime
+            .access_probe
+            .store(true, std::sync::atomic::Ordering::Release);
+        *runtime.last_host_union.lock().unwrap() = vec!["api.example".into()];
         let approval =
             state
                 .approvals
@@ -6606,21 +6483,22 @@ mod peritem_tests {
                 .unwrap()
                 .create(vault.into(), fake_operation(vault), "r".into());
         let cell = Arc::new(WakeCell::new());
-        state
-            .watcher_cells
-            .lock()
-            .unwrap()
-            .insert(vault.into(), cell);
-        state
-            .watchers
-            .lock()
-            .unwrap()
-            .insert(vault.into(), tokio::spawn(std::future::pending::<()>()));
-        let _ = state.audits.for_vault(vault).unwrap();
+        *runtime.watcher_cell.lock().unwrap() = Some(cell);
+        *runtime.watcher.lock().unwrap() = Some(tokio::spawn(std::future::pending::<()>()));
+        let _ = state.audit_for_vault(vault).unwrap();
         drop(state.vault_write_guard(vault).await.unwrap());
 
         revoke_vault_access(&state, vault, None).await;
         assert!(state.is_vault_revoked(vault));
+        assert!(state.runtime(vault).is_err());
+        assert!(!state.vault_runtimes.lock().unwrap().contains_key(vault));
+        assert!(runtime.is_closed());
+        assert!(runtime.write_guard().await.is_err());
+        assert!(matches!(*runtime.state.lock().unwrap(), crate::state::VaultState::Locked));
+        assert!(runtime.watcher.lock().unwrap().is_none());
+        assert!(runtime.watcher_cell.lock().unwrap().is_none());
+        assert!(runtime.sse_semaphore.is_closed());
+        assert!(runtime.audit.lock().unwrap().is_none());
         assert!(state.is_vault_locked(vault));
         state.unlock_vault(
             vault.into(),
@@ -6629,38 +6507,16 @@ mod peritem_tests {
         );
         assert!(state.is_vault_locked(vault));
         assert!(state.vault_write_guard(vault).await.is_err());
-        assert!(!state.cloud_contact.lock().unwrap().contains_key(vault));
-        assert!(!state.vault_shared.lock().unwrap().contains_key(vault));
-        assert!(!state.vault_upgrade_required.lock().unwrap().contains(vault));
-        assert!(!state.is_vault_key_changed(vault));
-        assert!(!state.sync_conflicts.lock().unwrap().contains_key(vault));
-        assert!(!state.catch_up_failures.lock().unwrap().contains_key(vault));
-        assert!(!state.pending_rotations.lock().unwrap().contains_key(vault));
-        assert!(!state.pending_format_mark.lock().unwrap().contains(vault));
-        assert!(!state.pending_config_ids.lock().unwrap().contains_key(vault));
         assert!(!state
             .oauth_pending
             .lock()
             .unwrap()
             .values()
             .any(|p| p.vault_id == vault));
-        assert!(!state
-            .oauth_reauth_needed
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(v, _)| v == vault));
-        assert!(!state
-            .live_ceremony_ops
-            .lock()
-            .unwrap()
-            .keys()
-            .any(|(v, _)| v == vault));
-        assert!(!state.sse_semaphores.lock().unwrap().contains_key(vault));
-        assert!(!state.access_probes.lock().unwrap().contains(vault));
-        assert!(!state.watchers.lock().unwrap().contains_key(vault));
-        assert!(!state.watcher_cells.lock().unwrap().contains_key(vault));
-        assert!(state.last_host_unions.lock().unwrap().contains_key(vault));
+        assert_eq!(
+            state.vault_tombstones.lock().unwrap()[vault].hosts,
+            ["api.example"]
+        );
         let rec = state
             .approvals
             .lock()

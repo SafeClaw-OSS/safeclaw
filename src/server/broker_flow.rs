@@ -93,7 +93,7 @@ pub fn register_pending_use(
         (c.id, c.expires_at_unix, c.supersedes)
     };
 
-    if let Ok(audit_store) = state.audits.for_vault(vault_id) {
+    if let Ok(audit_store) = state.audit_for_vault(vault_id) {
         let mut row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
         row.agent_prefix = agent_prefix.clone();
         if let Err(e) = audit_store.insert(&row) {
@@ -180,7 +180,7 @@ pub async fn resolve_auth_value(
     let _guard = state
         .vault_write_guard(vault_id)
         .await
-        .map_err(|_| AppError::VaultAccessRevoked)?;
+        .map_err(|error| error.app_error())?;
     if let Some(cached) = state.oauth_access_lookup(vault_id, &refresh_hash) {
         return Ok(cached);
     }

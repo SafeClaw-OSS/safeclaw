@@ -368,12 +368,9 @@ impl BrokerHandler {
                     let (code, msg) = e.code();
                     return err_response(code, &msg).into();
                 }
-                Err(AgentRefusal::Revoked) => {
-                    return err_response(
-                        ScCode::VaultAccessRevoked,
-                        crate::error::VAULT_ACCESS_REVOKED_MSG,
-                    )
-                    .into();
+                Err(AgentRefusal::Gone(error)) => {
+                    let (code, message) = error.code();
+                    return err_response(code, &message).into();
                 }
                 Err(AgentRefusal::NoIdentity) => {
                     return err_response(
@@ -420,12 +417,9 @@ impl BrokerHandler {
                 .into()
             }
         };
-        if self.state.is_vault_revoked(&vault_id) {
-            return err_response(
-                ScCode::VaultAccessRevoked,
-                crate::error::VAULT_ACCESS_REVOKED_MSG,
-            )
-            .into();
+        if let Some(error) = self.state.vault_gone_error(&vault_id) {
+            let (code, message) = error.code();
+            return err_response(code, &message).into();
         }
         // Daemon too old for this vault's format (cloud returned SC_UPGRADE_REQUIRED
         // for its sync, design 甲) → fail LOUDLY so the agent runs `sc upgrade`,
@@ -1710,7 +1704,7 @@ fn write_forward_audit(
     target: Option<&str>,
     code: Option<ScCode>,
 ) {
-    let Ok(store) = state.audits.for_vault(&p.vault_id) else {
+    let Ok(store) = state.audit_for_vault(&p.vault_id) else {
         return;
     };
     let now = now_secs() as i64;

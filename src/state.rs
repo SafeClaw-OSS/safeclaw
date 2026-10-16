@@ -9,7 +9,6 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::approval::ApprovalStore;
-use crate::audit::AuditRegistry;
 use crate::config::Config;
 use crate::passkey::challenge::ChallengeStore;
 use crate::service::ServiceRegistry;
@@ -358,66 +357,20 @@ fn rotation_note_key(conn_id: &str) -> String {
     format!("rotation {}", conn_id)
 }
 
-/// Process-wide daemon state.
-///
-/// Any new per-vault field must be classified by the revocation teardown and
-/// the exhaustive `revoke_teardown_clears_every_vault_object_and_deletes_only_with_proof` test.
+/// Process-wide daemon state. All state with a vault lifetime is reached
+/// through `vault_runtimes`; tombstones retain only the refusal reason and host
+/// anchors needed to intercept requests after the runtime is gone.
 pub struct AppState {
     pub config: Config,
     pub vaults: VaultDir,
-    /// Last successful cloud contact per vault (unlock initialises, sync
-    /// successes refresh). Drives the shared-vault offline lease (team §7.5):
-    /// a daemon cut off from the cloud — network loss OR revoked/offboarded
-    /// credentials parking its sync — keeps serving a SHARED vault only for
-    /// the lease window.
-    pub cloud_contact: Mutex<HashMap<String, std::time::Instant>>,
-    /// Server-authoritative vault sharedness (team §4: explicit `kind`, default
-    /// private), delivered on the `/blob` sync envelope OUTSIDE the sealed body —
-    /// `kind` is a server operational fact, never E2E. `true` = shared, `false` =
-    /// private; an ABSENT entry (never synced, or an old server that omits the
-    /// field) reads as private via `vault_is_shared` — the fail-safe default so a
-    /// personal vault (and any pre-sync state) is never leased. Supersedes the old
-    /// "derive shared from the E2E members map" heuristic (review H1). In-memory
-    /// only, repopulated on each pull — same restart-softness as `cloud_contact`,
-    /// which the offline lease already accepts (it is a soft backstop).
-    pub vault_shared: Mutex<HashMap<String, bool>>,
-    /// Vaults whose cloud sync returned `SC_UPGRADE_REQUIRED` — this daemon is too
-    /// old for their (newer) item format (design 甲). While set, the broker refuses
-    /// with [`crate::error::ScCode::UpgradeRequired`] so the AGENT gets an actionable
-    /// "run `sc upgrade`" instead of a silent parked-sync failure. In-memory only,
-    /// (re)set by the sync path; cleared when a sync succeeds again.
-    pub vault_upgrade_required: Mutex<std::collections::HashSet<String>>,
-    /// Vaults whose current cloud rows cannot be opened by the retained session
-    /// key. The old cache remains usable, but a fresh unlock must obtain the
-    /// replacement key before newly added rows can be seen.
-    pub vault_key_changed: Mutex<std::collections::HashSet<String>>,
-    /// Local changes the sync did not apply, vault → item id → why
-    /// ([`SyncNote`]). Shown by `sc sync` and `sc status`; cleared when a
-    /// later write or push of that row lands. In-memory only.
-    pub sync_conflicts: Mutex<HashMap<String, std::collections::BTreeMap<String, SyncNote>>>,
-    /// Vaults whose pull at unlock failed and is being retried in the
-    /// background: vault → the last error. Shown by `sc status`.
-    pub catch_up_failures: Mutex<HashMap<String, String>>,
-    /// Rotated OAuth refresh tokens not stored in the vault yet: vault →
-    /// `(connection id, role)` → the new token. The session already uses
-    /// each; the next sync stores it again. In-memory only.
-    pub pending_rotations: Mutex<
-        HashMap<String, std::collections::BTreeMap<(String, String), zeroize::Zeroizing<String>>>,
-    >,
+    pub vault_runtimes: Mutex<HashMap<String, Arc<crate::vault_runtime::VaultRuntime>>>,
+    pub vault_tombstones: Mutex<HashMap<String, crate::vault_runtime::Tombstone>>,
     /// Team-edition extension hooks (team-edition §9 open/closed split). The
     /// open build leaves the [`crate::team_hooks::NoopHooks`] default (no team
     /// policy); the closed `safeclaw-ee` overlay injects real ones via
     /// [`AppState::with_team_hooks`]. Serve-time team policy (the offline lease,
     /// etc.) lives behind these, never inline in open core.
     pub team: std::sync::Arc<dyn crate::team_hooks::TeamHooks>,
-    /// Vaults whose addressing migration completed locally but whose cloud
-    /// `format=2` mark hasn't landed yet — the sync loop drains this after a
-    /// successful item push (团队 §8.3: mark only after the rows are up).
-    pub pending_format_mark: Mutex<std::collections::HashSet<String>>,
-    /// Owner lock-list registrations awaiting delivery: vault → blinded ids of
-    /// the config singletons (computed at unlock while K was in hand; the sync
-    /// loop POSTs them once for SHARED vaults). §5.15 two-tier write model.
-    pub pending_config_ids: Mutex<HashMap<String, Vec<String>>>,
     pub challenges: Mutex<ChallengeStore>,
     pub approvals: Mutex<ApprovalStore>,
     /// Batch-approve root memo (design/batch-approve.md §Daemon verify 5):
@@ -432,53 +385,14 @@ pub struct AppState {
     pub batch_roots: Mutex<HashMap<String, ([u8; 32], u64)>>,
     pub services: ServiceRegistry,
     pub events: broadcast::Sender<ApprovalEvent>,
-    /// Per-vault Locked/Unlocked state. Absent entry = Locked. Lives entirely
-    /// in process memory; daemon restart returns all vaults to Locked.
-    pub vault_states: Mutex<HashMap<String, VaultState>>,
-    /// Vaults explicitly refused by the backend as no longer accessible to
-    /// this account. In-memory only: discovery clears a mark on re-add.
-    pub revoked_vaults: Mutex<HashSet<String>>,
-    /// The hosts each vault anchored the last time it was seen Unlocked
-    /// (lowercased, refreshed on every union pass). Kept ACROSS Lock so the
-    /// proxy still recognizes — and MITMs — brokered-host traffic while the
-    /// vault is locked: a phantom then meets an explicit `vault_locked`
-    /// instead of leaking upstream through a blind tunnel. Connections live in
-    /// the sealed blob, so this memory is the only locked-time anchor
-    /// knowledge; persisted to a cleartext `host-anchors.json` (host names only,
-    /// non-sensitive) so it survives a daemon restart while a vault stays locked,
-    /// and pruned when the vault is deleted.
-    /// Lock order: always `vault_states` first, then this.
-    pub last_host_unions: Mutex<HashMap<String, Vec<String>>>,
-    /// The canonical JSON of `last_host_unions` last written to disk, so the hot
+    /// The canonical JSON of the runtimes' host unions last written to disk, so the hot
     /// CONNECT path rewrites the durable cache only when the anchor set actually
     /// changes. Host names only — non-sensitive.
     pub host_unions_persisted: Mutex<String>,
-    /// Per-vault audit log (PROTOCOL.md §5.3). Connections opened lazily on
-    /// first write/query per vault. Survives daemon restarts — unlike
-    /// `approvals` / `vault_states` which are in-memory only.
-    pub audits: AuditRegistry,
     /// Daemon HPKE outer-envelope keypair (PROTOCOL.md §4.2.1 M1). Loaded
     /// once at startup, used to open pending-passkey seals (cross-device
     /// add-passkey) and — in future — `[HPKE: MUST]` grant submissions.
     pub sc: crate::crypto::envelope::ScKeyPair,
-    /// Per-vault async mutex serializing vault.dat read-modify-write cycles.
-    /// Two concurrent approve calls on the same vault both read the pre-write
-    /// state and race to rename the tmpfile — the second write wins silently.
-    /// Holding this lock for the full approve lifetime prevents that race.
-    /// Uses tokio::sync::Mutex so it can be held across await points.
-    pub vault_write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// One live cloud watcher per vault. Entries are retained when a task exits
-    /// and replaced by `ensure_watcher` after observing `is_finished()`.
-    pub watchers: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
-    /// Wake cells owned alongside watcher handles so teardown can park a vault
-    /// before aborting its task.
-    pub watcher_cells: Mutex<HashMap<String, Arc<crate::sync_stream::WakeCell>>>,
-    /// Debounce set for account-stream `access` hint probes.
-    pub access_probes: Mutex<HashSet<String>>,
-    /// Per-vault SSE connection semaphore (cap = MAX_SSE_PER_VAULT).
-    /// OwnedSemaphorePermit is stored in each live stream; dropping the
-    /// stream drops the permit, automatically releasing the slot.
-    pub sse_semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// This device's standing in the account principal ledger and the account's
     /// admitted agents (DESIGN-principal-ledger-enforced W2/W3/W6). Fail closed:
     /// nothing serves until a decision is loaded ([`crate::principal_ledger::init_gate`]).
@@ -493,12 +407,6 @@ pub struct AppState {
     /// held across the store round-trip so concurrent misses wait for the
     /// in-flight fill and then hit the cache on their re-check.
     pub external_fill_lock: tokio::sync::Mutex<()>,
-    /// OAuth connections whose refresh_token was rejected (`invalid_grant`) at
-    /// /use — surfaced via `/registry` as `needs_reauth` so the console prompts a
-    /// reconnect. Keyed by `(vault_id, connection_id)`. In-memory + self-healing:
-    /// cleared on a successful refresh or a fresh connect; a still-dead token
-    /// re-marks on the next use.
-    pub oauth_reauth_needed: Mutex<std::collections::HashSet<(String, String)>>,
     /// Authorization codes this daemon has already REDEEMED (sha256-hex → when).
     /// An OAuth code is single-use: a stale write (a buggy web Save, a
     /// cross-device echo, or a pull that re-introduces the `connecting` entry
@@ -510,12 +418,6 @@ pub struct AppState {
     /// (a restart empties it, by which point the cloud has converged). Entries
     /// self-reap after `REDEEMED_CODE_TTL` (codes expire ~10min upstream).
     pub oauth_redeemed_codes: Mutex<HashMap<String, std::time::Instant>>,
-    /// Most-recent lifecycle-ceremony op this daemon has open, keyed by
-    /// `(vault_id, ceremony_name)` (e.g. `vault-unlock`). When a new ceremony op
-    /// is created it supersedes the prior one — the daemon withdraws the stale
-    /// op from the relay so the console stops showing "1 approval waiting" after
-    /// a `sc unlock` was abandoned + retried. See requester-cancel design.
-    pub live_ceremony_ops: Mutex<HashMap<(String, String), String>>,
     /// Random per daemon PROCESS (hex). Rides every op-relay register so the
     /// backend can cancel a previous process's pending rows: the op store is
     /// in-memory and poll tasks spawn only at mint, so a pre-restart row can
@@ -554,11 +456,25 @@ pub struct AppState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VaultWriteRevoked;
+pub struct VaultWriteRevoked(pub crate::vault_runtime::TombstoneReason);
 
 impl std::fmt::Display for VaultWriteRevoked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("vault access revoked")
+    }
+}
+
+impl VaultWriteRevoked {
+    pub fn app_error(self) -> crate::error::AppError {
+        match self.0 {
+            crate::vault_runtime::TombstoneReason::Removed => {
+                crate::error::AppError::VaultAccessRevoked
+            }
+            crate::vault_runtime::TombstoneReason::Deleted => crate::error::AppError::VaultDeleted,
+            crate::vault_runtime::TombstoneReason::DeviceRevoked => {
+                crate::error::AppError::LedgerDeviceRevoked
+            }
+        }
     }
 }
 
@@ -579,6 +495,8 @@ pub(crate) fn host_anchors_path(state_dir: &std::path::Path) -> std::path::PathB
 /// unchanged set has a stable string for the skip-rewrite compare and the file
 /// on disk is stable across boots.
 fn canonical_unions_json(map: &HashMap<String, Vec<String>>) -> String {
+    // This vault-keyed map is only the on-disk host-anchor transfer format.
+    // AppState::new immediately moves every entry into its VaultRuntime.
     let sorted: std::collections::BTreeMap<&str, Vec<&str>> = map
         .iter()
         .map(|(k, v)| {
@@ -625,44 +543,32 @@ impl AppState {
         // while a vault is still locked keep MITMing that vault's brokered hosts.
         let (loaded_unions, loaded_unions_json) = load_host_unions(&config.state_dir);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let audits = AuditRegistry::new(vaults.clone());
+        let runtimes = loaded_unions
+            .into_iter()
+            .map(|(vid, hosts)| {
+                let runtime = crate::vault_runtime::VaultRuntime::new(vid.clone(), hosts);
+                (vid, Arc::new(runtime))
+            })
+            .collect();
         let sc = crate::crypto::envelope::ScKeyPair::load_or_generate()
             .expect("sc_sk load/generate failed — check ~/.safeclaw/crypto perms");
         Self {
             config,
             vaults,
-            cloud_contact: Mutex::new(HashMap::new()),
-            vault_shared: Mutex::new(HashMap::new()),
-            vault_upgrade_required: Mutex::new(std::collections::HashSet::new()),
-            vault_key_changed: Mutex::new(std::collections::HashSet::new()),
-            sync_conflicts: Mutex::new(HashMap::new()),
-            catch_up_failures: Mutex::new(HashMap::new()),
-            pending_rotations: Mutex::new(HashMap::new()),
+            vault_runtimes: Mutex::new(runtimes),
+            vault_tombstones: Mutex::new(HashMap::new()),
             team: std::sync::Arc::new(crate::team_hooks::NoopHooks),
-            pending_format_mark: Mutex::new(std::collections::HashSet::new()),
-            pending_config_ids: Mutex::new(HashMap::new()),
             challenges: Mutex::new(ChallengeStore::new()),
             approvals: Mutex::new(ApprovalStore::new()),
             batch_roots: Mutex::new(HashMap::new()),
             services: ServiceRegistry::load(),
             events,
-            vault_states: Mutex::new(HashMap::new()),
-            revoked_vaults: Mutex::new(HashSet::new()),
-            last_host_unions: Mutex::new(loaded_unions),
             host_unions_persisted: Mutex::new(loaded_unions_json),
-            audits,
             sc,
-            vault_write_locks: Mutex::new(HashMap::new()),
-            watchers: Mutex::new(HashMap::new()),
-            watcher_cells: Mutex::new(HashMap::new()),
-            access_probes: Mutex::new(HashSet::new()),
-            sse_semaphores: Mutex::new(HashMap::new()),
             ledger: Mutex::new(crate::principal_ledger::LedgerGate::default()),
             ledger_sync: tokio::sync::Mutex::new(None),
             external_fill_lock: tokio::sync::Mutex::new(()),
-            oauth_reauth_needed: Mutex::new(std::collections::HashSet::new()),
             oauth_redeemed_codes: Mutex::new(HashMap::new()),
-            live_ceremony_ops: Mutex::new(HashMap::new()),
             boot_id: {
                 use rand::RngCore as _;
                 let mut b = [0u8; 16];
@@ -674,6 +580,207 @@ impl AppState {
             oauth_listener_running: Mutex::new(std::collections::HashSet::new()),
             op_payloads: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The only entrance to vault-scoped runtime state. The map and tombstone
+    /// locks are always acquired in this order; neither is held for I/O.
+    pub fn runtime(
+        &self,
+        vault_id: &str,
+    ) -> Result<Arc<crate::vault_runtime::VaultRuntime>, crate::vault_runtime::VaultGone> {
+        let mut runtimes = self.vault_runtimes.lock().unwrap();
+        if let Some(runtime) = runtimes.get(vault_id) {
+            if !runtime.is_closed() {
+                return Ok(runtime.clone());
+            }
+        }
+        if let Some(tombstone) = self.vault_tombstones.lock().unwrap().get(vault_id) {
+            return Err(crate::vault_runtime::VaultGone {
+                reason: tombstone.reason,
+            });
+        }
+        let runtime = Arc::new(crate::vault_runtime::VaultRuntime::new(
+            vault_id.to_string(),
+            Vec::new(),
+        ));
+        runtimes.insert(vault_id.to_string(), runtime.clone());
+        Ok(runtime)
+    }
+
+    pub fn mark_vault_closing(
+        &self,
+        vault_id: &str,
+        reason: crate::vault_runtime::TombstoneReason,
+    ) {
+        let runtimes = self.vault_runtimes.lock().unwrap();
+        let runtime = runtimes.get(vault_id);
+        let hosts = runtime
+            .map(|runtime| {
+                runtime.mark_closed();
+                runtime.last_host_union.lock().unwrap().clone()
+            });
+        let mut tombstones = self.vault_tombstones.lock().unwrap();
+        let existing = tombstones.get(vault_id).cloned();
+        let reason = existing
+            .as_ref()
+            .map(|tombstone| tombstone.reason.merge(reason))
+            .unwrap_or(reason);
+        let hosts = hosts
+            .or_else(|| existing.map(|tombstone| tombstone.hosts))
+            .unwrap_or_default();
+        tombstones.insert(
+            vault_id.to_string(),
+            crate::vault_runtime::Tombstone { reason, hosts },
+        );
+    }
+
+    pub fn runtime_if_present(
+        &self,
+        vault_id: &str,
+    ) -> Option<Arc<crate::vault_runtime::VaultRuntime>> {
+        self.vault_runtimes
+            .lock()
+            .unwrap()
+            .get(vault_id)
+            .filter(|runtime| !runtime.is_closed())
+            .cloned()
+    }
+
+    pub fn runtime_ids(&self) -> Vec<String> {
+        self.vault_runtimes.lock().unwrap().keys().cloned().collect()
+    }
+
+    pub fn tombstone_reason(
+        &self,
+        vault_id: &str,
+    ) -> Option<crate::vault_runtime::TombstoneReason> {
+        self.vault_tombstones
+            .lock()
+            .unwrap()
+            .get(vault_id)
+            .map(|t| t.reason)
+    }
+
+    pub fn vault_gone_error(&self, vault_id: &str) -> Option<crate::error::AppError> {
+        match self.tombstone_reason(vault_id)? {
+            crate::vault_runtime::TombstoneReason::Removed => {
+                Some(crate::error::AppError::VaultAccessRevoked)
+            }
+            crate::vault_runtime::TombstoneReason::Deleted => {
+                Some(crate::error::AppError::VaultDeleted)
+            }
+            crate::vault_runtime::TombstoneReason::DeviceRevoked => {
+                Some(crate::error::AppError::LedgerDeviceRevoked)
+            }
+        }
+    }
+
+    pub fn restore_vault(&self, vault_id: &str) -> Arc<crate::vault_runtime::VaultRuntime> {
+        let mut runtimes = self.vault_runtimes.lock().unwrap();
+        let hosts = self
+            .vault_tombstones
+            .lock()
+            .unwrap()
+            .remove(vault_id)
+            .map(|t| t.hosts)
+            .unwrap_or_default();
+        let runtime = Arc::new(crate::vault_runtime::VaultRuntime::new(
+            vault_id.to_string(),
+            hosts,
+        ));
+        runtimes.insert(vault_id.to_string(), runtime.clone());
+        runtime
+    }
+
+    pub async fn close_vault(
+        &self,
+        vault_id: &str,
+        reason: crate::vault_runtime::TombstoneReason,
+        delete_disk: bool,
+    ) {
+        let runtime = {
+            let mut runtimes = self.vault_runtimes.lock().unwrap();
+            let runtime = runtimes.remove(vault_id);
+            let existing = self.vault_tombstones.lock().unwrap().get(vault_id).cloned();
+            let reason = existing
+                .as_ref()
+                .map(|tombstone| tombstone.reason.merge(reason))
+                .unwrap_or(reason);
+            let hosts = runtime
+                .as_ref()
+                .map(|r| r.last_host_union.lock().unwrap().clone())
+                .or_else(|| {
+                    existing.as_ref().map(|tombstone| tombstone.hosts.clone())
+                })
+                .unwrap_or_default();
+            if let Some(runtime) = runtime.as_ref() {
+                runtime.mark_closed();
+            }
+            self.vault_tombstones.lock().unwrap().insert(
+                vault_id.to_string(),
+                crate::vault_runtime::Tombstone { reason, hosts },
+            );
+            (runtime, reason)
+        };
+        let (runtime, reason) = runtime;
+        if let Some(runtime) = runtime {
+            runtime.close(self, reason).await;
+        } else {
+            self.oauth_pending
+                .lock()
+                .unwrap()
+                .retain(|_, pending| pending.vault_id != vault_id);
+            let rejection = reason.rejection_reason();
+            let rejected = self
+                .approvals
+                .lock()
+                .unwrap()
+                .reject_vault(vault_id, rejection);
+            for approval_id in rejected {
+                let _ = self.events.send(ApprovalEvent {
+                    vault_id: vault_id.to_string(),
+                    approval_id,
+                    kind: "rejected".into(),
+                    op_summary: None,
+                    response_preview: None,
+                    reason: Some(rejection.into()),
+                });
+            }
+        }
+        if delete_disk {
+            if let Err(error) = crate::sync::remove_vault_dir(&self.config.state_dir, vault_id) {
+                tracing::warn!(vault = %vault_id, "vault close: local copy removal failed: {}", error);
+            }
+        }
+        if let Err(error) = crate::cli::active::forget_vault(vault_id) {
+            tracing::warn!(vault = %vault_id, "vault close: failed to forget catalog entry: {}", error);
+        }
+    }
+
+    pub fn audit_for_vault(
+        &self,
+        vault_id: &str,
+    ) -> crate::error::Result<Arc<crate::audit::AuditStore>> {
+        let runtime = self
+            .runtime(vault_id)
+            .map_err(crate::vault_runtime::VaultGone::app_error)?;
+        let mut slot = runtime.audit.lock().unwrap();
+        if let Some(store) = slot.as_ref() {
+            return Ok(store.clone());
+        }
+        if runtime.is_closed() {
+            return Err(self
+                .vault_gone_error(vault_id)
+                .unwrap_or(crate::error::AppError::VaultAccessRevoked));
+        }
+        let vault_dir = self.vaults.dir_for(vault_id)?;
+        if !vault_dir.exists() {
+            return Err(crate::error::AppError::NotFound);
+        }
+        let store = Arc::new(crate::audit::AuditStore::open(
+            &self.vaults.audit_path(vault_id)?,
+        )?);
+        Ok(slot.get_or_insert_with(|| store.clone()).clone())
     }
 
     /// Stash-lifetime ceiling. Each entry carries its own TTL — the vault's
@@ -766,11 +873,13 @@ impl AppState {
         let open = gate.device == crate::principal_ledger::DeviceGate::Open;
         *self.ledger.lock().unwrap() = gate;
         if !open {
-            let mut states = self.vault_states.lock().unwrap();
-            for st in states.values_mut() {
-                *st = VaultState::Locked;
+            let runtimes: Vec<_> = self.vault_runtimes.lock().unwrap().values().cloned().collect();
+            for runtime in runtimes {
+                *runtime.state.lock().unwrap() = VaultState::Locked;
+                runtime
+                    .key_changed
+                    .store(false, std::sync::atomic::Ordering::Release);
             }
-            self.vault_key_changed.lock().unwrap().clear();
         }
     }
 
@@ -917,31 +1026,43 @@ impl AppState {
     /// True iff this vault is currently Locked (including "never unlocked
     /// since process boot").
     pub fn is_vault_locked(&self, vault_id: &str) -> bool {
-        let states = self.vault_states.lock().unwrap();
-        !matches!(states.get(vault_id), Some(VaultState::Unlocked { .. }))
+        let Ok(runtime) = self.runtime(vault_id) else {
+            return true;
+        };
+        let state = runtime.state.lock().unwrap();
+        !matches!(*state, VaultState::Unlocked { .. })
     }
 
     pub fn mark_vault_key_changed(&self, vault_id: &str) {
-        self.vault_key_changed
-            .lock()
-            .unwrap()
-            .insert(vault_id.to_string());
+        if let Ok(runtime) = self.runtime(vault_id) {
+            runtime
+                .key_changed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub fn clear_vault_key_changed(&self, vault_id: &str) {
-        self.vault_key_changed.lock().unwrap().remove(vault_id);
+        if let Some(runtime) = self.runtime_if_present(vault_id) {
+            runtime
+                .key_changed
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub fn is_vault_key_changed(&self, vault_id: &str) -> bool {
-        self.vault_key_changed.lock().unwrap().contains(vault_id)
+        self.runtime_if_present(vault_id).is_some_and(|runtime| {
+            runtime
+                .key_changed
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// True when at least one vault is currently unlocked.
     pub fn has_unlocked_vault(&self) -> bool {
-        let states = self.vault_states.lock().unwrap();
-        states
-            .values()
-            .any(|state| matches!(state, VaultState::Unlocked { .. }))
+        let runtimes: Vec<_> = self.vault_runtimes.lock().unwrap().values().cloned().collect();
+        runtimes
+            .iter()
+            .any(|runtime| matches!(*runtime.state.lock().unwrap(), VaultState::Unlocked { .. }))
     }
 
     /// Transition a vault to Unlocked with the given bootstrap cache and the
@@ -953,14 +1074,10 @@ impl AppState {
         cache: SecretsCache,
         state_key: zeroize::Zeroizing<Vec<u8>>,
     ) {
-        // Hold the latch through the state insertion. Teardown takes this same
-        // mutex before locking the vault, so an unlock either linearizes before
-        // revocation (and is immediately locked) or refuses after it.
-        let revoked = self.revoked_vaults.lock().unwrap();
-        if revoked.contains(&vault_id) {
+        let Ok(runtime) = self.runtime(&vault_id) else {
             tracing::warn!(vault = %vault_id, "unlock refused: vault access was revoked");
             return;
-        }
+        };
         // A parked or locked device holds no K (I3): a refresh or apply that
         // cloned K before the park must not write it back.
         if self.ledger.lock().unwrap().device != crate::principal_ledger::DeviceGate::Open {
@@ -1005,34 +1122,36 @@ impl AppState {
                 });
             }
         }
-        let mut states = self.vault_states.lock().unwrap();
-        states.insert(
-            vault_id,
-            VaultState::Unlocked {
+        if runtime.is_closed() {
+            return;
+        }
+        *runtime.state.lock().unwrap() = VaultState::Unlocked {
                 cache,
                 state_key,
                 unlocked_at,
-            },
-        );
-        drop(revoked);
+            };
     }
 
     /// Clone the retained state key `K` for an Unlocked vault, or `None` when
     /// the vault is Locked. Used by the cloud-sync refresh to re-decrypt a
     /// freshly-pulled sealed blob without a passkey.
     pub fn cloned_state_key(&self, vault_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { state_key, .. }) => Some(state_key.clone()),
+        let runtime = self.runtime_if_present(vault_id)?;
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { state_key, .. } => Some(state_key.clone()),
             _ => None,
         }
     }
 
     /// Transition a vault to Locked, zeroing any cached secrets.
     pub fn lock_vault(&self, vault_id: &str) {
-        let mut states = self.vault_states.lock().unwrap();
-        states.insert(vault_id.to_string(), VaultState::Locked);
-        self.clear_vault_key_changed(vault_id);
+        if let Some(runtime) = self.runtime_if_present(vault_id) {
+            *runtime.state.lock().unwrap() = VaultState::Locked;
+            runtime
+                .key_changed
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Retention setting for this vault's audit log. `None` when the vault
@@ -1040,9 +1159,10 @@ impl AppState {
     /// hasn't configured a retention (keep-forever default). The audit
     /// list handler treats both cases the same: skip prune.
     pub fn audit_retention_days(&self, vault_id: &str) -> Option<u32> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache.audit_retention_days,
+        let runtime = self.runtime_if_present(vault_id)?;
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache.audit_retention_days,
             _ => None,
         }
     }
@@ -1054,9 +1174,12 @@ impl AppState {
     /// connection resolvable. Locked vault → falls back to `conn`
     /// (the caller's locked-gate rejects before any real use).
     pub fn resolve_connection_service(&self, vault_id: &str, conn: &str) -> String {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return conn.to_string();
+        };
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache
                 .connections
                 .get(conn)
                 .and_then(|c| c.service.clone())
@@ -1073,9 +1196,10 @@ impl AppState {
         vault_id: &str,
         service_id: &str,
     ) -> Option<crate::service::ServiceDef> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => {
+        let runtime = self.runtime_if_present(vault_id)?;
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => {
                 cache.custom_services.get(service_id).cloned()
             }
             _ => None,
@@ -1085,9 +1209,12 @@ impl AppState {
     /// True when `service_id` is an installed service of the unlocked vault
     /// that is not loaded because its owner has installed services off.
     pub fn installed_service_off(&self, vault_id: &str, service_id: &str) -> bool {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => {
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return false;
+        };
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => {
                 !cache.policy.allow_installed_services
                     && cache
                         .service_entries
@@ -1100,9 +1227,12 @@ impl AppState {
 
     /// The names of an unlocked vault's console install requests.
     pub fn service_request_names(&self, vault_id: &str) -> Vec<String> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache.service_requests.clone(),
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return Vec::new();
+        };
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache.service_requests.clone(),
             _ => Vec::new(),
         }
     }
@@ -1116,9 +1246,10 @@ impl AppState {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut states = self.vault_states.lock().unwrap();
-        let cache = match states.get_mut(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache,
+        let runtime = self.runtime_if_present(vault_id)?;
+        let mut state = runtime.state.lock().unwrap();
+        let cache = match &mut *state {
+            VaultState::Unlocked { cache, .. } => cache,
             _ => return None,
         };
         let entry = cache.entries.get(conn_id)?;
@@ -1144,9 +1275,10 @@ impl AppState {
         vault_id: &str,
         conn_id: &str,
     ) -> Option<HashMap<String, Vec<u8>>> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache.allow_secrets.get(conn_id).cloned(),
+        let runtime = self.runtime_if_present(vault_id)?;
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache.allow_secrets.get(conn_id).cloned(),
             _ => None,
         }
     }
@@ -1167,8 +1299,11 @@ impl AppState {
         expires_at: Option<u64>,
         agent_prefix: Option<String>,
     ) {
-        let mut states = self.vault_states.lock().unwrap();
-        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return;
+        };
+        let mut state = runtime.state.lock().unwrap();
+        if let VaultState::Unlocked { cache, .. } = &mut *state {
             let expires_at = match (cache.entries.get(conn_id), expires_at) {
                 (Some(prev), Some(t)) => prev.expires_at.map(|p| p.max(t)),
                 (_, e) => e,
@@ -1205,8 +1340,11 @@ impl AppState {
         value: Vec<u8>,
         expires_at: u64,
     ) {
-        let mut states = self.vault_states.lock().unwrap();
-        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return;
+        };
+        let mut state = runtime.state.lock().unwrap();
+        if let VaultState::Unlocked { cache, .. } = &mut *state {
             cache.op_grants.insert(
                 OpGrantKey::new(
                     agent_prefix,
@@ -1260,9 +1398,10 @@ impl AppState {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut states = self.vault_states.lock().unwrap();
-        let cache = match states.get_mut(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache,
+        let runtime = self.runtime_if_present(vault_id)?;
+        let mut state = runtime.state.lock().unwrap();
+        let cache = match &mut *state {
+            VaultState::Unlocked { cache, .. } => cache,
             _ => return None,
         };
         let key = OpGrantKey::new(
@@ -1294,30 +1433,25 @@ impl AppState {
     /// The per-vault async write lock — serializes anything that reseals the
     /// vault body (connect exchange, oauth refresh-token rotation) so two writers
     /// can't clobber each other. Same map the connect + sync paths use inline.
-    fn vault_write_lock(&self, vault_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.vault_write_locks.lock().unwrap();
-        Arc::clone(
-            locks
-                .entry(vault_id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
-    }
-
     /// Acquire the per-vault persistence lock and then re-check the revocation
     /// latch, closing the race with a writer that was queued before teardown.
     pub async fn vault_write_guard(
         &self,
         vault_id: &str,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, VaultWriteRevoked> {
-        let guard = self.vault_write_lock(vault_id).lock_owned().await;
-        if self.is_vault_revoked(vault_id) {
-            return Err(VaultWriteRevoked);
-        }
-        Ok(guard)
+    ) -> Result<crate::vault_runtime::VaultWriteGuard, VaultWriteRevoked> {
+        let runtime = self
+            .runtime(vault_id)
+            .map_err(|gone| VaultWriteRevoked(gone.reason))?;
+        runtime.write_guard().await.map_err(|_| {
+            VaultWriteRevoked(
+                self.tombstone_reason(vault_id)
+                    .unwrap_or(crate::vault_runtime::TombstoneReason::Removed),
+            )
+        })
     }
 
     pub fn is_vault_revoked(&self, vault_id: &str) -> bool {
-        self.revoked_vaults.lock().unwrap().contains(vault_id)
+        self.vault_tombstones.lock().unwrap().contains_key(vault_id)
     }
 
     pub fn oauth_access_lookup(&self, vault_id: &str, refresh_hash: &str) -> Option<Vec<u8>> {
@@ -1325,9 +1459,10 @@ impl AppState {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut states = self.vault_states.lock().unwrap();
-        let cache = match states.get_mut(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache,
+        let runtime = self.runtime_if_present(vault_id)?;
+        let mut state = runtime.state.lock().unwrap();
+        let cache = match &mut *state {
+            VaultState::Unlocked { cache, .. } => cache,
             _ => return None,
         };
         let entry = cache.oauth_access.get(refresh_hash)?;
@@ -1352,8 +1487,11 @@ impl AppState {
         value: Vec<u8>,
         expires_at: u64,
     ) {
-        let mut states = self.vault_states.lock().unwrap();
-        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return;
+        };
+        let mut state = runtime.state.lock().unwrap();
+        if let VaultState::Unlocked { cache, .. } = &mut *state {
             cache.oauth_access.insert(
                 refresh_hash.to_string(),
                 CacheEntry {
@@ -1370,35 +1508,34 @@ impl AppState {
     /// Mark an OAuth connection's refresh_token as dead (invalid_grant at /use).
     /// Surfaced via `/registry` as `needs_reauth` so the console prompts reconnect.
     pub fn oauth_mark_reauth(&self, vault_id: &str, conn_id: &str) {
-        self.oauth_reauth_needed
-            .lock()
-            .unwrap()
-            .insert((vault_id.to_string(), conn_id.to_string()));
+        if let Ok(runtime) = self.runtime(vault_id) {
+            runtime
+                .oauth_reauth_needed
+                .lock()
+                .unwrap()
+                .insert(conn_id.to_string());
+        }
     }
 
     /// Clear a connection's reauth flag (a refresh succeeded).
     pub fn oauth_clear_reauth(&self, vault_id: &str, conn_id: &str) {
-        self.oauth_reauth_needed
-            .lock()
-            .unwrap()
-            .remove(&(vault_id.to_string(), conn_id.to_string()));
+        if let Some(runtime) = self.runtime_if_present(vault_id) {
+            runtime.oauth_reauth_needed.lock().unwrap().remove(conn_id);
+        }
     }
 
     /// True iff `(vault, conn)`'s refresh_token was flagged dead.
     pub fn oauth_needs_reauth(&self, vault_id: &str, conn_id: &str) -> bool {
-        self.oauth_reauth_needed
-            .lock()
-            .unwrap()
-            .contains(&(vault_id.to_string(), conn_id.to_string()))
+        self.runtime_if_present(vault_id)
+            .is_some_and(|runtime| runtime.oauth_reauth_needed.lock().unwrap().contains(conn_id))
     }
 
     /// Clear ALL reauth flags for a vault (a fresh connect just landed; any
     /// still-dead token re-marks on the next /use).
     pub fn oauth_clear_reauth_vault(&self, vault_id: &str) {
-        self.oauth_reauth_needed
-            .lock()
-            .unwrap()
-            .retain(|(v, _)| v != vault_id);
+        if let Some(runtime) = self.runtime_if_present(vault_id) {
+            runtime.oauth_reauth_needed.lock().unwrap().clear();
+        }
     }
 
     /// [`Self::evaluate_request_decision`] as `(level, matched_rule_id, ttl)`.
@@ -1495,8 +1632,9 @@ impl AppState {
         // `aux.policy` overlaid on compiled defaults at refresh), read live
         // here, so a policy edit is realtime on the next request.
         let (conn_policy, floors, vault_policy) = {
-            let states = self.vault_states.lock().unwrap();
-            let Some(VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
+            let runtime = self.runtime_if_present(vault_id)?;
+            let state = runtime.state.lock().unwrap();
+            let VaultState::Unlocked { cache, .. } = &*state else {
                 return None;
             };
             (
@@ -1564,8 +1702,9 @@ impl AppState {
                     host.to_ascii_lowercase(),
                     unit,
                 );
-                let mut states = self.vault_states.lock().unwrap();
-                if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+                let runtime = self.runtime_if_present(vault_id)?;
+                let mut state = runtime.state.lock().unwrap();
+                if let VaultState::Unlocked { cache, .. } = &mut *state {
                     if let Some(&exp) = cache.ask_grants.get(&key) {
                         if exp > now {
                             return Some((crate::core::policy::AccessLevel::Allow, by, ttl));
@@ -1597,8 +1736,9 @@ impl AppState {
         rs: &crate::service::RequestScope,
     ) -> Option<String> {
         let (user_rules, vault_policy) = {
-            let states = self.vault_states.lock().unwrap();
-            let Some(VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
+            let runtime = self.runtime_if_present(vault_id)?;
+            let state = runtime.state.lock().unwrap();
+            let VaultState::Unlocked { cache, .. } = &*state else {
                 return None;
             };
             (
@@ -1647,8 +1787,11 @@ impl AppState {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut states = self.vault_states.lock().unwrap();
-        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return;
+        };
+        let mut state = runtime.state.lock().unwrap();
+        if let VaultState::Unlocked { cache, .. } = &mut *state {
             cache.ask_grants.insert(
                 (
                     agent_prefix.to_string(),
@@ -1662,61 +1805,63 @@ impl AppState {
     }
 
     /// Keep why a change of `item_id` was not applied (see
-    /// [`AppState::sync_conflicts`]).
+    /// the vault runtime's sync notes).
     pub fn note_sync(&self, vault_id: &str, item_id: &str, note: SyncNote) {
-        self.sync_conflicts
-            .lock()
-            .unwrap()
-            .entry(vault_id.to_string())
-            .or_default()
-            .insert(item_id.to_string(), note);
+        if let Ok(runtime) = self.runtime(vault_id) {
+            runtime
+                .sync_conflicts
+                .lock()
+                .unwrap()
+                .insert(item_id.to_string(), note);
+        }
     }
 
     /// A write or push of `item_id` landed: an earlier note on it is settled.
     pub fn clear_sync_conflict(&self, vault_id: &str, item_id: &str) {
-        let mut all = self.sync_conflicts.lock().unwrap();
-        if let Some(m) = all.get_mut(vault_id) {
-            m.remove(item_id);
-            if m.is_empty() {
-                all.remove(vault_id);
-            }
+        if let Some(runtime) = self.runtime_if_present(vault_id) {
+            runtime.sync_conflicts.lock().unwrap().remove(item_id);
         }
     }
 
     /// The records of `vault_id` whose change was set aside because they
     /// changed elsewhere meanwhile, sorted, each once.
     pub fn sync_conflict_records(&self, vault_id: &str) -> Vec<String> {
-        let all = self.sync_conflicts.lock().unwrap();
-        let set: std::collections::BTreeSet<String> = all
-            .get(vault_id)
-            .map(|m| {
-                m.values()
-                    .filter_map(|n| match n {
-                        SyncNote::ChangedElsewhere(r) => Some(r.clone()),
-                        _ => None,
-                    })
-                    .collect()
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return Vec::new();
+        };
+        let set: std::collections::BTreeSet<String> = runtime
+            .sync_conflicts
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|n| match n {
+                SyncNote::ChangedElsewhere(r) => Some(r.clone()),
+                _ => None,
             })
-            .unwrap_or_default();
+            .collect();
         set.into_iter().collect()
     }
 
     /// Every other note of `vault_id` as a sentence, sorted, each once.
     pub fn sync_note_lines(&self, vault_id: &str) -> Vec<String> {
-        let all = self.sync_conflicts.lock().unwrap();
-        let set: std::collections::BTreeSet<String> = all
-            .get(vault_id)
-            .map(|m| m.values().filter_map(SyncNote::sentence).collect())
-            .unwrap_or_default();
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return Vec::new();
+        };
+        let set: std::collections::BTreeSet<String> = runtime
+            .sync_conflicts
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(SyncNote::sentence)
+            .collect();
         set.into_iter().collect()
     }
 
     /// The pull at unlock of `vault_id` failed with `error`; it is retried.
     pub fn note_catch_up(&self, vault_id: &str, error: &str) {
-        self.catch_up_failures
-            .lock()
-            .unwrap()
-            .insert(vault_id.to_string(), error.to_string());
+        if let Ok(runtime) = self.runtime(vault_id) {
+            *runtime.catch_up_failure.lock().unwrap() = Some(error.to_string());
+        }
     }
 
     /// A rotated refresh token of `conn_id` (`role`) was not stored (`why`):
@@ -1729,15 +1874,12 @@ impl AppState {
         token: &str,
         why: &str,
     ) {
-        self.pending_rotations
-            .lock()
-            .unwrap()
-            .entry(vault_id.to_string())
-            .or_default()
-            .insert(
+        if let Ok(runtime) = self.runtime(vault_id) {
+            runtime.pending_rotations.lock().unwrap().insert(
                 (conn_id.to_string(), role.to_string()),
                 zeroize::Zeroizing::new(token.to_string()),
             );
+        }
         self.note_sync(
             vault_id,
             &rotation_note_key(conn_id),
@@ -1753,10 +1895,8 @@ impl AppState {
         &self,
         vault_id: &str,
     ) -> Vec<((String, String), zeroize::Zeroizing<String>)> {
-        self.pending_rotations
-            .lock()
-            .unwrap()
-            .remove(vault_id)
+        self.runtime_if_present(vault_id)
+            .map(|runtime| std::mem::take(&mut *runtime.pending_rotations.lock().unwrap()))
             .map(|m| m.into_iter().collect())
             .unwrap_or_default()
     }
@@ -1770,8 +1910,11 @@ impl AppState {
     /// wherever the unlocked session holds it (its entry, its named secrets).
     /// A no-op when locked or not held.
     pub fn cache_replace_value(&self, vault_id: &str, conn_id: &str, old: &[u8], new: &[u8]) {
-        let mut states = self.vault_states.lock().unwrap();
-        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return;
+        };
+        let mut state = runtime.state.lock().unwrap();
+        if let VaultState::Unlocked { cache, .. } = &mut *state {
             if let Some(e) = cache.entries.get_mut(conn_id) {
                 if e.value.as_slice() == old {
                     e.value = new.to_vec();
@@ -1789,35 +1932,35 @@ impl AppState {
 
     /// The pull after unlock of `vault_id` landed (or the vault locked).
     pub fn clear_catch_up(&self, vault_id: &str) {
-        self.catch_up_failures.lock().unwrap().remove(vault_id);
+        if let Some(runtime) = self.runtime_if_present(vault_id) {
+            runtime.catch_up_failure.lock().unwrap().take();
+        }
     }
 
     /// Why the changes from the cloud since unlock are not pulled yet.
     pub fn catch_up_failure(&self, vault_id: &str) -> Option<String> {
-        self.catch_up_failures
-            .lock()
-            .unwrap()
-            .get(vault_id)
-            .cloned()
+        self.runtime_if_present(vault_id)
+            .and_then(|runtime| runtime.catch_up_failure.lock().unwrap().clone())
     }
 
     /// Record a successful cloud contact for this vault (sync pull/push, or
     /// unlock — a human is present). Feeds the shared-vault offline lease.
     pub fn record_cloud_contact(&self, vault_id: &str) {
-        self.cloud_contact
-            .lock()
-            .unwrap()
-            .insert(vault_id.to_string(), std::time::Instant::now());
+        if let Ok(runtime) = self.runtime(vault_id) {
+            *runtime.cloud_contact.lock().unwrap() = Some(std::time::Instant::now());
+        }
     }
 
     /// Seconds since the last cloud contact, `None` if never recorded (treated
     /// as fresh by callers — the entry appears at unlock).
     pub fn cloud_contact_age_secs(&self, vault_id: &str) -> Option<u64> {
-        self.cloud_contact
-            .lock()
-            .unwrap()
-            .get(vault_id)
-            .map(|t| t.elapsed().as_secs())
+        self.runtime_if_present(vault_id).and_then(|runtime| {
+            runtime
+                .cloud_contact
+                .lock()
+                .unwrap()
+                .map(|t| t.elapsed().as_secs())
+        })
     }
 
     /// Is this vault SHARED? Server-authoritative (team §4): the `kind` the
@@ -1828,12 +1971,9 @@ impl AppState {
     /// private vault's `kind` never reads shared). Independent of unlock state,
     /// unlike the old E2E members-map derivation this replaces.
     pub fn vault_is_shared(&self, vault_id: &str) -> bool {
-        *self
-            .vault_shared
-            .lock()
-            .unwrap()
-            .get(vault_id)
-            .unwrap_or(&false)
+        self.runtime_if_present(vault_id)
+            .and_then(|runtime| *runtime.shared.lock().unwrap())
+            .unwrap_or(false)
     }
 
     /// Record the server-authoritative sharedness (`kind`) for a vault, from the
@@ -1841,10 +1981,9 @@ impl AppState {
     /// sync path whenever a fresh envelope carries the field; absent-field pulls
     /// leave the last known value untouched (see `sync::apply_vault_kind`).
     pub fn set_vault_shared(&self, vault_id: &str, shared: bool) {
-        self.vault_shared
-            .lock()
-            .unwrap()
-            .insert(vault_id.to_string(), shared);
+        if let Ok(runtime) = self.runtime(vault_id) {
+            *runtime.shared.lock().unwrap() = Some(shared);
+        }
     }
 
     /// Eagerly seed `vault_shared` from the known-vaults catalog `kind` (server-
@@ -1879,20 +2018,20 @@ impl AppState {
     /// signal, cleared on a successful sync. The broker reads it to fail loudly with
     /// an actionable "run `sc upgrade`" to the agent.
     pub fn set_vault_upgrade_required(&self, vault_id: &str, required: bool) {
-        let mut set = self.vault_upgrade_required.lock().unwrap();
-        if required {
-            set.insert(vault_id.to_string());
-        } else {
-            set.remove(vault_id);
+        if let Ok(runtime) = self.runtime(vault_id) {
+            runtime
+                .upgrade_required
+                .store(required, std::sync::atomic::Ordering::Release);
         }
     }
 
     /// Is this vault flagged `SC_UPGRADE_REQUIRED` (daemon too old for its format)?
     pub fn is_vault_upgrade_required(&self, vault_id: &str) -> bool {
-        self.vault_upgrade_required
-            .lock()
-            .unwrap()
-            .contains(vault_id)
+        self.runtime_if_present(vault_id).is_some_and(|runtime| {
+            runtime
+                .upgrade_required
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     /// Does this vault's reach mask let `agent_id` use `connection_id`?
@@ -1912,9 +2051,10 @@ impl AppState {
         agent_id: &str,
         connection_id: &str,
     ) -> Option<bool> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache
+        let runtime = self.runtime_if_present(vault_id)?;
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache
                 .agents
                 .get(agent_id)
                 .map(|e| e.connections.allows(connection_id)),
@@ -1933,9 +2073,12 @@ impl AppState {
     /// legacy agent, whose api-key prefix simply isn't an `ag_` and takes the
     /// hash-set path instead).
     pub fn agent_is_authorized(&self, vault_id: &str, agent_id: &str) -> bool {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache.agents.contains_key(agent_id),
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return false;
+        };
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache.agents.contains_key(agent_id),
             _ => false,
         }
     }
@@ -1948,10 +2091,9 @@ impl AppState {
     /// authorized on at least one vault. `false` if no unlocked vault authorizes
     /// it (fail-closed; dual-auth with the legacy api-key covers the transition).
     pub fn agent_is_authorized_any(&self, agent_id: &str) -> bool {
-        let states = self.vault_states.lock().unwrap();
-        states.values().any(|s| match s {
-            VaultState::Unlocked { cache, .. } => cache.agents.contains_key(agent_id),
-            _ => false,
+        let runtimes: Vec<_> = self.vault_runtimes.lock().unwrap().values().cloned().collect();
+        runtimes.iter().any(|runtime| {
+            matches!(&*runtime.state.lock().unwrap(), VaultState::Unlocked { cache, .. } if cache.agents.contains_key(agent_id))
         })
     }
 
@@ -1969,9 +2111,10 @@ impl AppState {
         agent_id: &str,
         candidates: &[String],
     ) -> Option<Vec<String>> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache.agents.get(agent_id).map(|entry| {
+        let runtime = self.runtime_if_present(vault_id)?;
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache.agents.get(agent_id).map(|entry| {
                 candidates
                     .iter()
                     .filter(|id| entry.connections.allows(id))
@@ -1993,9 +2136,12 @@ impl AppState {
     /// locked or sets no timeout.
     pub fn policy_approval_hold(&self, vault_id: &str) -> u64 {
         const DEFAULT_APPROVAL_HOLD: u64 = 1800;
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => {
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return DEFAULT_APPROVAL_HOLD;
+        };
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => {
                 cache.policy.timeout.unwrap_or(DEFAULT_APPROVAL_HOLD)
             }
             _ => DEFAULT_APPROVAL_HOLD,
@@ -2012,9 +2158,12 @@ impl AppState {
         &self,
         vault_id: &str,
     ) -> Vec<(String, crate::storage::plaintext::Connection)> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return Vec::new();
+        };
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache
                 .connections
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -2028,9 +2177,10 @@ impl AppState {
         vault_id: &str,
         conn: &str,
     ) -> Option<crate::storage::plaintext::Connection> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache.connections.get(conn).cloned(),
+        let runtime = self.runtime_if_present(vault_id)?;
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache.connections.get(conn).cloned(),
             _ => None,
         }
     }
@@ -2043,9 +2193,12 @@ impl AppState {
         &self,
         vault_id: &str,
     ) -> std::collections::HashMap<String, crate::service::ServiceDef> {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache.custom_services.clone(),
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return Default::default();
+        };
+        let state = runtime.state.lock().unwrap();
+        match &*state {
+            VaultState::Unlocked { cache, .. } => cache.custom_services.clone(),
             _ => Default::default(),
         }
     }
@@ -2054,9 +2207,10 @@ impl AppState {
     /// through the compiled registry and the vault's custom services. `None`
     /// when the vault is Locked or the connection id is unknown.
     pub fn resolved_hosts_for(&self, vault_id: &str, conn: &str) -> Option<Vec<String>> {
-        let states = self.vault_states.lock().unwrap();
-        let cache = match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache,
+        let runtime = self.runtime_if_present(vault_id)?;
+        let state = runtime.state.lock().unwrap();
+        let cache = match &*state {
+            VaultState::Unlocked { cache, .. } => cache,
             _ => return None,
         };
         let conn_rec = cache.connections.get(conn)?;
@@ -2073,7 +2227,7 @@ impl AppState {
 
     /// True iff `host` is in the union of `resolved_hosts` over the connections
     /// of all unlocked vaults, OR in a locked vault's remembered union
-    /// (`last_host_unions`). Decides MITM-vs-blind-tunnel at CONNECT time: only
+    /// (each runtime's `last_host_union`). Decides MITM-vs-blind-tunnel at CONNECT time: only
     /// hosts a connection anchors are decrypted; everything else is a blind
     /// tunnel. Including locked vaults' last-known anchors means a phantom sent
     /// while locked reaches `pipeline`'s explicit `vault_locked` refusal instead
@@ -2082,72 +2236,64 @@ impl AppState {
     /// can return a precise error) even when the CONNECT's vid userinfo is
     /// wrong or absent.
     pub fn host_in_any_known_union(&self, host: &str) -> bool {
-        let states = self.vault_states.lock().unwrap();
-        let mut remembered = self.last_host_unions.lock().unwrap();
+        let runtimes: Vec<_> = self.vault_runtimes.lock().unwrap().values().cloned().collect();
+        let mut remembered = HashMap::new();
         let mut hit = false;
-        // Unlocked vaults are authoritative; refresh each one's remembered
-        // union in the same pass so it is current whenever the vault locks.
-        for (vid, st) in states.iter() {
-            let VaultState::Unlocked { cache, .. } = st else {
-                continue;
+        for runtime in runtimes {
+            let unlocked_hosts = {
+                let state = runtime.state.lock().unwrap();
+                match &*state {
+                    VaultState::Unlocked { cache, .. } => {
+                        let mut hosts = Vec::new();
+                        for conn_rec in cache.connections.values() {
+                            let def = conn_rec.service.as_deref().and_then(|s| {
+                                cache
+                                    .custom_services
+                                    .get(s)
+                                    .cloned()
+                                    .or_else(|| self.services.get(s).cloned())
+                            });
+                            for resolved in
+                                crate::core::host::resolved_hosts(conn_rec, def.as_ref())
+                            {
+                                hosts.push(resolved.to_ascii_lowercase());
+                            }
+                        }
+                        hosts.sort_unstable();
+                        hosts.dedup();
+                        Some(hosts)
+                    }
+                    VaultState::Locked => None,
+                }
             };
-            let mut hosts: Vec<String> = Vec::new();
-            for conn_rec in cache.connections.values() {
-                let def = conn_rec.service.as_deref().and_then(|s| {
-                    // custom-FIRST (see proxy::handler)
-                    cache
-                        .custom_services
-                        .get(s)
-                        .cloned()
-                        .or_else(|| self.services.get(s).cloned())
-                });
-                for h in crate::core::host::resolved_hosts(conn_rec, def.as_ref()) {
-                    hosts.push(h.to_ascii_lowercase());
-                }
+            if let Some(hosts) = unlocked_hosts {
+                *runtime.last_host_union.lock().unwrap() = hosts;
             }
-            hosts.sort_unstable();
-            hosts.dedup();
-            if hosts
+            let hosts = runtime.last_host_union.lock().unwrap().clone();
+            hit |= hosts
                 .iter()
-                .any(|h| crate::core::host::host_anchor_matches(host, h))
-            {
-                hit = true;
-            }
-            remembered.insert(vid.clone(), hosts);
+                .any(|anchor| crate::core::host::host_anchor_matches(host, anchor));
+            remembered.insert(runtime.vault_id.clone(), hosts);
         }
-        // Forget vaults that no longer exist so the durable cache never grows
-        // stale/unbounded, then persist (host names only — non-sensitive) so the
-        // union survives a daemon restart while a vault stays locked.
-        remembered.retain(|vid, _| states.contains_key(vid.as_str()));
-        {
-            let json = canonical_unions_json(&remembered);
-            let mut persisted = self.host_unions_persisted.lock().unwrap();
-            if *persisted != json {
-                if let Err(e) =
-                    std::fs::write(host_anchors_path(&self.config.state_dir), json.as_bytes())
-                {
-                    tracing::warn!("proxy: persist host-anchors failed: {}", e);
-                } else {
-                    *persisted = json;
-                }
-            }
-        }
-        if hit {
-            return true;
-        }
-        // Locked (or never-unlocked-this-boot) vaults: last-known anchors.
-        for (vid, hosts) in remembered.iter() {
-            if matches!(states.get(vid.as_str()), Some(VaultState::Unlocked { .. })) {
-                continue;
-            }
-            if hosts
+        for (vid, tombstone) in self.vault_tombstones.lock().unwrap().iter() {
+            hit |= tombstone
+                .hosts
                 .iter()
-                .any(|h| crate::core::host::host_anchor_matches(host, h))
+                .any(|anchor| crate::core::host::host_anchor_matches(host, anchor));
+            remembered.insert(vid.clone(), tombstone.hosts.clone());
+        }
+        let json = canonical_unions_json(&remembered);
+        let mut persisted = self.host_unions_persisted.lock().unwrap();
+        if *persisted != json {
+            if let Err(error) =
+                std::fs::write(host_anchors_path(&self.config.state_dir), json.as_bytes())
             {
-                return true;
+                tracing::warn!("proxy: persist host-anchors failed: {}", error);
+            } else {
+                *persisted = json;
             }
         }
-        false
+        hit
     }
 
     /// Session-level host widen (component C partial): append an exact FQDN to a
@@ -2156,8 +2302,11 @@ impl AppState {
     /// `aux.connections` is a separate write (see BUILD_NOTES). No-op when the
     /// vault is Locked or the connection is unknown.
     pub fn widen_connection_host(&self, vault_id: &str, conn: &str, host: &str) {
-        let mut states = self.vault_states.lock().unwrap();
-        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
+            return;
+        };
+        let mut runtime_state = runtime.state.lock().unwrap();
+        if let VaultState::Unlocked { cache, .. } = &mut *runtime_state {
             if let Some(conn_rec) = cache.connections.get_mut(conn) {
                 let hosts = conn_rec.hosts.get_or_insert_with(Vec::new);
                 if !hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
@@ -2285,8 +2434,9 @@ mod tests {
     /// produces for an allow-read connection) — there's no public setter since
     /// only unlock writes these.
     fn insert_bootstrap(state: &AppState, vault_id: &str, conn: &str, value: &[u8]) {
-        let mut states = state.vault_states.lock().unwrap();
-        if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
+        let runtime = state.runtime(vault_id).unwrap();
+        let mut runtime_state = runtime.state.lock().unwrap();
+        if let VaultState::Unlocked { cache, .. } = &mut *runtime_state {
             cache.entries.insert(
                 conn.to_string(),
                 CacheEntry {
@@ -2574,8 +2724,9 @@ mod tests {
         );
         state.record_ask_grant("v1", "agA", "gh", "H.com", unit.clone(), 60);
         {
-            let states = state.vault_states.lock().unwrap();
-            if let Some(VaultState::Unlocked { cache, .. }) = states.get("v1") {
+            let runtime = state.runtime("v1").unwrap();
+            let runtime_state = runtime.state.lock().unwrap();
+            if let VaultState::Unlocked { cache, .. } = &*runtime_state {
                 let key_a = (
                     "agA".to_string(),
                     "gh".to_string(),

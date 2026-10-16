@@ -423,7 +423,7 @@ async fn run(
                     // wait` returns a definitive, actionable error. Ending the poll
                     // with Err instead (the old behavior) left the relay op
                     // 'approved' and hung the CLI forever on "Waiting for approval".
-                    if let Ok(audit) = state.audits.for_vault(vault_id) {
+                    if let Ok(audit) = state.audit_for_vault(vault_id) {
                         let _ = audit.finalize(
                             op_id,
                             crate::audit::STATUS_EXPIRED,

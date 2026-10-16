@@ -54,7 +54,7 @@ pub async fn usage(
             "since must be strictly less than until".into(),
         ));
     }
-    let store = state.audits.for_vault(&vault_id)?;
+    let store = state.audit_for_vault(&vault_id)?;
     let (total, by_service) = store.aggregate_usage(q.since, until)?;
     let body = UsageResponse {
         since: q.since,

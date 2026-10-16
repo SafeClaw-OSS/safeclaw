@@ -516,9 +516,13 @@ pub(crate) fn stamp_at_mint(
         None => BTreeSet::new(),
     };
     let (connections, native, custom_defs, has_external) = {
-        let states = state.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(crate::state::VaultState::Unlocked { cache, .. }) => (
+        let runtime = state.runtime_if_present(vault_id);
+        let Some(runtime) = runtime else {
+            return Err(crate::error::VAULT_LOCKED_MSG.to_string());
+        };
+        let runtime_state = runtime.state.lock().unwrap();
+        match &*runtime_state {
+            crate::state::VaultState::Unlocked { cache, .. } => (
                 cache
                     .connections
                     .iter()

@@ -22,6 +22,7 @@ pub enum ScCode {
     Conflict,
     VaultLocked,
     VaultAccessRevoked,
+    VaultDeleted,
     RateLimited,
     Internal,
     CaUnavailable,
@@ -150,6 +151,7 @@ impl ScCode {
                 "configure",
                 "auth",
             ),
+            VaultDeleted => (410, "vault_deleted", "Vault deleted", "none", "vault"),
             RateLimited => (429, "rate_limited", "Rate limited", "retry", "request"),
             Internal => (500, "internal", "Internal error", "retry", "internal"),
             CaUnavailable => (500, "ca_unavailable", "CA unavailable", "retry", "internal"),
@@ -452,6 +454,8 @@ pub enum AppError {
     VaultLocked,
     /// The cloud explicitly reported that this account is no longer a member.
     VaultAccessRevoked,
+    /// The vault has a verified deletion tombstone.
+    VaultDeleted,
     TooManyRequests,
     Internal(String),
     /// Batch-approve verification failure (recoverable; see
@@ -494,6 +498,7 @@ impl AppError {
                 ScCode::VaultAccessRevoked,
                 VAULT_ACCESS_REVOKED_MSG.to_string(),
             ),
+            AppError::VaultDeleted => (ScCode::VaultDeleted, "This vault was deleted.".to_string()),
             AppError::TooManyRequests => (ScCode::RateLimited, "Rate limit exceeded".to_string()),
             AppError::BatchVerify(msg) => (ScCode::BatchVerifyFailed, msg.clone()),
             AppError::ApproverNotAuthorized(msg) => (ScCode::ApproverNotAuthorized, msg.clone()),
@@ -556,6 +561,7 @@ impl std::fmt::Display for AppError {
             AppError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             AppError::VaultLocked => write!(f, "Vault locked"),
             AppError::VaultAccessRevoked => write!(f, "{}", VAULT_ACCESS_REVOKED_MSG),
+            AppError::VaultDeleted => write!(f, "This vault was deleted."),
             AppError::TooManyRequests => write!(f, "Rate limit exceeded"),
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
             AppError::BatchVerify(msg) => write!(f, "Batch verification failed: {}", msg),
@@ -631,6 +637,7 @@ mod tests {
             Conflict,
             VaultLocked,
             VaultAccessRevoked,
+            VaultDeleted,
             RateLimited,
             Internal,
             CaUnavailable,

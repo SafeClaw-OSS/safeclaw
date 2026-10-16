@@ -233,10 +233,10 @@ async fn require_agent(
             let (code, msg) = e.code();
             Err(problem(code, &msg))
         }
-        Err(AgentRefusal::Revoked) => Err(problem(
-            ScCode::VaultAccessRevoked,
-            crate::error::VAULT_ACCESS_REVOKED_MSG,
-        )),
+        Err(AgentRefusal::Gone(error)) => {
+            let (code, message) = error.code();
+            Err(problem(code, &message))
+        }
         Err(AgentRefusal::NoIdentity) => Err(problem(
             ScCode::Unauthorized,
             crate::principal_ledger::NO_AGENT_IDENTITY_MSG,
@@ -462,12 +462,12 @@ mod tests {
         // A named revoked vault is explicit and wins over its locked state or
         // vault-level agent table.
         state.open_ledger_for_tests(&[&ag]);
-        state.revoked_vaults.lock().unwrap().insert("v1".into());
+        state.mark_vault_closing("v1", crate::vault_runtime::TombstoneReason::Removed);
         let pq = "/v/v1/registry";
         let r = require_agent(&state, &headers(pq), pq).await.unwrap_err();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         assert_eq!(code(&r).as_deref(), Some("vault_access_revoked"));
-        state.revoked_vaults.lock().unwrap().remove("v1");
+        state.restore_vault("v1");
 
         // This device not admitted: every agent refused with device_not_admitted.
         state.set_ledger(crate::principal_ledger::LedgerGate::default());

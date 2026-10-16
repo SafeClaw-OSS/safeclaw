@@ -10,18 +10,16 @@
 //! "what did my agent do" without needing SUDP-grade encryption.
 //!
 //! Per-vault DB (one file per vault) is the spec's isolation guarantee
-//! (PROTOCOL.md §5.3 "跨 vault 永远隔离"). Connections cached lazily in
-//! `AuditRegistry`.
+//! (PROTOCOL.md §5.3 "跨 vault 永远隔离"). Each `VaultRuntime` owns its
+//! lazily-opened connection handle.
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
 use crate::error::{AppError, Result};
-use crate::storage::VaultDir;
 
 // ── Status vocabulary ────────────────────────────────────────────────────
 //
@@ -172,7 +170,7 @@ pub struct AuditStore {
 }
 
 impl AuditStore {
-    fn open(db_path: &Path) -> Result<Self> {
+    pub(crate) fn open(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| AppError::Internal(format!("audit dir create: {}", e)))?;
@@ -518,79 +516,6 @@ impl AuditStore {
             }
         }
         Ok((total, by_service))
-    }
-}
-
-/// Per-vault `AuditStore` cache. Lazy-init on first `for_vault` call —
-/// no DB file exists until that vault's first op writes audit.
-
-/// fd ceiling for simultaneously open SQLite connection handles.
-/// Each WAL-mode SQLite connection uses ~3 fds; 2000 × 3 = 6000 fds,
-/// well within Linux's default nofile=65536. This is a resource management
-/// ceiling, not a DoS gate — the DoS gate is the vault-existence check in
-/// `for_vault`. When the ceiling is hit, one cached handle is evicted (fd
-/// closed, on-disk data untouched); the next access reopens the file.
-const AUDIT_REGISTRY_CAP: usize = 2000;
-
-pub struct AuditRegistry {
-    vaults: VaultDir,
-    stores: Mutex<HashMap<String, Arc<AuditStore>>>,
-}
-
-impl AuditRegistry {
-    pub fn new(vaults: VaultDir) -> Self {
-        Self {
-            vaults,
-            stores: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn for_vault(&self, vault_id: &str) -> Result<Arc<AuditStore>> {
-        {
-            let stores = self.stores.lock().unwrap();
-            if let Some(s) = stores.get(vault_id) {
-                return Ok(s.clone());
-            }
-        }
-
-        // Layer 1 — DoS gate: verify the vault exists before touching any fd.
-        // Fake vault_ids have no directory on disk; without this check, open()
-        // would call create_dir_all and allocate a real fd for a non-vault.
-        let vault_dir = self.vaults.dir_for(vault_id)?;
-        if !vault_dir.exists() {
-            return Err(crate::error::AppError::NotFound);
-        }
-
-        // Open the SQLite connection outside the lock so a slow disk access
-        // doesn't block concurrent requests to other vaults.
-        let db_path = self.vaults.audit_path(vault_id)?;
-        let store = Arc::new(AuditStore::open(&db_path)?);
-
-        let mut stores = self.stores.lock().unwrap();
-        // Race: another thread may have inserted while we were opening — keep theirs.
-        if let Some(existing) = stores.get(vault_id) {
-            return Ok(existing.clone());
-        }
-
-        // Layer 2 — fd ceiling: evict one handle when at capacity.
-        // The evicted vault's SQLite fd is closed; its on-disk data is untouched.
-        // The next request for that vault simply reopens the file.
-        if stores.len() >= AUDIT_REGISTRY_CAP {
-            if let Some(key) = stores.keys().next().cloned() {
-                stores.remove(&key);
-            }
-        }
-
-        stores.insert(vault_id.to_string(), store.clone());
-        Ok(store)
-    }
-
-    /// Drop the cached `AuditStore` handle for a vault. Used during
-    /// admin-driven vault deletion so the SQLite connection is closed
-    /// before we `rm -rf` the directory it points at. Idempotent.
-    pub fn forget(&self, vault_id: &str) {
-        let mut stores = self.stores.lock().unwrap();
-        stores.remove(vault_id);
     }
 }
 

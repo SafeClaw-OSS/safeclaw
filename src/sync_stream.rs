@@ -331,7 +331,8 @@ pub async fn stream_health_edge() {
 /// so a vault outside the streamed set (born after daemon start, over the
 /// 32-vid cap, hello-rejected) never hears them either. Cleared on every
 /// go_down; kept across a rotation (the gap is one re-dial budget, inside
-/// the poll floors).
+/// the poll floors). The vid set stays here because it is one atomic snapshot
+/// of the shared SSE connection's negotiated routing, not vault-owned state.
 #[derive(Default)]
 struct StreamCaps {
     vids: std::collections::HashSet<String>,
@@ -742,7 +743,9 @@ pub async fn dispatcher(
         }
         announced_off = false; // re-entering off later announces again
 
-        // This attempt's vid set (see MAX_STREAM_VIDS for why we filter).
+        // This attempt's vid-to-cell table is connection-local routing for one
+        // shared SSE request. The cells themselves remain owned by runtimes.
+        // See MAX_STREAM_VIDS for why we filter.
         let mut stream_cells: HashMap<String, Arc<WakeCell>> = HashMap::new();
         for (vid, cell) in &live {
             if stream_cells.len() >= MAX_STREAM_VIDS {
@@ -1141,10 +1144,18 @@ fn dispatch_record_with_context(
         if state.is_vault_revoked(vid) {
             return;
         }
-        let held = state.vault_states.lock().unwrap().contains_key(vid)
-            || state.watcher_cells.lock().unwrap().contains_key(vid)
+        let held = state.runtime_if_present(vid).is_some()
             || state.vaults.dir_for(vid).is_ok_and(|p| p.exists());
-        if !held || !state.access_probes.lock().unwrap().insert(vid.to_string()) {
+        if !held {
+            return;
+        }
+        let Ok(runtime) = state.runtime(vid) else {
+            return;
+        };
+        if runtime
+            .access_probe
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
             return;
         }
         let (state, cloud, dk, vid) = (
@@ -1155,7 +1166,9 @@ fn dispatch_record_with_context(
         );
         tokio::spawn(async move {
             crate::sync::probe_vault_access(&state, &cloud, &dk, &vid).await;
-            state.access_probes.lock().unwrap().remove(&vid);
+            runtime
+                .access_probe
+                .store(false, std::sync::atomic::Ordering::Release);
         });
         return;
     }

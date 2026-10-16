@@ -118,7 +118,7 @@ pub async fn create(
         let _guard = state
             .vault_write_guard(&vault_id)
             .await
-            .map_err(|_| AppError::VaultAccessRevoked)?;
+            .map_err(|error| error.app_error())?;
         let mut view =
             crate::server::handlers::metadata::open_view_with_state_key(&state, &vault_id, &k)?;
         let base = crate::storage::sealed_vault::ViewBase::of(&view)?;

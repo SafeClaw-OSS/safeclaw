@@ -927,7 +927,7 @@ pub async fn approve_op(
     let _vault_write_guard = state
         .vault_write_guard(&vault_id)
         .await
-        .map_err(|_| AppError::VaultAccessRevoked)?;
+        .map_err(|error| error.app_error())?;
 
     // 3a. Re-check UNDER the vault write lock (design/approvals-inbox.md D1,
     // atomic apply). One intent chain is always one vault (redeemer ==
@@ -1358,25 +1358,14 @@ pub async fn approve_op(
                 if existing_vault.is_none() {
                     return Err(AppError::Conflict("vault not initialized".into()));
                 }
-                // Close the cached AuditStore SQLite handle BEFORE removing
-                // the directory. On Linux, unlinking a file that still has
-                // an open fd leaves the inode alive: any subsequent
-                // `state.audits.for_vault(vid)` call returns the cached
-                // Arc<AuditStore> and reads/writes against the now-orphan
-                // inode. Recreating the same vault_id (deterministic from
-                // user_id, so very common after delete) then sees the old
-                // approvals "from 50 minutes ago" instead of an empty log.
-                // Matches the admin DELETE path's ordering (admin.rs).
-                state.audits.forget(&vault_id);
+                drop(_vault_write_guard);
                 state
-                    .vaults
-                    .remove(&vault_id)
-                    .map_err(|e| AppError::Internal(format!("vault dir remove: {}", e)))?;
-                {
-                    let mut states = state.vault_states.lock().unwrap();
-                    states.remove(&vault_id);
-                }
-                state.last_host_unions.lock().unwrap().remove(&vault_id);
+                    .close_vault(
+                        &vault_id,
+                        crate::vault_runtime::TombstoneReason::Deleted,
+                        true,
+                    )
+                    .await;
                 tracing::info!(vault = %vault_id, "vault deleted");
                 (json!({ "ok": true, "act": "vault-delete" }), None)
             }
@@ -2193,7 +2182,7 @@ pub async fn approve_op(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if let Ok(store) = state.audits.for_vault(&rec_vault_id) {
+    if let Ok(store) = state.audit_for_vault(&rec_vault_id) {
         if let Err(e) = store.finalize(
             &op_id,
             STATUS_APPROVED,
@@ -2514,7 +2503,7 @@ pub(crate) fn finish_chain_siblings(
                 crate::relay::client::CancelReason::Rejected,
             ),
         };
-        if let Ok(store) = state.audits.for_vault(&sib.vault_id) {
+        if let Ok(store) = state.audit_for_vault(&sib.vault_id) {
             if let Err(e) = store.finalize(
                 &sib.id,
                 crate::audit::STATUS_CANCELLED,
@@ -2579,7 +2568,7 @@ pub async fn reject_op(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if let Ok(store) = state.audits.for_vault(&rec_vault_id) {
+    if let Ok(store) = state.audit_for_vault(&rec_vault_id) {
         if let Err(e) = store.finalize(
             &op_id,
             STATUS_REJECTED,
@@ -2964,8 +2953,11 @@ pub(crate) async fn lazy_fill_external(
     let _fill = state.external_fill_lock.lock().await;
 
     let (policy, rec, adapters) = {
-        let states = state.vault_states.lock().unwrap();
-        let Some(crate::state::VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
+        let Some(runtime) = state.runtime_if_present(vault_id) else {
+            return Ok(false);
+        };
+        let runtime_state = runtime.state.lock().unwrap();
+        let crate::state::VaultState::Unlocked { cache, .. } = &*runtime_state else {
             return Ok(false);
         };
         if cache.entries.contains_key(conn) || cache.allow_secrets.contains_key(conn) {
@@ -3078,8 +3070,10 @@ pub(crate) async fn lazy_fill_external(
         return Ok(false);
     }
     {
-        let mut states = state.vault_states.lock().unwrap();
-        let Some(crate::state::VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id)
+        let Some(runtime) = state.runtime_if_present(vault_id) else {
+            return Ok(false);
+        };
+        let crate::state::VaultState::Unlocked { cache, .. } = &mut *runtime.state.lock().unwrap()
         else {
             return Ok(false); // locked while we were fetching — drop the bytes
         };
@@ -4328,9 +4322,10 @@ mod tests {
     }
 
     fn held_expiry(state: &AppState) -> Option<u64> {
-        let states = state.vault_states.lock().unwrap();
-        match states.get(RV) {
-            Some(crate::state::VaultState::Unlocked { cache, .. }) => {
+        let runtime = state.runtime_if_present(RV)?;
+        let runtime_state = runtime.state.lock().unwrap();
+        match &*runtime_state {
+            crate::state::VaultState::Unlocked { cache, .. } => {
                 cache.entries.get(RC).and_then(|e| e.expires_at)
             }
             _ => None,
@@ -4338,9 +4333,12 @@ mod tests {
     }
 
     fn ledger_len(state: &AppState) -> usize {
-        let states = state.vault_states.lock().unwrap();
-        match states.get(RV) {
-            Some(crate::state::VaultState::Unlocked { cache, .. }) => cache.ask_grants.len(),
+        let Some(runtime) = state.runtime_if_present(RV) else {
+            return 0;
+        };
+        let runtime_state = runtime.state.lock().unwrap();
+        match &*runtime_state {
+            crate::state::VaultState::Unlocked { cache, .. } => cache.ask_grants.len(),
             _ => 0,
         }
     }
@@ -4356,10 +4354,11 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let digest = crate::service::scope_digest(&pairs);
-        let states = state.vault_states.lock().unwrap();
-        match states.get(RV) {
+        let runtime = state.runtime_if_present(RV)?;
+        let runtime_state = runtime.state.lock().unwrap();
+        match &*runtime_state {
             // Whatever tier minted it: the request line + digest identify it.
-            Some(crate::state::VaultState::Unlocked { cache, .. }) => cache
+            crate::state::VaultState::Unlocked { cache, .. } => cache
                 .op_grants
                 .iter()
                 .find(|(k, _)| {
@@ -5009,9 +5008,10 @@ mod tests {
 
     fn grants_present(state: &AppState, agent: &str) -> (bool, bool) {
         let ledger = {
-            let states = state.vault_states.lock().unwrap();
-            match states.get("v1") {
-                Some(crate::state::VaultState::Unlocked { cache, .. }) => cache
+            let runtime = state.runtime_if_present("v1").unwrap();
+            let runtime_state = runtime.state.lock().unwrap();
+            match &*runtime_state {
+                crate::state::VaultState::Unlocked { cache, .. } => cache
                     .ask_grants
                     .keys()
                     .any(|(a, c, _, _)| a == agent && c == "github"),

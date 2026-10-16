@@ -31,7 +31,7 @@ use crate::state::AppState;
 /// Maximum concurrent SSE connections per vault. Generous enough for normal
 /// use (browser tab + mobile + dev tool open simultaneously) while capping
 /// the file-descriptor exhaustion surface from a connection-flood attack.
-const MAX_SSE_PER_VAULT: usize = 50;
+pub(crate) const MAX_SSE_PER_VAULT: usize = 50;
 
 type SseItem = std::result::Result<Event, Infallible>;
 
@@ -61,13 +61,11 @@ pub async fn stream(
     // Acquire a per-vault semaphore slot. try_acquire_owned() fails immediately
     // if all MAX_SSE_PER_VAULT slots are taken; the OwnedSemaphorePermit is
     // held in PermitStream so the slot is released when the stream drops.
-    let semaphore = {
-        let mut sems = state.sse_semaphores.lock().unwrap();
-        Arc::clone(
-            sems.entry(vault_id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_SSE_PER_VAULT))),
-        )
-    };
+    let semaphore = state
+        .runtime(&vault_id)
+        .map_err(crate::vault_runtime::VaultGone::app_error)?
+        .sse_semaphore
+        .clone();
     let permit = semaphore
         .try_acquire_owned()
         .map_err(|_| AppError::TooManyRequests)?;

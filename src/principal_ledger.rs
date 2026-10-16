@@ -538,13 +538,13 @@ async fn self_wipe_and_logout(state: &Arc<AppState>) -> ! {
         .map(|kv| kv.vault)
         .filter(|v| !v.is_empty())
         .collect();
-    vaults.extend(state.vault_states.lock().unwrap().keys().cloned());
+    vaults.extend(state.runtime_ids());
     vaults.extend(state.vaults.list().unwrap_or_default());
     // F2: evict retained K from EVERY vault UP-FRONT (synchronous, in-memory) so the
     // serve window closes immediately — no in-flight request can be handed K for a
     // not-yet-dropped vault while the per-vault disk wipe below iterates.
     for vid in &vaults {
-        state.lock_vault(vid);
+        state.mark_vault_closing(vid, crate::vault_runtime::TombstoneReason::DeviceRevoked);
     }
     for vid in &vaults {
         crate::sync::revoke_vault_access_verified(state, vid).await;
@@ -762,8 +762,8 @@ pub async fn agent_not_admitted(state: &Arc<AppState>, agent_id: &str) -> bool {
 pub enum AgentRefusal {
     /// This device itself may not serve (park / lock / revoked).
     Device(crate::error::AppError),
-    /// The backend explicitly reported that this account lost this vault.
-    Revoked,
+    /// The vault runtime was closed with a durable in-process reason.
+    Gone(crate::error::AppError),
     /// No verified agent identity (no or invalid AIK proof): an api key alone is
     /// no longer an agent credential (W3).
     NoIdentity,
@@ -789,8 +789,8 @@ pub async fn authorize_agent(
     if let Some(e) = state.ledger_refusal() {
         return Err(AgentRefusal::Device(e));
     }
-    if vault.is_some_and(|v| state.is_vault_revoked(v)) {
-        return Err(AgentRefusal::Revoked);
+    if let Some(error) = vault.and_then(|v| state.vault_gone_error(v)) {
+        return Err(AgentRefusal::Gone(error));
     }
     let ag = agent.ok_or(AgentRefusal::NoIdentity)?;
     if agent_not_admitted(state, ag).await {
@@ -877,10 +877,10 @@ mod tests {
         };
         let state = Arc::new(AppState::new(cfg));
         state.open_ledger_for_tests(&[]);
-        state.revoked_vaults.lock().unwrap().insert("v".into());
+        state.mark_vault_closing("v", crate::vault_runtime::TombstoneReason::Removed);
         assert!(matches!(
             authorize_agent(&state, None, Some("v")).await,
-            Err(AgentRefusal::Revoked)
+            Err(AgentRefusal::Gone(crate::error::AppError::VaultAccessRevoked))
         ));
     }
 

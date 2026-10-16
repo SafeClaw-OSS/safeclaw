@@ -512,7 +512,7 @@ pub async fn vault_registry(
 /// The `/v/{vid}/registry` projection as a plain `Value`. Shared by the axum
 /// control-plane handler (above) AND the 23294 API face (`proxy::api_face`), so
 /// discovery can't drift between the two ports. Pure read — briefly locks
-/// `vault_states`, no I/O.
+/// the vault runtime's state, no I/O.
 pub fn vault_registry_value(
     state: &AppState,
     vault_id: &str,
@@ -534,9 +534,12 @@ pub fn vault_registry_value(
         std::collections::HashMap<String, Connection>,
         bool,
     ) = {
-        let states = state.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => {
+        let runtime = state
+            .runtime(vault_id)
+            .map_err(crate::vault_runtime::VaultGone::app_error)?;
+        let runtime_state = runtime.state.lock().unwrap();
+        match &*runtime_state {
+            VaultState::Unlocked { cache, .. } => {
                 let mut custom: Vec<(String, ServiceDef)> = cache
                     .custom_services
                     .iter()
