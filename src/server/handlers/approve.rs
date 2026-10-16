@@ -256,7 +256,7 @@ fn export_precheck(op: &crate::protocol::operation::Operation) -> Result<&str> {
     // no path can dump the whole vault's plaintext through one op.
     if path == "env" || path.is_empty() {
         return Err(AppError::BadRequest(
-            "reveal-all export is retired — export a specific secret by name".into(),
+            "reveal-all export is retired. Export a specific secret by name".into(),
         ));
     }
     Ok(path)
@@ -1129,7 +1129,7 @@ pub async fn approve_op(
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
             if vault.credentials.len() <= 1 {
                 return Err(AppError::BadRequest(
-                    "cannot remove the last passkey — add another one first".into(),
+                    "cannot remove the last passkey. Add another one first".into(),
                 ));
             }
             let cid_bytes = decode_credential_id(cid_b64)?;
@@ -1722,7 +1722,7 @@ pub async fn approve_op(
                     // misleading "not found".
                     if view.resolve_value_async(&key).await?.is_some() {
                         return Err(AppError::BadRequest(format!(
-                            "key '{}' is hosted by an external store — SafeClaw reads it pass-through and cannot delete it; remove it in the provider's console",
+                            "key '{}' is hosted by an external store. SafeClaw reads it pass-through and cannot delete it; remove it in the provider's console",
                             key
                         )));
                     }
@@ -1888,7 +1888,7 @@ pub async fn approve_op(
                 let values = match scope.get("values_digest").and_then(|v| v.as_str()) {
                     Some(d) => Some(state.op_payload_take(d).ok_or_else(|| {
                         AppError::BadRequest(
-                            "deposited values not found or expired — re-run the command".into(),
+                            "deposited values not found or expired. Re-run the command".into(),
                         )
                     })?),
                     None => None,
@@ -2089,7 +2089,7 @@ pub async fn approve_op(
                     })?;
                 let mut values = state.op_payload_take(digest).ok_or_else(|| {
                     AppError::BadRequest(
-                        "deposited value not found or expired — re-run the command".into(),
+                        "deposited value not found or expired. Re-run the command".into(),
                     )
                 })?;
                 let value = values.remove(&key).ok_or_else(|| {

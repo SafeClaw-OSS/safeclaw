@@ -465,7 +465,7 @@ where
 /// re-processes the pending entry every cycle, forever.
 ///
 /// The error is a formatted string (`exchange_code` returns
-/// `"… returned HTTP <status> — <body>"`), so classification is textual: any
+/// `"… returned HTTP <status>: <body>"`), so classification is textual: any
 /// 4xx is a rejection except 408 (timeout) and 429 (rate limit). The reason
 /// surfaces the provider's `error_description`/`error` when the body is the
 /// standard RFC 6749 §5.2 JSON.
@@ -480,7 +480,7 @@ fn terminal_exchange_reason(e: &str) -> Option<String> {
         return None;
     }
     let detail = e
-        .split_once("— ")
+        .split_once(": ")
         .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body.trim()).ok())
         .and_then(|v| {
             v.get("error_description")
@@ -1535,7 +1535,7 @@ mod tests {
             &no_custom(),
             &mut m,
             |_conn, _cfg, _p| async move {
-                Err("oauth2 code-exchange returned HTTP 400 — invalid_grant".to_string())
+                Err("oauth2 code-exchange returned HTTP 400: invalid_grant".to_string())
             },
         )
         .await;
@@ -1560,7 +1560,7 @@ mod tests {
     fn terminal_exchange_reason_classifies_rejections_vs_transients() {
         // 4xx rejections are terminal, with the provider's detail surfaced.
         let missing_secret = terminal_exchange_reason(
-            "oauth2 code-exchange returned HTTP 400 Bad Request — {\"error\":\"invalid_request\",\"error_description\":\"client_secret is missing.\"}",
+            "oauth2 code-exchange returned HTTP 400 Bad Request: {\"error\":\"invalid_request\",\"error_description\":\"client_secret is missing.\"}",
         );
         assert_eq!(
             missing_secret.as_deref(),
@@ -1568,7 +1568,7 @@ mod tests {
         );
         assert!(terminal_exchange_reason("… invalid_grant …").is_some());
         assert!(
-            terminal_exchange_reason("oauth2 code-exchange returned HTTP 401 — nope").is_some()
+            terminal_exchange_reason("oauth2 code-exchange returned HTTP 401: nope").is_some()
         );
         // Network errors, 5xx, timeouts, and rate limits stay retryable.
         assert!(
@@ -1576,14 +1576,14 @@ mod tests {
                 .is_none()
         );
         assert!(
-            terminal_exchange_reason("oauth2 code-exchange returned HTTP 500 — oops").is_none()
+            terminal_exchange_reason("oauth2 code-exchange returned HTTP 500: oops").is_none()
         );
         assert!(
-            terminal_exchange_reason("oauth2 code-exchange returned HTTP 429 — slow down")
+            terminal_exchange_reason("oauth2 code-exchange returned HTTP 429: slow down")
                 .is_none()
         );
         assert!(
-            terminal_exchange_reason("oauth2 code-exchange returned HTTP 408 — timeout").is_none()
+            terminal_exchange_reason("oauth2 code-exchange returned HTTP 408: timeout").is_none()
         );
     }
 
@@ -1594,7 +1594,7 @@ mod tests {
         // A 400 rejection (not invalid_grant) stamps a terminal error.
         let mut m = with_connecting("gmail", "gmail", "code-A");
         let report = run_pending(&services, &no_custom(), &mut m, |_conn, _cfg, _p| async move {
-            Err("oauth2 code-exchange returned HTTP 400 Bad Request — {\"error\":\"invalid_request\",\"error_description\":\"client_secret is missing.\"}".to_string())
+            Err("oauth2 code-exchange returned HTTP 400 Bad Request: {\"error\":\"invalid_request\",\"error_description\":\"client_secret is missing.\"}".to_string())
         })
         .await;
         assert_eq!((report.completed.len(), report.failed.len()), (0, 1));
@@ -1618,7 +1618,7 @@ mod tests {
             &no_custom(),
             &mut m,
             |_conn, _cfg, _p| async move {
-                Err("oauth2 code-exchange returned HTTP 500 — oops".to_string())
+                Err("oauth2 code-exchange returned HTTP 500: oops".to_string())
             },
         )
         .await;

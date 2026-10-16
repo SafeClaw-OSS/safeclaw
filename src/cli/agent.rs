@@ -30,8 +30,8 @@ fn cloud_and_key() -> Result<(String, String), String> {
     let cloud = cfg
         .cloud_backend
         .filter(|s| !s.is_empty())
-        .ok_or("this device isn't paired — run `sc login` first")?;
-    let key = crate::sync::device_key().ok_or("no device-key — run `sc login` first")?;
+        .ok_or("this device isn't paired. Run `sc login` first")?;
+    let key = crate::sync::device_key().ok_or("no device-key. Run `sc login` first")?;
     Ok((cloud.trim_end_matches('/').to_string(), key))
 }
 

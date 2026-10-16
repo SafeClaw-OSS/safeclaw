@@ -71,7 +71,7 @@ fn run_ls() -> Result<(), String> {
         any = true;
     }
     if !any {
-        println!("(no settings yet — try `sc config set cb-port 23394`)");
+        println!("(no settings yet; try `sc config set cb-port 23394`)");
     }
     Ok(())
 }

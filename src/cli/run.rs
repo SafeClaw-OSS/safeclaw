@@ -22,7 +22,7 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     // that exactly one is present.
     if !args.export_env && args.cmd.is_empty() {
         return Err(
-            "nothing to run — `sc run -- <cmd>` to run a command, or `sc run --export-env`".into(),
+            "nothing to run: `sc run -- <cmd>` to run a command, or `sc run --export-env`".into(),
         );
     }
 
@@ -121,7 +121,7 @@ fn warn_git_url_specific_proxy(cmd: &[String]) {
         return;
     }
     eprintln!(
-        "note: your git config sets URL-specific proxies — git traffic to those URLs \
+        "note: your git config sets URL-specific proxies. Git traffic to those URLs \
          bypasses SafeClaw, so credential substitution won't happen there:\n{found}\n\
          Drop the key (`git config --unset <key>`) if that host should be brokered."
     );
@@ -216,7 +216,7 @@ fn agent_has_key() -> bool {
 async fn preflight(ca: &Path, control_root: &str) -> Result<(), String> {
     if !ca.exists() {
         return Err(format!(
-            "SafeClaw CA not found at {} — the daemon generates it on first start. Run `sc up`, then retry.",
+            "SafeClaw CA not found at {}. The daemon generates it on first start. Run `sc up`, then retry.",
             ca.display()
         ));
     }

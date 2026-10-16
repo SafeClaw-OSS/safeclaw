@@ -551,7 +551,7 @@ impl AppState {
             })
             .collect();
         let sc = crate::crypto::envelope::ScKeyPair::load_or_generate()
-            .expect("sc_sk load/generate failed — check ~/.safeclaw/crypto perms");
+            .expect("sc_sk load/generate failed. Check ~/.safeclaw/crypto perms");
         Self {
             config,
             vaults,

@@ -343,7 +343,7 @@ async fn remote_approve(
         _ = shutdown_signal() => {
             let withdrawn = cancel_op(custodian, op_id, waiter).await;
             return Err(if withdrawn {
-                "interrupted — the approval request was withdrawn".into()
+                "interrupted. The approval request was withdrawn".into()
             } else {
                 "interrupted".into()
             });
@@ -357,13 +357,13 @@ async fn remote_approve(
             if deadline_from_op {
                 // We read the op's real expiry and waited its whole window out.
                 return Err(format!(
-                    "the approval window expired — re-run the command for a fresh link (was {})",
+                    "the approval window expired. Re-run the command for a fresh link (was {})",
                     url
                 ));
             }
             if withdrawn {
                 return Err(format!(
-                    "stopped waiting after {}s and withdrew the request — re-run the command \
+                    "stopped waiting after {}s and withdrew the request. Re-run the command \
                      for a fresh link",
                     REMOTE_APPROVE_TIMEOUT_SECS
                 ));
@@ -372,7 +372,7 @@ async fn remote_approve(
             // op WAS registered and its cloud link is almost certainly still
             // live, so don't claim it expired.
             Err(format!(
-                "stopped waiting after {}s — if you haven't approved it yet the link is still \
+                "stopped waiting after {}s. If you haven't approved it yet the link is still \
                  live; approve it then re-run, or `sc op wait {}` to keep waiting. link: {}",
                 REMOTE_APPROVE_TIMEOUT_SECS, op_id, url
             ))
@@ -449,10 +449,10 @@ async fn remote_wait(
                 let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("");
                 return Err(RemoteWaitErr::Failed(match not_approved(reason) {
                     NotApproved::Superseded => "approval superseded by a newer request \
-                         (not a user rejection) — re-run the command"
+                         (not a user rejection). Re-run the command"
                         .into(),
                     NotApproved::Withdrawn => "the approval request was withdrawn \
-                         (not a user rejection) — re-run the command"
+                         (not a user rejection). Re-run the command"
                         .into(),
                     NotApproved::Other(r) => format!("not approved: {}", r),
                     NotApproved::Rejected => "approval was rejected".into(),
@@ -497,7 +497,7 @@ async fn local_ceremony(
     }
     let sc_pk = fetch_sc_pk(custodian).await?;
 
-    eprintln!("safeclaw {} — touch passkey…", label.to_lowercase());
+    eprintln!("safeclaw {}: touch passkey…", label.to_lowercase());
     let result = do_browser_gesture(
         custodian,
         op_id,

@@ -133,27 +133,19 @@ pub async fn run(args: SetupArgs, json_output: bool) -> Result<(), i32> {
             }
         };
 
-        let mut messages = Vec::new();
+        let mut notes = Vec::new();
         if skill.modified {
-            messages.push("The existing SafeClaw skill was modified, so it was left unchanged.".to_string());
+            notes.push("The existing SafeClaw skill was modified, so it was left unchanged.".to_string());
         }
-        messages.extend(skill.notes.clone());
-
-        if messages.is_empty() {
-            messages.push("SafeClaw setup is complete.".to_string());
-        }
+        notes.extend(skill.notes.clone());
         let vault_guidance = setup_vault_guidance(crate::cli::active::known_vaults().len());
-        let done_message = vault_guidance
-            .as_ref()
-            .map(|(message, _)| message.clone())
-            .unwrap_or_else(|| messages.join(" "));
         emit_done(
             json_output,
             &context.name,
             &env_path,
             &skill.paths,
-            &done_message,
-            vault_guidance.as_ref().map(|(_, next)| next.as_str()),
+            &notes,
+            vault_guidance.as_ref(),
         );
         return Ok(());
     }
@@ -198,15 +190,15 @@ async fn preconditions(
                         paired.trim_end_matches('/'),
                         selected
                     ),
-                    format!("Ask the user to run: sc login --profile {}", selected),
+                    format!("sc login --profile {}", selected),
                     1,
                 ));
             }
         }
         if crate::sync::device_key().is_none() {
             let fix = match profile.as_deref() {
-                Some(profile) => format!("Ask the user to run: sc login --profile {}", profile),
-                None => "Ask the user to run: sc login".to_string(),
+                Some(profile) => format!("sc login --profile {}", profile),
+                None => "sc login".to_string(),
             };
             return Err((
                 "This machine has pairing configuration but its device credential is missing."
@@ -689,68 +681,25 @@ fn base_command(context: &Context) -> String {
 }
 
 fn setup_command(name: &str, profile: Option<&str>) -> String {
-    let mut command = format!(
-        "{} setup --name {}",
-        shell_word(&running_binary()),
-        shell_word(name)
-    );
+    let mut command = format!("sc setup --name {}", shell_word(name));
     if let Some(profile) = profile {
         command.push_str(&format!(" --profile {}", shell_word(profile)));
     }
     command
 }
 
-fn running_binary() -> String {
-    let current = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(_) => return "sc".to_string(),
-    };
-    let current = fs::canonicalize(&current).unwrap_or(current);
-    let resolved = std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .map(|dir| dir.join("sc"))
-        .filter(|path| executable_on_path(path))
-        .filter_map(|path| fs::canonicalize(path).ok())
-        .next();
-    if resolved.as_ref() == Some(&current) {
-        "sc".to_string()
-    } else {
-        current.display().to_string()
-    }
-}
-
 fn setup_vault_guidance(known_vault_count: usize) -> Option<(String, String)> {
-    let binary = shell_word(&running_binary());
     match known_vault_count {
         0 => None,
         1 => Some((
             "The vault is locked.".to_string(),
-            format!("{} unlock", binary),
+            "sc unlock".to_string(),
         )),
         _ => Some((
-            "The vault is locked. Pick the vault to use: sc vault ls, then sc unlock --vault <name>."
+            "The vaults are locked. List them with sc vault ls, then run sc unlock --vault <name>."
                 .to_string(),
-            format!("{} vault ls", binary),
+            "sc vault ls".to_string(),
         )),
-    }
-}
-
-fn executable_on_path(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
     }
 }
 
@@ -768,16 +717,8 @@ fn shell_word(value: &str) -> String {
 
 fn emit_action(json_output: bool, context: &Context, status: &SetupStatus) {
     let url = status.url.as_deref().unwrap_or("");
-    let expires_in = status.expires_in;
-    let say = {
-        let code = status.code.as_deref().unwrap_or("");
-        let subject = if status.phase == "device" {
-            format!("this machine ({})", crate::cli::login::device_name(None))
-        } else {
-            format!("this agent ({})", status.name)
-        };
-        pairing_say(&subject, url, code, expires_in)
-    };
+    let code = status.code.as_deref();
+    let instruction = pairing_instruction(status.phase == "device", code.is_some());
     let next = if status.name.is_empty() {
         next_command(context, effective_profile(context, status))
     } else {
@@ -786,50 +727,57 @@ fn emit_action(json_output: bool, context: &Context, status: &SetupStatus) {
     if json_output {
         let mut object = Map::new();
         object.insert("status".into(), json!("action_required"));
-        object.insert("say".into(), json!(say));
+        object.insert("message".into(), json!(format!("{}.", instruction)));
         object.insert("url".into(), json!(url));
-        if let Some(code) = status.code.as_deref() {
+        if let Some(code) = code {
             object.insert("code".into(), json!(code));
         }
-        if let Some(seconds) = expires_in {
+        if let Some(seconds) = status.expires_in {
             object.insert("expires_in".into(), json!(seconds));
         }
         object.insert("next_step".into(), json!(next));
         println!("{}", Value::Object(object));
     } else {
-        println!("Action required: {}", say);
-        println!("URL: {}", url);
-        if let Some(code) = status.code.as_deref() {
-            println!("Code: {}", code);
+        println!("{}:", instruction);
+        println!("  {}", url);
+        if let Some(code) = code {
+            match expiry_phrase(status.expires_in) {
+                Some(expiry) => println!("  Code: {} ({})", code, expiry),
+                None => println!("  Code: {}", code),
+            }
         }
         println!("Next: {}", next);
     }
 }
 
-fn pairing_say(subject: &str, url: &str, code: &str, expires_in: Option<u64>) -> String {
-    let expiry = match expires_in {
-        Some(seconds) if seconds < 60 => "The code expires soon.".to_string(),
-        Some(seconds) => {
-            let minutes = (seconds.saturating_add(59)) / 60;
-            format!(
-                "The code expires in about {} {}.",
-                minutes,
-                if minutes == 1 { "minute" } else { "minutes" }
-            )
-        }
-        None => "The code expires soon.".to_string(),
+fn pairing_instruction(device: bool, has_code: bool) -> String {
+    let subject = if device { "this machine" } else { "this agent" };
+    let action = if has_code {
+        "enter the code"
+    } else {
+        "tap your passkey"
     };
-    format!(
-        "Ask the user to open {} and enter the code {} to pair {}. {}",
-        url, code, subject, expiry
-    )
+    format!("To pair {}, open this link and {}", subject, action)
+}
+
+fn expiry_phrase(expires_in: Option<u64>) -> Option<String> {
+    let seconds = expires_in?;
+    if seconds < 60 {
+        return Some("expires soon".to_string());
+    }
+    let minutes = seconds.saturating_add(59) / 60;
+    Some(format!(
+        "expires in about {} {}",
+        minutes,
+        if minutes == 1 { "minute" } else { "minutes" }
+    ))
 }
 
 fn emit_waiting(json_output: bool, next: &str) {
     if json_output {
         println!("{}", json!({ "status": "waiting", "next_step": next }));
     } else {
-        println!("The user has not finished the browser approval yet.");
+        println!("Waiting for approval in the browser.");
         println!("Next: {}", next);
     }
 }
@@ -839,42 +787,47 @@ fn emit_done(
     name: &str,
     env_file: &Path,
     skill_paths: &[PathBuf],
-    message: &str,
-    next_step: Option<&str>,
+    notes: &[String],
+    vault_guidance: Option<&(String, String)>,
 ) {
-    let paths: Vec<String> = skill_paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect();
+    let load_env = format!(
+        "set -a; . {}; set +a",
+        shell_word(&env_file.display().to_string())
+    );
     if json_output {
+        let paths: Vec<String> = skill_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        let mut messages = notes.to_vec();
+        if let Some((message, _)) = vault_guidance {
+            messages.push(message.clone());
+        }
+        if messages.is_empty() {
+            messages.push("SafeClaw setup is complete.".to_string());
+        }
         let mut object = Map::new();
         object.insert("status".into(), json!("done"));
         object.insert("name".into(), json!(name));
         object.insert("env_file".into(), json!(env_file.display().to_string()));
         object.insert("skill_paths".into(), json!(paths));
-        object.insert("message".into(), json!(message));
-        object.insert(
-            "load_env".into(),
-            json!(format!("set -a; . {}; set +a", shell_word(&env_file.display().to_string()))),
-        );
-        if let Some(next_step) = next_step {
+        object.insert("message".into(), json!(messages.join(" ")));
+        object.insert("load_env".into(), json!(load_env));
+        if let Some((_, next_step)) = vault_guidance {
             object.insert("next_step".into(), json!(next_step));
         }
         println!("{}", Value::Object(object));
     } else {
-        println!("SafeClaw setup is done for agent '{}'.", name);
-        println!("Environment file: {}", env_file.display());
-        for path in skill_paths {
-            println!("Skill path: {}", path.display());
+        println!("Agent {} is set up.", name);
+        for note in notes {
+            println!("{}", note);
         }
-        println!("Done: {}", message);
-        if let Some(next_step) = next_step {
+        println!("To run sc as {}, load its environment:", name);
+        println!("  {}", load_env);
+        if let Some((message, next_step)) = vault_guidance {
+            println!("{}", message);
             println!("Next: {}", next_step);
         }
-        println!(
-            "Before using sc run in a new session, load this agent's environment: set -a; . {}; set +a",
-            shell_word(&env_file.display().to_string())
-        );
     }
 }
 
@@ -932,12 +885,19 @@ mod setup_tests {
     use super::*;
 
     #[test]
-    fn pairing_wording_uses_soon_and_singular_minute() {
-        let soon = pairing_say("this agent (codex)", "https://example.test", "1234", Some(59));
-        assert!(soon.ends_with("The code expires soon."));
-        let singular = pairing_say("this agent (codex)", "https://example.test", "1234", Some(60));
-        assert!(singular.ends_with("The code expires in about 1 minute."));
-        assert!(!singular.contains("1 minutes"));
+    fn pairing_wording_names_the_step_and_expiry() {
+        assert_eq!(
+            pairing_instruction(true, true),
+            "To pair this machine, open this link and enter the code"
+        );
+        assert_eq!(
+            pairing_instruction(false, false),
+            "To pair this agent, open this link and tap your passkey"
+        );
+        assert_eq!(expiry_phrase(Some(601)).as_deref(), Some("expires in about 11 minutes"));
+        assert_eq!(expiry_phrase(Some(60)).as_deref(), Some("expires in about 1 minute"));
+        assert_eq!(expiry_phrase(Some(59)).as_deref(), Some("expires soon"));
+        assert_eq!(expiry_phrase(None), None);
     }
 
     #[test]
@@ -945,7 +905,7 @@ mod setup_tests {
         let status = SetupStatus::new("agent", "needs_user", 42, "other", Some("dev".into()));
         let (message, fix) = name_mismatch_details("codex", &status).unwrap();
         assert_eq!(message, "Setup for agent 'other' is in progress.");
-        assert!(fix.ends_with(" setup --name other --profile dev --wait"));
+        assert_eq!(fix, "sc setup --name other --profile dev --wait");
     }
 
     #[test]
@@ -964,8 +924,10 @@ mod setup_tests {
             setup_dir: PathBuf::from("/tmp/setup"),
         };
         assert_eq!(effective_profile(&explicit, &status), Some("prod"));
-        assert!(next_command(&context, effective_profile(&context, &status))
-            .ends_with(" setup --name codex --profile dev --wait"));
+        assert_eq!(
+            next_command(&context, effective_profile(&context, &status)),
+            "sc setup --name codex --profile dev --wait"
+        );
     }
 
     #[test]
@@ -974,14 +936,14 @@ mod setup_tests {
 
         let (message, next) = setup_vault_guidance(1).unwrap();
         assert_eq!(message, "The vault is locked.");
-        assert!(next.ends_with(" unlock"));
+        assert_eq!(next, "sc unlock");
 
         let (message, next) = setup_vault_guidance(2).unwrap();
         assert_eq!(
             message,
-            "The vault is locked. Pick the vault to use: sc vault ls, then sc unlock --vault <name>."
+            "The vaults are locked. List them with sc vault ls, then run sc unlock --vault <name>."
         );
-        assert!(next.ends_with(" vault ls"));
+        assert_eq!(next, "sc vault ls");
     }
 }
 
@@ -999,31 +961,4 @@ fn write_pid_file(path: &Path, pid: u32) -> Result<(), String> {
             .map_err(|e| format!("chmod 0600 {}: {}", path.display(), e))?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn say_sentence_uses_known_and_unknown_expiry() {
-        assert_eq!(
-            pairing_say(
-                "this machine (box)",
-                "https://safeclaw.pro/pair",
-                "1234-5678-9012",
-                Some(601),
-            ),
-            "Ask the user to open https://safeclaw.pro/pair and enter the code 1234-5678-9012 to pair this machine (box). The code expires in about 11 minutes."
-        );
-        assert_eq!(
-            pairing_say(
-                "this agent (claude-code)",
-                "https://safeclaw.pro/pair",
-                "1234-5678-9012",
-                None,
-            ),
-            "Ask the user to open https://safeclaw.pro/pair and enter the code 1234-5678-9012 to pair this agent (claude-code). The code expires soon."
-        );
-    }
 }

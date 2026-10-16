@@ -114,7 +114,7 @@ pub fn build_adapter(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
                     AdapterError::Config(format!(
-                        "store '{}': gcp-secret-manager requires `credentials_item` (string — name of the SA JSON in native-secrets)",
+                        "store '{}': gcp-secret-manager requires `credentials_item` (string; name of the SA JSON in native-secrets)",
                         store_id
                     ))
                 })?;

@@ -35,17 +35,11 @@ sc setup
 
 `--name <a short name for the agent>` is optional and defaults to the agent's
 product name, such as `claude-code` or `codex`.
-`sc setup` never prompts. Read its status and follow the loop until it reports
-`done`:
-
-- `action_required`: relay the `say` sentence exactly. It tells the person to
-  open the `/pair` address and type the code shown, or open a link and approve
-  with a passkey. Then run the printed `next_step`.
-- `waiting`: run the printed `next_step` again.
-- `done`: if it has a `next_step`, run it. After the machine and agent are
-  approved, this unlocks the vault: `sc unlock` prints a link for the person and
-  the `sc op wait` command. Run that wait command and continue after approval.
-- `error`: apply the printed `fix`, then run setup again as directed.
+`sc setup` never prompts. Give the person any link and code it prints (they
+open the link and enter the code), then run its `Next:` command. Repeat until a
+run prints no `Next:`. After an error, run the printed `Fix:`. The last `Next:`
+is usually `sc unlock`: it prints a link for the person and an `sc op wait`
+command. Run that wait command and continue after approval.
 
 The browser sequence is: the person signs in or creates an account, creates a
 passkey, and approves the machine; approves the agent and chooses which vaults

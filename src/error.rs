@@ -395,9 +395,9 @@ impl ScCode {
 pub const VAULT_LOCKED_MSG: &str = "vault locked. Run `sc unlock`, then retry";
 
 pub const VAULT_ACCESS_REVOKED_MSG: &str =
-    "This device can no longer use this vault: your account was removed from it. Ask a vault admin to add you back.";
+    "This device can no longer use this vault: its account was removed from it.";
 
-pub const VAULT_KEY_CHANGED_MSG: &str = "This connection may have been added after the vault's members changed and its key was replaced. This device doesn't have the new key yet: ask the user to approve `sc unlock`.";
+pub const VAULT_KEY_CHANGED_MSG: &str = "This connection may have been added after the vault's members changed and its key was replaced. This device doesn't have the new key yet. Run `sc unlock`.";
 
 pub const VAULT_KEY_CHANGED_STATUS_MSG: &str = "key changed: this vault's members changed (someone was removed), so it has a new key. Run `sc unlock` once to see what was added since; existing credentials keep working.";
 
@@ -608,7 +608,7 @@ mod tests {
         let (code, message) = AppError::VaultAccessRevoked.code();
         assert_eq!(code, ScCode::VaultAccessRevoked);
         assert_eq!(message, VAULT_ACCESS_REVOKED_MSG);
-        assert!(message.contains("Ask a vault admin to add you back."));
+        assert!(message.contains("its account was removed from it"));
     }
 
     #[test]
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(ScCode::VaultKeyChanged.row().3, "unlock");
         assert_eq!(
             VAULT_KEY_CHANGED_MSG,
-            "This connection may have been added after the vault's members changed and its key was replaced. This device doesn't have the new key yet: ask the user to approve `sc unlock`."
+            "This connection may have been added after the vault's members changed and its key was replaced. This device doesn't have the new key yet. Run `sc unlock`."
         );
     }
 

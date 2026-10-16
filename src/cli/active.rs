@@ -245,7 +245,7 @@ fn known_file_parse_error() -> Result<Option<Vec<KnownVault>>, String> {
 fn update_known_vaults<F: FnOnce(&mut Vec<KnownVault>)>(mutate: F) -> Result<(), String> {
     if let Err(e) = known_file_parse_error() {
         return Err(format!(
-            "refusing to rewrite the vault catalog: {} — fix or delete the file, then retry",
+            "refusing to rewrite the vault catalog: {}. Fix or delete the file, then retry",
             e
         ));
     }
@@ -817,7 +817,7 @@ fn validate_vault_id_arg(v: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "'{}' is not a vault id (ids use letters, digits, '-' and '_') — run `sc vault ls` and pass the id from the `/v/<id>` part of the URL",
+            "'{}' is not a vault id (ids use letters, digits, '-' and '_'). Run `sc vault ls` and pass the id from the `/v/<id>` part of the URL",
             v
         ))
     }
@@ -877,7 +877,7 @@ pub fn resolve_vault_token(token: &str, cfg: &CliConfig) -> Result<(String, Stri
         return Ok((daemon, token.to_string()));
     }
     Err(format!(
-        "no vault matches '{}' — run `sc vault ls` and pass its id, a unique id prefix, or its exact name (quote a name with spaces)",
+        "no vault matches '{}'. Run `sc vault ls` and pass its id, a unique id prefix, or its exact name (quote a name with spaces)",
         token
     ))
 }
@@ -897,7 +897,7 @@ fn ambiguous_vault_err(token: &str, by: &str, cands: &[&KnownVault]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "'{}' matches {} vaults by {} — be specific (use the id or a unique prefix):\n{}",
+        "'{}' matches {} vaults by {}. Be specific (use the id or a unique prefix):\n{}",
         token,
         cands.len(),
         by,

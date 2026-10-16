@@ -37,7 +37,7 @@ pub async fn run(_args: SyncArgs) -> Result<(), String> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         eprintln!(
-            "safeclaw sync — ok ({})",
+            "safeclaw sync: ok ({})",
             sync_summary(pulled, key_changed)
         );
         if key_changed {
@@ -110,7 +110,7 @@ fn report_connects(connects: Option<&serde_json::Value>) {
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("rejected");
-            eprintln!("  {conn}: connect failed ({reason}) — reconnect from the console.");
+            eprintln!("  {conn}: connect failed ({reason}). Reconnect from the console.");
         }
     }
 
@@ -126,7 +126,7 @@ fn report_connects(connects: Option<&serde_json::Value>) {
             .and_then(|v| v.as_str())
             .unwrap_or("the provider");
         eprintln!(
-            "  {}: couldn't reach {host} (network/proxy?) — will retry. \
+            "  {}: couldn't reach {host} (network/proxy?); will retry. \
              Behind a proxy? `sc proxy set <url>`.",
             unreached.join(", ")
         );

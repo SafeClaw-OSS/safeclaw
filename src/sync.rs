@@ -29,7 +29,7 @@ use crate::sync_stream::{Mode, StreamHealth, WakeCell, Work};
 
 #[cfg(test)]
 const REVOKED_REASON: &str =
-    "this device can no longer use this vault: your account was removed from it";
+    "this device can no longer use this vault: its account was removed from it";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum VaultRefusal {
@@ -305,7 +305,7 @@ pub struct SyncOutcome {
 
 pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<SyncOutcome, String> {
     let cfg = active::load().map_err(|_| {
-        "not set up yet — run `sc login` to pair this daemon with the cloud".to_string()
+        "not set up yet. Run `sc login` to pair this daemon with the cloud".to_string()
     })?;
     // `sc sync` only makes sense for a cloud-paired daemon. Distinguish the two
     // not-logged-in shapes so the message guides the user (mainstream: gcloud /
@@ -315,12 +315,12 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
         .as_deref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            "local-only daemon (no cloud backend) — nothing to sync from the cloud; \
+            "local-only daemon (no cloud backend). Nothing to sync from the cloud; \
              run `sc login` to pair"
                 .to_string()
         })?;
     let dk = device_key().ok_or_else(|| {
-        "this daemon isn't paired with the cloud — run `sc login` first".to_string()
+        "this daemon isn't paired with the cloud. Run `sc login` first".to_string()
     })?;
     let pulled_response = pull(&state.config.state_dir, cloud, vault_id, &dk).await;
     let pulled = match pulled_response {
@@ -443,9 +443,9 @@ pub async fn resync_membership_now(state: &Arc<AppState>, vault_id: &str) -> Res
         .cloud_backend
         .as_deref()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "local-only daemon (no cloud) — cannot resync membership".to_string())?;
+        .ok_or_else(|| "local-only daemon (no cloud). Cannot resync membership".to_string())?;
     let dk =
-        device_key().ok_or_else(|| "daemon not paired — cannot resync membership".to_string())?;
+        device_key().ok_or_else(|| "daemon not paired. Cannot resync membership".to_string())?;
     let pulled = pull_membership(
         &state.config.state_dir,
         cloud,

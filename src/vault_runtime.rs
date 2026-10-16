@@ -30,7 +30,7 @@ impl TombstoneReason {
     pub fn rejection_reason(self) -> &'static str {
         match self {
             Self::Removed => {
-                "this device can no longer use this vault: your account was removed from it"
+                "this device can no longer use this vault: its account was removed from it"
             }
             Self::Deleted => "This vault was deleted.",
             Self::DeviceRevoked => crate::error::LEDGER_DEVICE_REVOKED_MSG,

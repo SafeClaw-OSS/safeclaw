@@ -291,7 +291,7 @@ pub async fn exchange_code(
             .unwrap_or_else(|_| "<no body>".to_string());
         tracing::warn!("oauth2 code-exchange error body: {}", body_text);
         return Err(format!(
-            "oauth2 code-exchange returned HTTP {} — {}",
+            "oauth2 code-exchange returned HTTP {}: {}",
             status, body_text
         ));
     }
@@ -377,7 +377,7 @@ pub async fn perform_refresh(
             .unwrap_or_else(|_| "<no body>".to_string());
         tracing::warn!("oauth2 refresh error body: {}", body_text);
         return Err(format!(
-            "oauth2 refresh returned HTTP {} — {}",
+            "oauth2 refresh returned HTTP {}: {}",
             status, body_text
         ));
     }

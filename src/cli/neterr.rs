@@ -21,7 +21,7 @@ pub fn is_unreachable(err: &reqwest::Error) -> bool {
 /// way; adds the proxy hint only when the failure is a reachability one.
 pub fn reach_failed(target: &str, err: &reqwest::Error) -> String {
     if is_unreachable(err) {
-        format!("couldn't reach {target}: {err} — {PROXY_HINT}.")
+        format!("couldn't reach {target}: {err}; {PROXY_HINT}.")
     } else {
         format!("couldn't reach {target}: {err}")
     }
@@ -35,7 +35,7 @@ pub fn with_proxy_hint(msg: &str) -> String {
     if msg.contains("sc proxy set") || !looks_unreachable(msg) {
         return msg.to_string();
     }
-    format!("{msg} — {PROXY_HINT}.")
+    format!("{msg}; {PROXY_HINT}.")
 }
 
 /// Heuristic: does a stringified error read as a reachability failure? Used only

@@ -320,7 +320,7 @@ pub async fn run(json: bool) -> Result<(), String> {
             println!("  vaults:  {}", n);
         }
     } else {
-        println!("  state:   not running — bring it up with `sc up`");
+        println!("  state:   not running. Bring it up with `sc up`");
     }
     println!("  control: {}", control);
     println!("  broker:  {} (agent face; wired by `sc run`)", broker);
@@ -346,7 +346,7 @@ pub async fn run(json: bool) -> Result<(), String> {
             println!("  cloud: {} ({})", host, env_label(host));
             println!("  device: {}", ledger_line(&d));
         }
-        None => println!("  state: not logged in — run `sc login`"),
+        None => println!("  state: not logged in. Run `sc login`"),
     }
     println!();
 
@@ -366,7 +366,7 @@ pub async fn run(json: bool) -> Result<(), String> {
                 );
                 println!("  hint:  run `sc vault ls` to pick another, or `sc login` to pair again");
             } else if d.vault_count == Some(0) {
-                println!("  hint:  no vaults yet — seal one on the web, then `sc login`");
+                println!("  hint:  no vaults yet. Seal one on the web, then `sc login`");
             } else if crate::cli::active::known_vaults().is_empty() {
                 println!("  hint:  pick one with `sc vault use`, or `sc vault create`");
             } else {
@@ -492,7 +492,7 @@ pub fn print_status(s: &VaultStatus) {
     match &s.state {
         VaultState::Unreachable => {
             if s.url.contains("//localhost") || s.url.contains("//127.0.0.1") {
-                println!("  state:    unreachable — bring the daemon up with `sc up`");
+                println!("  state:    unreachable. Bring the daemon up with `sc up`");
             } else {
                 println!("  state:    unreachable (is the daemon running?)");
             }
