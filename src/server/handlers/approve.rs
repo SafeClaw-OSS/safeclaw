@@ -27,16 +27,14 @@ use crate::approval::ApprovalStatus;
 use crate::audit::{STATUS_APPROVED, STATUS_REJECTED};
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
-use crate::protocol::operation::{
-    as_export_path, decode_credential_id, discriminator, ActType,
-};
 use crate::protocol::grant::{delivery_form, DeliveredVaultKey, DeliveryForm};
+use crate::protocol::operation::{as_export_path, decode_credential_id, discriminator, ActType};
 use crate::protocol::{render_operation, validate_batch_grant, validate_grant, Grant};
 use crate::state::{AppState, ApprovalEvent, SecretsCache};
 use crate::storage::plaintext::{Category, VaultPlaintextView};
 use crate::storage::sealed_vault::{
-    find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item,
-    write_atomic, ApprovalAuthority, PerItemVault,
+    find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item, write_atomic,
+    ApprovalAuthority, PerItemVault,
 };
 use std::collections::BTreeSet;
 
@@ -691,8 +689,14 @@ fn verify_grant_identity(
         .and_then(|v| <[u8; 64]>::try_from(v.as_slice()).ok())
         .ok_or_else(|| invalid("the approval carries no valid identity signature"))?;
     let (Some(k_enc), Some(k_ct)) = (
-        grant.k_enc.as_deref().and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()),
-        grant.k_ct.as_deref().and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()),
+        grant
+            .k_enc
+            .as_deref()
+            .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()),
+        grant
+            .k_ct
+            .as_deref()
+            .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()),
     ) else {
         return Err(AppError::BadRequest(
             "a sealed grant needs both k_enc and k_ct (base64url)".into(),
@@ -708,9 +712,8 @@ fn verify_grant_identity(
         &serde_json::to_value(stored_op)?,
     )?;
     let sc_pk = state.sc.pk_bytes();
-    let input = crate::identity::grant_id_input(
-        vault_id, op_id, &beta, &cid, &k_enc, &k_ct, &sc_pk, id,
-    );
+    let input =
+        crate::identity::grant_id_input(vault_id, op_id, &beta, &cid, &k_enc, &k_ct, &sc_pk, id);
     let certifies =
         |pk: &[u8; 32]| crate::identity::derive_id(crate::identity::IdKind::User, pk) == id;
     let sig_pub = paired_account_pub()
@@ -800,7 +803,9 @@ fn open_grant_seal(
     let ct = URL_SAFE_NO_PAD
         .decode(ct_b64)
         .map_err(|_| AppError::BadRequest(format!("{name}_ct not base64url")))?;
-    Ok(zeroize::Zeroizing::new(state.sc.open(&enc, &ct, info, b"")?))
+    Ok(zeroize::Zeroizing::new(
+        state.sc.open(&enc, &ct, info, b"")?,
+    ))
 }
 
 /// Open the vault key a grant delivers (`k_*`, sealed to this daemon's `sc_pk`
@@ -919,15 +924,10 @@ pub async fn approve_op(
     // on-disk state and race to write_atomic — the second rename wins
     // silently. This per-vault async mutex ensures the full read-validate-
     // write cycle is atomic per vault without blocking unrelated vaults.
-    let vault_write_lock = {
-        let mut locks = state.vault_write_locks.lock().unwrap();
-        Arc::clone(
-            locks
-                .entry(vault_id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
-    };
-    let _vault_write_guard = vault_write_lock.lock().await;
+    let _vault_write_guard = state
+        .vault_write_guard(&vault_id)
+        .await
+        .map_err(|_| AppError::VaultAccessRevoked)?;
 
     // 3a. Re-check UNDER the vault write lock (design/approvals-inbox.md D1,
     // atomic apply). One intent chain is always one vault (redeemer ==
@@ -1569,7 +1569,9 @@ pub async fn approve_op(
                     }
                 }
                 if removed {
-                    crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)?;
+                    crate::auth::connect::persist_mutated_view(
+                        &state, &vault_id, &base, &view, &k,
+                    )?;
                     {
                         let state = state.clone();
                         let vid = vault_id.clone();
@@ -1908,12 +1910,11 @@ pub async fn approve_op(
                 // The service def, resolved as mint and the proxy resolve it:
                 // the vault's valid custom defs (never shadowing a built-in
                 // id), else the compiled registry.
-                let (custom_defs, _) =
-                    crate::service::vault_custom_services(
-            &view.aux.services,
-            view.aux.allows_installed_services(),
-            &state.services,
-        );
+                let (custom_defs, _) = crate::service::vault_custom_services(
+                    &view.aux.services,
+                    view.aux.allows_installed_services(),
+                    &state.services,
+                );
                 let def: Option<crate::service::ServiceDef> = match &service {
                     None => None,
                     Some(svc) => Some(
@@ -2875,12 +2876,11 @@ pub(crate) fn bootstrap_cache_from_view(
     // Custom (per-vault `aux.services`) definitions: validate before they can
     // broker (defense in depth — never trust the stored blob), never shadow a
     // built-in id, load only if valid. Wiped on lock with the rest of the cache.
-    let (custom, skipped) =
-        crate::service::vault_custom_services(
-            &view.aux.services,
-            view.aux.allows_installed_services(),
-            &state.services,
-        );
+    let (custom, skipped) = crate::service::vault_custom_services(
+        &view.aux.services,
+        view.aux.allows_installed_services(),
+        &state.services,
+    );
     for (service_id, reason) in skipped {
         tracing::warn!(service = %service_id, "custom service {} — skipped", reason);
     }
@@ -3196,7 +3196,8 @@ mod tests {
         )
         .unwrap();
         pv.seed_items_from_view::<S>(keys, vid, &view).unwrap();
-        let rule = wire_id_for::<S>(&k, ItemNs::Policy, &format!("{}gh", POLICY_CONNECTION)).unwrap();
+        let rule =
+            wire_id_for::<S>(&k, ItemNs::Policy, &format!("{}gh", POLICY_CONNECTION)).unwrap();
         assert!(pv.items.contains_key(&rule), "the rule is its own record");
 
         // A keyset: the rule stays in the view (and the device writes no
@@ -3204,7 +3205,13 @@ mod tests {
         let mut kept = pv.fold_view::<S>(keys, vid).unwrap();
         apply_connection_rm_to_view(&mut kept, "gh", true, true, &reg).unwrap();
         assert!(!kept.aux.connections.contains_key("gh"));
-        assert!(kept.aux.policy.as_ref().unwrap().connections.contains_key("gh"));
+        assert!(kept
+            .aux
+            .policy
+            .as_ref()
+            .unwrap()
+            .connections
+            .contains_key("gh"));
 
         // No keyset: the rule goes with the connection, as a tombstone.
         let mut gone = pv.fold_view::<S>(keys, vid).unwrap();
@@ -3216,7 +3223,11 @@ mod tests {
         assert!(r.changed.contains(&rule), "{:?}", r.changed);
         assert!(pv.items[&rule].tombstone);
         let after = pv.fold_view::<S>(keys, vid).unwrap();
-        assert!(!after.aux.policy.as_ref().is_some_and(|p| p.connections.contains_key("gh")));
+        assert!(!after
+            .aux
+            .policy
+            .as_ref()
+            .is_some_and(|p| p.connections.contains_key("gh")));
 
         // A later connection of the same id starts without it.
         let base = ViewBase::of(&after).unwrap();
@@ -3226,7 +3237,11 @@ mod tests {
             .unwrap();
         let now = pv.fold_view::<S>(keys, vid).unwrap();
         assert!(now.aux.connections.contains_key("gh"));
-        assert!(!now.aux.policy.as_ref().is_some_and(|p| p.connections.contains_key("gh")));
+        assert!(!now
+            .aux
+            .policy
+            .as_ref()
+            .is_some_and(|p| p.connections.contains_key("gh")));
     }
 
     // The shared secret-set mutation is the SSOT for BOTH write paths (grant
@@ -5196,12 +5211,20 @@ mod tests {
         let c = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let (ax, ay) = xy(&admin);
         let (cx, cy) = xy(&c);
-        pv.set_approver_credential(ADMIN_CID, &admin_id, &ax, &ay).unwrap();
+        pv.set_approver_credential(ADMIN_CID, &admin_id, &ax, &ay)
+            .unwrap();
         pv.set_approver_credential(C_CID, &c_id, &cx, &cy).unwrap();
         let keys = VaultKeys::single(&VAULT_K);
         for (name, value) in [("FOO", "foo-value"), ("BAR", "bar-value")] {
-            pv.plant::<S>(keys, vault, ItemNs::Secret, name, 1, &ItemPayload::secret_live(name, value))
-                .unwrap();
+            pv.plant::<S>(
+                keys,
+                vault,
+                ItemNs::Secret,
+                name,
+                1,
+                &ItemPayload::secret_live(name, value),
+            )
+            .unwrap();
         }
         let path = state.vaults.per_item_path(vault).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -5243,12 +5266,11 @@ mod tests {
                 .unwrap()
                 .issue("127.0.0.1".parse().unwrap())
                 .unwrap();
-            let id = self
-                .state
-                .approvals
-                .lock()
-                .unwrap()
-                .create(self.vault.into(), op.clone(), r.clone());
+            let id = self.state.approvals.lock().unwrap().create(
+                self.vault.into(),
+                op.clone(),
+                r.clone(),
+            );
             self.ids.borrow_mut().insert(r.clone(), id.clone());
             (op, r, id)
         }
@@ -5280,8 +5302,10 @@ mod tests {
             let mut g = plain_grant(op.clone(), r);
             g.credential_id = cid.into();
             g.assertion = Some(assertion_over(key, &beta));
-            let (enc, ct) =
-                self.seal(material, &crate::crypto::envelope::grant_k_seal_info(seal_for));
+            let (enc, ct) = self.seal(
+                material,
+                &crate::crypto::envelope::grant_k_seal_info(seal_for),
+            );
             g.k_enc = Some(enc);
             g.k_ct = Some(ct);
             self.sign_id(g)
@@ -5344,7 +5368,10 @@ mod tests {
             assert!(matches!(rec.status, ApprovalStatus::Pending));
             assert_eq!(rec.fail_count, 0);
             drop(store);
-            assert!(self.state.challenges.lock().unwrap().peek(r), "challenge not consumed");
+            assert!(
+                self.state.challenges.lock().unwrap().peek(r),
+                "challenge not consumed"
+            );
         }
     }
 
@@ -5384,15 +5411,27 @@ mod tests {
         let d = b_daemon("-kadmin");
         let (op, r, id) = d.raise("FOO");
         let v = d
-            .approve(&id, d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id))
+            .approve(
+                &id,
+                d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id),
+            )
             .await
             .unwrap();
         assert_eq!(v["value"], "foo-value");
         assert!(matches!(
-            d.state.approvals.lock().unwrap().get_any(&id).unwrap().status,
+            d.state
+                .approvals
+                .lock()
+                .unwrap()
+                .get_any(&id)
+                .unwrap()
+                .status,
             ApprovalStatus::Approved
         ));
-        assert!(!d.state.challenges.lock().unwrap().peek(&r), "consumed once applied");
+        assert!(
+            !d.state.challenges.lock().unwrap().peek(&r),
+            "consumed once applied"
+        );
 
         let bundle = [VAULT_K, VAULT_K].concat();
         let (op, r, id) = d.raise("BAR");
@@ -5420,7 +5459,10 @@ mod tests {
         assert_eq!(err.code().0.status(), 403);
         d.assert_untouched(&id, &r);
         let v = d
-            .approve(&id, d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id))
+            .approve(
+                &id,
+                d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id),
+            )
             .await
             .unwrap();
         assert_eq!(v["value"], "foo-value");
@@ -5451,7 +5493,10 @@ mod tests {
         g.k_enc = Some("not base64url!".into());
         bad.push(("not base64url", g));
         let mut g = good();
-        let (enc, ct) = d.seal(&[0x42u8; 48], &crate::crypto::envelope::grant_k_seal_info(&id));
+        let (enc, ct) = d.seal(
+            &[0x42u8; 48],
+            &crate::crypto::envelope::grant_k_seal_info(&id),
+        );
         (g.k_enc, g.k_ct) = (Some(enc), Some(ct));
         bad.push(("48 bytes", d.sign_id(g)));
         for (why, grant) in bad {
@@ -5462,7 +5507,16 @@ mod tests {
         // A wrong vault key (well sealed) opens nothing: the apply fails, the
         // value never leaves.
         let err = d
-            .approve(&other_id, d.k_grant((&other_op, &other_r), ADMIN_CID, &d.admin, &[7u8; 32], &other_id))
+            .approve(
+                &other_id,
+                d.k_grant(
+                    (&other_op, &other_r),
+                    ADMIN_CID,
+                    &d.admin,
+                    &[7u8; 32],
+                    &other_id,
+                ),
+            )
             .await;
         assert!(err.is_err(), "a wrong vault key applies nothing");
         let v = d.approve(&id, good()).await.unwrap();
@@ -5478,13 +5532,20 @@ mod tests {
         let (op, r, id) = d.raise("FOO");
         let good = || d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id);
         let mut both = good();
-        let (enc, ct) = d.seal(&[0x11u8; 32], &crate::crypto::envelope::grant_seal_info(&id));
+        let (enc, ct) = d.seal(
+            &[0x11u8; 32],
+            &crate::crypto::envelope::grant_seal_info(&id),
+        );
         (both.wk_enc, both.wk_ct) = (Some(enc), Some(ct));
         let mut plain_and_k = good();
         plain_and_k.wrapping_key = Some(STANDARD.encode([0x11u8; 32]));
         let mut neither = good();
         (neither.k_enc, neither.k_ct) = (None, None);
-        for (why, grant) in [("wk_* and k_*", both), ("wrapping_key and k_*", plain_and_k), ("neither", neither)] {
+        for (why, grant) in [
+            ("wk_* and k_*", both),
+            ("wrapping_key and k_*", plain_and_k),
+            ("neither", neither),
+        ] {
             let err = d.approve(&id, grant).await.unwrap_err();
             assert!(matches!(err, AppError::BadRequest(_)), "{why}: {err}");
             d.assert_untouched(&id, &r);
@@ -5528,7 +5589,10 @@ mod tests {
         pv.set_registry_pubkey(ADMIN_CID, "x", "y", "").unwrap();
         let only = |id: &str| -> BTreeSet<String> { [id.to_string()].into() };
         assert_eq!(requester_identities(&pv, Some(b_id.clone())), only(&b_id));
-        assert_eq!(requester_identities(&pv, Some("us_other".into())), only("us_other"));
+        assert_eq!(
+            requester_identities(&pv, Some("us_other".into())),
+            only("us_other")
+        );
         // The approver label (as the membership serves it) takes the admin out
         // of the fallback too.
         pv.keyset
@@ -5540,7 +5604,11 @@ mod tests {
         assert_eq!(requester_identities(&pv, None), only(&b_id));
         // So the admin approving B's op is an admin, never "the requester".
         assert_eq!(
-            pv.approval_authority(vault, &requester_identities(&pv, Some(b_id.clone())), &admin_id),
+            pv.approval_authority(
+                vault,
+                &requester_identities(&pv, Some(b_id.clone())),
+                &admin_id
+            ),
             ApprovalAuthority::Admin
         );
     }
@@ -5569,8 +5637,10 @@ mod tests {
             let mut g = batch_grant(op.clone(), r, ids.clone());
             g.credential_id = ADMIN_CID.into();
             g.batch.as_mut().unwrap().assertion = assertion.clone();
-            let (enc, ct) =
-                d.seal(&VAULT_K, &crate::crypto::envelope::grant_k_seal_info(seal_for));
+            let (enc, ct) = d.seal(
+                &VAULT_K,
+                &crate::crypto::envelope::grant_k_seal_info(seal_for),
+            );
             (g.k_enc, g.k_ct) = (Some(enc), Some(ct));
             d.sign_id(g)
         };
@@ -5580,7 +5650,10 @@ mod tests {
 
         let v1 = d.approve(&id1, row(&op1, &r1, &id1)).await.unwrap();
         let v2 = d.approve(&id2, row(&op2, &r2, &id2)).await.unwrap();
-        assert_eq!((v1["value"].as_str(), v2["value"].as_str()), (Some("foo-value"), Some("bar-value")));
+        assert_eq!(
+            (v1["value"].as_str(), v2["value"].as_str()),
+            (Some("foo-value"), Some("bar-value"))
+        );
     }
 
     // ── grant v3: the vault key + the approver's identity signature ────────
@@ -5593,7 +5666,10 @@ mod tests {
         let d = b_daemon("-v3wk");
         let (op, r, id) = d.raise("FOO");
         let mut sealed = d.k_grant((&op, &r), "Yw", &d.c, &VAULT_K, &id);
-        let (enc, ct) = d.seal(&[0x22u8; 32], &crate::crypto::envelope::grant_seal_info(&id));
+        let (enc, ct) = d.seal(
+            &[0x22u8; 32],
+            &crate::crypto::envelope::grant_seal_info(&id),
+        );
         (sealed.k_enc, sealed.k_ct) = (None, None);
         (sealed.wk_enc, sealed.wk_ct) = (Some(enc), Some(ct));
         let mut plain = d.k_grant((&op, &r), "Yw", &d.c, &VAULT_K, &id);
@@ -5650,7 +5726,9 @@ mod tests {
         g.id_sig = None;
         bad.push(("no signature", g));
         let mut g = good();
-        let mut sig = URL_SAFE_NO_PAD.decode(g.id_sig.as_deref().unwrap()).unwrap();
+        let mut sig = URL_SAFE_NO_PAD
+            .decode(g.id_sig.as_deref().unwrap())
+            .unwrap();
         sig[0] ^= 1;
         g.id_sig = Some(URL_SAFE_NO_PAD.encode(sig));
         bad.push(("tampered", g));
@@ -5663,9 +5741,11 @@ mod tests {
         let (_o2, _r2, other) = d.raise("BAR");
         let mut g = good();
         let uik = UikRoot::from_root([0x11u8; 32]);
-        g.id_sig = Some(URL_SAFE_NO_PAD.encode(
-            uik.signing().sign(&d.id_input(&g, &other, &uik.user_id())),
-        ));
+        g.id_sig = Some(URL_SAFE_NO_PAD.encode(uik.signing().sign(&d.id_input(
+            &g,
+            &other,
+            &uik.user_id(),
+        ))));
         bad.push(("signed for another op", g));
         for (why, g) in bad {
             let err = d.approve(&id, g).await.unwrap_err();
@@ -5716,8 +5796,8 @@ mod tests {
         check_approval_authority(None, "v-personal", &signer).unwrap();
         // Another account pinned: the signer's key is unknown here.
         pin_account_key(UikRoot::from_root([0x66u8; 32]).signing().public_bytes());
-        let err = verify_grant_identity(&state, None, "v-personal", "op-1", &g, &op, &r)
-            .unwrap_err();
+        let err =
+            verify_grant_identity(&state, None, "v-personal", "op-1", &g, &op, &r).unwrap_err();
         assert!(matches!(err, AppError::GrantIdInvalid(_)), "{err}");
         pin_account(None);
     }

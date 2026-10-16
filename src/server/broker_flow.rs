@@ -177,8 +177,10 @@ pub async fn resolve_auth_value(
     // invalid_grant and the connection false-flags needs-reauth. Serialize the
     // refresh + rotation write-back under the SAME per-vault write lock the
     // connect path uses, then re-check the cache (the winner may have filled it).
-    let write_lock = state.vault_write_lock(vault_id);
-    let _guard = write_lock.lock().await;
+    let _guard = state
+        .vault_write_guard(vault_id)
+        .await
+        .map_err(|_| AppError::VaultAccessRevoked)?;
     if let Some(cached) = state.oauth_access_lookup(vault_id, &refresh_hash) {
         return Ok(cached);
     }

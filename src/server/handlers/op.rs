@@ -67,6 +67,9 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
     api: Option<&A>,
 ) -> Result<Value> {
     let state = state.clone();
+    if state.is_vault_revoked(&vault_id) {
+        return Err(AppError::VaultAccessRevoked);
+    }
     // §15: a device that is not admitted, past its lease, or revoked unlocks
     // nothing and raises no op.
     if let Some(e) = state.ledger_refusal() {
@@ -626,7 +629,13 @@ mod tests {
         // request then mints fresh (a terminal op is never reused).
         state.approvals.lock().unwrap().approve(&first_id, None);
         assert!(matches!(
-            state.approvals.lock().unwrap().get_any(&first_id).unwrap().status,
+            state
+                .approvals
+                .lock()
+                .unwrap()
+                .get_any(&first_id)
+                .unwrap()
+                .status,
             crate::approval::store::ApprovalStatus::Approved
         ));
         assert!(pending_unlock_response(&state, "v1").is_none());
@@ -683,6 +692,37 @@ mod tests {
             s.open_ledger_for_tests(&[]);
             s
         }
+    }
+
+    #[tokio::test]
+    async fn revoked_vault_refuses_unlock_before_creating_an_op() {
+        use crate::protocol::operation::{Act, Bind, Valid};
+
+        let state = Arc::new(test_state());
+        state.revoked_vaults.lock().unwrap().insert("v1".into());
+        let op = Operation {
+            act: Act {
+                kind: ActType::Custom("vault-unlock".into()),
+                target: "v1".into(),
+                scope: Value::Null,
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        };
+        let err = create_op::<crate::service::source::github::GitHubHttp>(
+            &state,
+            "v1".into(),
+            op,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::VaultAccessRevoked));
     }
 
     /// RED LINE (verified invariant — see the export/allow discussion): an
@@ -920,7 +960,10 @@ mod tests {
             (DeviceGate::NotAdmitted, "device_not_admitted"),
             (DeviceGate::Stale, "ledger_stale"),
         ] {
-            state.set_ledger(LedgerGate { device, agents: None });
+            state.set_ledger(LedgerGate {
+                device,
+                agents: None,
+            });
             let err = create(
                 State(state.clone()),
                 ConnectInfo(addr),

@@ -234,8 +234,7 @@ where
         tracing::info!(vault = %vault_id, "legacy rows migration waits for a pull: {}", e);
         return None;
     }
-    let lock = state.vault_write_lock(vault_id);
-    let _guard = lock.lock().await;
+    let _guard = state.vault_write_guard(vault_id).await.ok()?;
     Some(migrate_legacy_now(state, vault_id, step))
 }
 
@@ -302,13 +301,7 @@ pub(crate) async fn mint_add<A: GitHubApi>(
     // Collisions first: nothing is fetched for a
     // request the vault refuses anyway.
     let (entries, _, _) = session(state, vault_id)?;
-    card::add_card(
-        &snapshot,
-        &req.defs,
-        &req.source,
-        &entries,
-        &state.services,
-    )?;
+    card::add_card(&snapshot, &req.defs, &req.source, &entries, &state.services)?;
     // GitHub's reads carry their own deadline ([`source_check_api`]), so a
     // check still running past it has had answers: whether it would have
     // matched is unknown, and nothing unchecked is offered for approval.
@@ -330,13 +323,7 @@ pub(crate) async fn mint_add<A: GitHubApi>(
     if !allowed {
         return Err(crate::service::INSTALLED_OFF_MSG.to_string());
     }
-    let c = card::add_card(
-        &snapshot,
-        &req.defs,
-        &req.source,
-        &entries,
-        &state.services,
-    )?;
+    let c = card::add_card(&snapshot, &req.defs, &req.source, &entries, &state.services)?;
     c.stamp(&mut op.act.scope)?;
     // The source as stored, so every reader of the signed scope reads one
     // spelling.
@@ -394,13 +381,7 @@ pub(crate) fn apply_add(
     if !view.aux.allows_installed_services() {
         return Err(crate::service::INSTALLED_OFF_MSG.to_string());
     }
-    let c = card::add_card(
-        snapshot,
-        &req.defs,
-        &req.source,
-        &view.aux.services,
-        reg,
-    )?;
+    let c = card::add_card(snapshot, &req.defs, &req.source, &view.aux.services, reg)?;
     if let Some(f) = c.first_difference(signed_scope) {
         return Err(changed_since(f));
     }
@@ -408,9 +389,7 @@ pub(crate) fn apply_add(
         view.aux.services.remove(id);
     }
     for (id, (svc, pol)) in req.defs {
-        let def = snapshot
-            .get(&id)
-            .ok_or_else(|| changed_since("ids"))?;
+        let def = snapshot.get(&id).ok_or_else(|| changed_since("ids"))?;
         let entry = StoredService::installed(svc, pol, req.source.clone(), def);
         view.aux.services.insert(id, entry);
     }

@@ -12,8 +12,9 @@
 //! Auth is the daemon's device-key (`~/.safeclaw/device-key`, a `sc_device_`
 //! token), distinct from the agent→daemon broker api-key.
 //!
-//! Best-effort by design: any failure logs and leaves local state untouched
-//! — a local-only daemon (no `cloud_backend` configured) just skips this and
+//! Best-effort by design: ordinary failures log and leave local state untouched.
+//! The one exception is the backend's dedicated vault-access revocation code,
+//! which locks and forgets that vault. A local-only daemon skips cloud sync and
 //! serves whatever `vault.dat` is on disk. See [[project_slice3_design]].
 
 use std::path::{Path, PathBuf};
@@ -25,6 +26,110 @@ use crate::device_auth::DikRequestExt;
 use crate::state::AppState;
 use crate::storage::sealed_vault::{self, SealedVault};
 use crate::sync_stream::{Mode, StreamHealth, WakeCell, Work};
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum VaultRefusal {
+    AccessRevoked {
+        membership: Option<serde_json::Value>,
+    },
+}
+
+/// Classify only the backend's dedicated vault-access revocation refusal.
+/// Status and body are both required; every other failure remains transient or
+/// follows its existing handling.
+pub(crate) fn vault_refusal(status: reqwest::StatusCode, body: &[u8]) -> Option<VaultRefusal> {
+    if status != reqwest::StatusCode::FORBIDDEN {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let dedicated = value.get("code").and_then(|v| v.as_str()) == Some("SC_VAULT_ACCESS_REVOKED")
+        || value.get("error").and_then(|v| v.as_str()) == Some("vault_access_revoked");
+    dedicated.then(|| VaultRefusal::AccessRevoked {
+        membership: value.get("membership").cloned(),
+    })
+}
+
+#[derive(Debug)]
+pub(crate) enum CloudError {
+    Revoked(Option<serde_json::Value>),
+    Other(String),
+}
+
+impl CloudError {
+    fn revoked(&self) -> Option<Option<serde_json::Value>> {
+        match self {
+            Self::Revoked(membership) => Some(membership.clone()),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CloudError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Revoked(_) => f.write_str(crate::error::VAULT_ACCESS_REVOKED_MSG),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for CloudError {
+    fn from(value: String) -> Self {
+        Self::Other(value)
+    }
+}
+
+impl From<&str> for CloudError {
+    fn from(value: &str) -> Self {
+        Self::Other(value.to_string())
+    }
+}
+
+fn refusal_error(status: reqwest::StatusCode, body: &[u8]) -> Option<CloudError> {
+    vault_refusal(status, body).map(|VaultRefusal::AccessRevoked { membership }| {
+        CloudError::Revoked(membership)
+    })
+}
+
+async fn handle_refusal_response(
+    state: &Arc<AppState>,
+    vault: &str,
+    response: reqwest::Response,
+) -> bool {
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        crate::sync_stream::notify_device_auth_rejected();
+        return false;
+    }
+    if status != reqwest::StatusCode::FORBIDDEN {
+        return false;
+    }
+    let body = response.bytes().await.unwrap_or_default();
+    if let Some(CloudError::Revoked(membership)) = refusal_error(status, &body) {
+        revoke_vault_access(state, vault, membership).await;
+        return true;
+    }
+    false
+}
+
+/// Confirm an account-stream `access` hint with one authenticated vault read.
+/// The event itself is never authority: only the dedicated 403 body tears down.
+pub(crate) async fn probe_vault_access(state: &Arc<AppState>, cloud: &str, dk: &str, vault: &str) {
+    let url = format!("{}/v/{}/blob", cloud.trim_end_matches('/'), vault);
+    let Ok(client) = crate::cli::egress_proxy::client(Duration::from_secs(15)) else {
+        return;
+    };
+    let Ok(response) = client
+        .get(&url)
+        .bearer_auth(dk)
+        .dik_pop("GET", &url, &[])
+        .send()
+        .await
+    else {
+        return;
+    };
+    let _ = handle_refusal_response(state, vault, response).await;
+}
 
 /// How long an auth-rejected (401/403) sync path parks before retrying. The
 /// pre-parking behavior — `return`, killing sync for the daemon's lifetime —
@@ -110,7 +215,10 @@ pub async fn pull_on_start(state_dir: &Path) {
     let discovered = discover_account_vault_ids(cloud, &dk).await;
     let fresh = remember_discovered(&cfg, &discovered);
     if !fresh.is_empty() {
-        tracing::info!(count = fresh.len(), "cloud sync: adopted account vaults via discovery");
+        tracing::info!(
+            count = fresh.len(),
+            "cloud sync: adopted account vaults via discovery"
+        );
     }
     // All vaults this device knows (active ∪ known_vaults ∪ discovered) are kept
     // online — the agent addresses any of them by vid, no "switch vault" needed
@@ -134,11 +242,16 @@ pub async fn pull_on_start(state_dir: &Path) {
                 // retired vault. No AppState yet at this point (pre-serve), so the
                 // disk + CLI-config side is dropped here; the in-memory K/audit
                 // handle don't exist yet (daemon boots Locked, audit opens lazily).
-                drop_local_vault_disk(state_dir, vault);
+                let _ = remove_vault_dir(state_dir, vault);
                 tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
+                continue;
             }
             Err(e) => {
-                tracing::warn!(vault = %vault, "cloud sync pull failed (serving local state): {}", e)
+                let revoked = e.revoked().is_some();
+                tracing::warn!(vault = %vault, "cloud sync pull failed (serving local state): {}", e);
+                if revoked {
+                    continue;
+                }
             }
         }
         // PER-ITEM: pull the KEYSET (the passkey-wrap layer, now on `/keys`)
@@ -149,7 +262,13 @@ pub async fn pull_on_start(state_dir: &Path) {
                 tracing::info!(vault = %vault, adopted = n, "cloud sync: pulled keyset rows")
             }
             Ok(_) => {}
-            Err(e) => tracing::debug!(vault = %vault, "cloud sync: keyset pull failed: {}", e),
+            Err(e) => {
+                let revoked = e.revoked().is_some();
+                tracing::debug!(vault = %vault, "cloud sync: keyset pull failed: {}", e);
+                if revoked {
+                    continue;
+                }
+            }
         }
         // PER-ITEM: pull content rows too (pre-serve, no cache to refresh yet —
         // the first unlock folds them). Best-effort; a 404 / non-per-item vault
@@ -199,25 +318,34 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     let dk = device_key().ok_or_else(|| {
         "this daemon isn't paired with the cloud — run `sc login` first".to_string()
     })?;
-    let pulled = match pull(&state.config.state_dir, cloud, vault_id, &dk).await? {
-        PullOutcome::Updated(_version) => {
-            refresh_after_pull(state, vault_id);
-            true
+    let pulled_response = pull(&state.config.state_dir, cloud, vault_id, &dk).await;
+    let pulled = match pulled_response {
+        Err(e) => {
+            if let Some(membership) = e.revoked() {
+                revoke_vault_access(state, vault_id, membership).await;
+            }
+            return Err(e.to_string());
         }
-        PullOutcome::Unchanged => false,
-        PullOutcome::Deleted => {
-            // The vault was deleted (tombstoned) cloud-side. Drop all local
-            // state — disk, retained K, audit handle, CLI config — under the
-            // per-vault write lock (this runs at serving time via POST
-            // /v/{vid}/sync, so it must not race a concurrent approve write) and
-            // return without the connect step (there is nothing left to act on).
-            drop_local_vault_locked(state, vault_id).await;
-            tracing::info!(vault = %vault_id, "cloud sync: vault deleted upstream; dropped local state");
-            return Ok(SyncOutcome {
-                pulled: false,
-                connects: Default::default(),
-            });
-        }
+        Ok(outcome) => match outcome {
+            PullOutcome::Updated(_version) => {
+                refresh_after_pull(state, vault_id);
+                true
+            }
+            PullOutcome::Unchanged => false,
+            PullOutcome::Deleted => {
+                // The vault was deleted (tombstoned) cloud-side. Drop all local
+                // state — disk, retained K, audit handle, CLI config — under the
+                // per-vault write lock (this runs at serving time via POST
+                // /v/{vid}/sync, so it must not race a concurrent approve write) and
+                // return without the connect step (there is nothing left to act on).
+                drop_local_vault_locked(state, vault_id).await;
+                tracing::info!(vault = %vault_id, "cloud sync: vault deleted upstream; dropped local state");
+                return Ok(SyncOutcome {
+                    pulled: false,
+                    connects: Default::default(),
+                });
+            }
+        },
     };
     // PER-ITEM: pull the KEYSET (`/keys`), then the content item rows (`/items`).
     // The keyset now rides `/keys` (NOT the whole-blob `/blob`, which is a
@@ -228,7 +356,9 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     if let Some(cloud2) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) {
         if let Some(dk2) = device_key() {
             let lock = StoreLock::Take(state);
-            let keys_pulled = match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2, lock).await {
+            let keys_pulled = match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2, lock)
+                .await
+            {
                 Ok(n) => {
                     state.record_cloud_contact(vault_id);
                     if n > 0 {
@@ -237,6 +367,10 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
                     true
                 }
                 Err(e) => {
+                    if let Some(membership) = e.revoked() {
+                        revoke_vault_access(state, vault_id, membership).await;
+                        return Err(e.to_string());
+                    }
                     tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e);
                     false
                 }
@@ -261,7 +395,13 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
                     state.record_cloud_contact(vault_id);
                     crate::server::handlers::service_ops::requests::after_sync(state, vault_id);
                 }
-                Err(e) => tracing::debug!(vault = %vault_id, "per-item pull failed: {}", e),
+                Err(e) => {
+                    if let Some(membership) = e.revoked() {
+                        revoke_vault_access(state, vault_id, membership).await;
+                        return Err(e.to_string());
+                    }
+                    tracing::debug!(vault = %vault_id, "per-item pull failed: {}", e)
+                }
             }
             if keys_pulled {
                 confirm_unreadable_after_refresh(state, vault_id).await;
@@ -302,7 +442,7 @@ pub async fn resync_membership_now(state: &Arc<AppState>, vault_id: &str) -> Res
         .ok_or_else(|| "local-only daemon (no cloud) — cannot resync membership".to_string())?;
     let dk =
         device_key().ok_or_else(|| "daemon not paired — cannot resync membership".to_string())?;
-    let n = pull_membership(
+    let pulled = pull_membership(
         &state.config.state_dir,
         cloud,
         vault_id,
@@ -310,7 +450,17 @@ pub async fn resync_membership_now(state: &Arc<AppState>, vault_id: &str) -> Res
         true,
         StoreLock::Held,
     )
-    .await?;
+    .await;
+    let n = match pulled {
+        Ok(n) => n,
+        Err(e) => {
+            if let Some(membership) = e.revoked() {
+                // The caller holds the write lock; hand teardown to another task.
+                schedule_revoke_vault_access(state, vault_id, membership);
+            }
+            return Err(e.to_string());
+        }
+    };
     if n > 0 {
         state.record_cloud_contact(vault_id);
         tracing::info!(vault = %vault_id, adopted = n, "membership resync (self-heal): backfilled keyset");
@@ -362,7 +512,11 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
                 tracing::info!(vault = %vault_id, "owner lock-list registered");
             }
             Ok(r) => {
-                tracing::debug!(vault = %vault_id, status = %r.status(), "config-ids register deferred")
+                let status = r.status();
+                if handle_refusal_response(state, vault_id, r).await {
+                    return;
+                }
+                tracing::debug!(vault = %vault_id, status = %status, "config-ids register deferred")
             }
             Err(e) => tracing::debug!(vault = %vault_id, "config-ids register failed: {}", e),
         }
@@ -373,7 +527,11 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
         match client
             .patch(&url)
             .bearer_auth(&dk)
-            .dik_pop("PATCH", &url, &serde_json::to_vec(&body).unwrap_or_default())
+            .dik_pop(
+                "PATCH",
+                &url,
+                &serde_json::to_vec(&body).unwrap_or_default(),
+            )
             .json(&body)
             .send()
             .await
@@ -383,7 +541,11 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
                 tracing::info!(vault = %vault_id, "vault marked format=2 (unified addressing)");
             }
             Ok(r) => {
-                tracing::debug!(vault = %vault_id, status = %r.status(), "format mark deferred")
+                let status = r.status();
+                if handle_refusal_response(state, vault_id, r).await {
+                    return;
+                }
+                tracing::debug!(vault = %vault_id, status = %status, "format mark deferred")
             }
             Err(e) => tracing::debug!(vault = %vault_id, "format mark failed: {}", e),
         }
@@ -413,7 +575,17 @@ pub(crate) async fn pull_items_now(state: &Arc<AppState>, vault_id: &str) -> Res
     let key = state.cloned_state_key(vault_id);
     let key = key.as_deref().map(|m| &m[..]);
     let lock = StoreLock::Take(state);
-    if pull_items(&state.config.state_dir, cloud, vault_id, &dk, key, lock).await? > 0 {
+    let pulled = pull_items(&state.config.state_dir, cloud, vault_id, &dk, key, lock).await;
+    let count = match pulled {
+        Ok(n) => n,
+        Err(e) => {
+            if let Some(membership) = e.revoked() {
+                revoke_vault_access(state, vault_id, membership).await;
+            }
+            return Err(e.to_string());
+        }
+    };
+    if count > 0 {
         refresh_after_item_pull(state, vault_id);
     } else {
         // Nothing adopted, but a request a racing pull adopted (or one whose
@@ -496,7 +668,9 @@ fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
         }
     }
     for kv in &known {
-        if !kv.vault.is_empty() && !leave_to_official(&kv.vault) && !ids.iter().any(|x| x == &kv.vault)
+        if !kv.vault.is_empty()
+            && !leave_to_official(&kv.vault)
+            && !ids.iter().any(|x| x == &kv.vault)
         {
             ids.push(kv.vault.clone());
         }
@@ -557,6 +731,9 @@ async fn discover_account_vault_ids(cloud: &str, dk: &str) -> Vec<DiscoveredVaul
         }
     };
     if !resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            crate::sync_stream::notify_device_auth_rejected();
+        }
         // 404 = a backend that predates device-key vault listing; anything else
         // is transient. Either way, keep what we already know.
         tracing::debug!(status = %resp.status(), "vault discovery: non-success (old backend?)");
@@ -633,6 +810,18 @@ fn remember_discovered(
     fresh
 }
 
+fn restore_discovered_access(state: &AppState, discovered: &[DiscoveredVault]) -> Vec<String> {
+    let mut restored = Vec::new();
+    let mut revoked = state.revoked_vaults.lock().unwrap();
+    for dv in discovered {
+        if revoked.remove(&dv.id) {
+            tracing::info!(vault = %dv.id, "vault discovery: access restored; watcher may restart after unlock");
+            restored.push(dv.id.clone());
+        }
+    }
+    restored
+}
+
 /// Live auto-discovery: adopt an account vault created AFTER the daemon started
 /// (e.g. in the console) without a restart. Re-lists the account's vaults on an
 /// interval; a genuinely new one is persisted, pulled once so it serves right
@@ -640,12 +829,7 @@ fn remember_discovered(
 /// (its cell is not in the SSE dispatcher's fixed set); the next daemon restart
 /// folds it into the SSE stream. Spawned unconditionally for a paired daemon, so
 /// even a device with zero vaults today adopts its first console-created one.
-async fn discovery_reconcile_loop(
-    state: Arc<AppState>,
-    cloud: String,
-    dk: String,
-    mut watched: std::collections::HashSet<String>,
-) {
+async fn discovery_reconcile_loop(state: Arc<AppState>, cloud: String, dk: String) {
     /// Cadence for spotting a newly created vault. Fast path for existing vaults
     /// is still the per-vault watcher; this only governs first adoption latency.
     const INTERVAL: Duration = Duration::from_secs(120);
@@ -661,7 +845,13 @@ async fn discovery_reconcile_loop(
             Err(_) => continue,
         };
         let discovered = discover_account_vault_ids(&cloud, &dk).await;
-        let fresh = remember_discovered(&cfg, &discovered);
+        let restored = restore_discovered_access(&state, &discovered);
+        let mut fresh = remember_discovered(&cfg, &discovered);
+        for vid in restored {
+            if !fresh.contains(&vid) {
+                fresh.push(vid);
+            }
+        }
         let serves_shared = crate::team_hooks::build_serves_shared();
         for vid in fresh {
             // Personal build: leave a SHARED (team) vault to the official build
@@ -676,22 +866,69 @@ async fn discovery_reconcile_loop(
             {
                 continue;
             }
-            if !watched.insert(vid.clone()) {
-                continue;
-            }
-            let st = state.clone();
-            let cl = cloud.clone();
-            let dkk = dk.clone();
-            let hr = health_rx.clone();
-            tracing::info!(vault = %vid, "cloud sync: live-adopted a new account vault (long-poll until restart)");
-            tokio::spawn(async move {
-                let cell = Arc::new(WakeCell::new());
-                // Pull once so the vault serves immediately, then keep it current.
-                let _ = pull(&st.config.state_dir, &cl, &vid, &dkk).await;
-                watch_loop(st, vid, cl, dkk, cell, hr).await;
-            });
+            tracing::info!(vault = %vid, "cloud sync: live-adopted an account vault (long-poll until restart)");
+            ensure_watcher(
+                state.clone(),
+                vid,
+                cloud.clone(),
+                dk.clone(),
+                health_rx.clone(),
+                None,
+            );
         }
     }
+}
+
+/// Start at most one watcher for a vault and retain both objects teardown must
+/// explicitly park/remove. Returns the weak cell used by the account stream.
+pub(crate) fn ensure_watcher(
+    state: Arc<AppState>,
+    vault: String,
+    cloud: String,
+    dk: String,
+    health_rx: tokio::sync::watch::Receiver<StreamHealth>,
+    cell: Option<Arc<WakeCell>>,
+) -> std::sync::Weak<WakeCell> {
+    let revoked = state.revoked_vaults.lock().unwrap();
+    if revoked.contains(&vault) {
+        return std::sync::Weak::new();
+    }
+    let mut watchers = state.watchers.lock().unwrap();
+    drop(revoked);
+    if watchers.get(&vault).is_some_and(|h| !h.is_finished()) {
+        return state
+            .watcher_cells
+            .lock()
+            .unwrap()
+            .get(&vault)
+            .map(Arc::downgrade)
+            .unwrap_or_default();
+    }
+    watchers.remove(&vault);
+    let cell = cell.unwrap_or_else(|| Arc::new(WakeCell::new()));
+    let weak = Arc::downgrade(&cell);
+    state
+        .watcher_cells
+        .lock()
+        .unwrap()
+        .insert(vault.clone(), cell.clone());
+    let task_state = state.clone();
+    let task_vault = vault.clone();
+    let cleanup_state = state.clone();
+    let cleanup_vault = vault.clone();
+    let cleanup_cell = cell.clone();
+    let handle = tokio::spawn(async move {
+        watch_loop(task_state, task_vault, cloud, dk, cell, health_rx).await;
+        let mut cells = cleanup_state.watcher_cells.lock().unwrap();
+        if cells
+            .get(&cleanup_vault)
+            .is_some_and(|current| Arc::ptr_eq(current, &cleanup_cell))
+        {
+            cells.remove(&cleanup_vault);
+        }
+    });
+    watchers.insert(vault, handle);
+    weak
 }
 
 /// Spawn one `watch_loop` per synced vault (active ∪ known_vaults), so every
@@ -724,7 +961,9 @@ pub fn spawn_watchers(state: Arc<AppState>) {
     // startup ([`crate::principal_ledger::init_gate`]); the anchor is only
     // learned at pairing, which restarts the daemon.
     if active::account_uik().is_some() {
-        tokio::spawn(crate::principal_ledger::principal_ledger_loop(state.clone()));
+        tokio::spawn(crate::principal_ledger::principal_ledger_loop(
+            state.clone(),
+        ));
     }
     let Some(dk) = device_key() else {
         tracing::debug!("cloud sync watch: no device-key (unpaired); not started");
@@ -741,18 +980,19 @@ pub fn spawn_watchers(state: Arc<AppState>) {
     let mut cells: Vec<(String, std::sync::Weak<WakeCell>)> = Vec::new();
     for vault in synced_vault_ids(&cfg) {
         let cell = Arc::new(WakeCell::new());
-        cells.push((vault.clone(), Arc::downgrade(&cell)));
-        tokio::spawn(watch_loop(
+        let weak = ensure_watcher(
             state.clone(),
-            vault,
+            vault.clone(),
             cloud.clone(),
             dk.clone(),
-            cell,
             health_rx.clone(),
-        ));
+            Some(cell),
+        );
+        cells.push((vault, weak));
     }
     if !cells.is_empty() {
         tokio::spawn(crate::sync_stream::dispatcher(
+            state.clone(),
             cloud.clone(),
             dk.clone(),
             cells,
@@ -763,9 +1003,7 @@ pub fn spawn_watchers(state: Arc<AppState>) {
     // created after startup with no restart. Runs even with zero vaults today, so
     // a freshly-paired device picks up its first console-created vault. Seeded
     // with the vaults already watched above so it only spawns for NEW ones.
-    let watched: std::collections::HashSet<String> =
-        synced_vault_ids(&cfg).into_iter().collect();
-    tokio::spawn(discovery_reconcile_loop(state, cloud, dk, watched));
+    tokio::spawn(discovery_reconcile_loop(state, cloud, dk));
 }
 
 /// Pull the vault's sealed blob (version-gated by the `.blob_version` sidecar).
@@ -779,7 +1017,7 @@ async fn pull(
     cloud: &str,
     vault: &str,
     device_key: &str,
-) -> Result<PullOutcome, String> {
+) -> Result<PullOutcome, CloudError> {
     // Personal build: a SHARED (team) vault is left to the official build, so its
     // whole-blob is never pulled here either. The main sync loop and the discovery
     // reconcile already pre-filter shared vaults, but the arbitrary-vid callers
@@ -813,8 +1051,25 @@ async fn pull(
         // EXACTLY as before — a tombstone is a 200 with status:"deleted", never
         // a 404, so a delete can no longer masquerade as "nothing sealed yet".
         404 => return Ok(PullOutcome::Unchanged),
-        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
-        other => return Err(format!("cloud blob GET HTTP {}", other)),
+        401 => {
+            crate::sync_stream::notify_device_auth_rejected();
+            return Err(CloudError::Other(format!(
+                "cloud auth rejected (HTTP {})",
+                resp.status()
+            )));
+        }
+        403 => {
+            let status = resp.status();
+            let body = resp.bytes().await.unwrap_or_default();
+            if let Some(e) = refusal_error(status, &body) {
+                return Err(e);
+            }
+            return Err(CloudError::Other(format!(
+                "cloud auth rejected (HTTP {})",
+                status
+            )));
+        }
+        other => return Err(format!("cloud blob GET HTTP {}", other).into()),
     }
 
     let body: serde_json::Value = resp
@@ -822,7 +1077,7 @@ async fn pull(
         .await
         .map_err(|e| format!("parse blob response: {}", e))?;
 
-    Ok(classify_pull_body(state_dir, vault, &body)?)
+    classify_pull_body(state_dir, vault, &body).map_err(CloudError::Other)
 }
 
 /// Extract the server-authoritative vault `kind` from a `/blob` (or `/blob/wait`)
@@ -1063,70 +1318,154 @@ fn persist_blob(
     Ok(())
 }
 
-/// Remove the on-disk footprint of a vault: `vault.dat` and the `.blob_version`
-/// sidecar. Best-effort and idempotent (missing files are not an error). Used by
-/// both the in-process drop path and the pre-serve startup drop. Deliberately
-/// narrow — it removes ONLY the two sync-owned files, not the whole vault dir
-/// (the audit `.db` is closed/removed by the registry's `forget`, and we keep the
-/// directory shell so a re-pair to the same id, were one to happen, isn't
-/// confused by a half-present tree).
-fn drop_local_vault_disk(state_dir: &Path, vault: &str) {
-    let vault_dir = state_dir.join("vaults").join(vault);
-    let vault_path = vault_dir.join("vault.dat");
-    if let Err(e) = std::fs::remove_file(&vault_path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(vault = %vault, "cloud sync: failed to remove vault.dat on delete: {}", e);
-        }
-    }
-    let sidecar = version_sidecar(state_dir, vault);
-    if let Err(e) = std::fs::remove_file(&sidecar) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(vault = %vault, "cloud sync: failed to remove .blob_version on delete: {}", e);
-        }
-    }
+/// Delete the complete on-disk footprint of one vault. Best-effort callers log
+/// the returned error; a missing directory is success.
+pub(crate) fn remove_vault_dir(state_dir: &Path, vault: &str) -> Result<(), String> {
+    crate::storage::VaultDir::new(state_dir)
+        .remove(vault)
+        .map_err(|e| e.to_string())
 }
 
-/// Drop ALL local state for a vault that was deleted (tombstoned) cloud-side.
-/// This is the sole code path that destroys local vault state, and it is only
-/// reached on an explicit `status:"deleted"` tombstone (never on a decrypt
-/// failure — see design/sync.md §4 case 3). Order matters:
-///  1. `lock_vault` — transition to Locked, which DROPS the `Unlocked` variant
-///     and thereby zeroizes the retained state key `K` (`Zeroizing<Vec<u8>>`)
-///     and the whole secrets cache. Done first so K is gone before we touch the
-///     ciphertext it protected.
-///  2. remove `vault.dat` + `.blob_version` from disk.
-///  3. close/forget the per-vault audit SQLite handle (the registry reopens
-///     lazily if ever asked again; on a tombstone it won't be).
-///  4. forget the vault from the CLI `known_vaults` config so the next daemon
-///     start doesn't re-add a watcher for the dead id.
-/// The caller is responsible for stopping this vault's `watch_loop` (it returns
-/// from the loop after calling us). Best-effort throughout — a failure in any
-/// step logs and proceeds; nothing here may stop the daemon from serving.
-fn drop_local_vault(state: &Arc<AppState>, vault: &str) {
-    // 1. Zeroize retained K + cache by transitioning to Locked.
+fn attached_membership_excludes_us(
+    state: &AppState,
+    vault: &str,
+    membership: Option<&serde_json::Value>,
+) -> bool {
+    let (Some(us), Some(body), Some(mut pv)) = (
+        active::account_uik(),
+        membership,
+        read_per_item_store(&state.config.state_dir, vault),
+    ) else {
+        return false;
+    };
+    // The response may update an existing trust graph, but it may not create
+    // the trust anchor that authorizes deletion. A locally pinned genesis key
+    // must already exist before transport data is adopted in the copy.
+    let Some(local_anchor) = pv
+        .keyset
+        .uik
+        .as_ref()
+        .map(|uik| uik.creator_sig_pub.as_slice())
+        .filter(|anchor| anchor.len() == 32)
+    else {
+        return false;
+    };
+    let Some(anchor) = body
+        .get("anchor")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let Ok(attached_anchor) = pv_store::decode_keys_data_field(anchor) else {
+        return false;
+    };
+    if attached_anchor.as_slice() != local_anchor {
+        return false;
+    }
+    if body
+        .get("members")
+        .and_then(|v| v.as_object())
+        .is_none_or(|members| members.is_empty())
+        || body.get("identities").and_then(|v| v.as_object()).is_none()
+        || body.get("proof").and_then(|v| v.as_object()).is_none()
+    {
+        return false;
+    }
+    // `members` is a complete snapshot. Remove stale local seats in this copy
+    // before adopting it, while retaining the pinned anchor and signed history
+    // needed to verify the resulting fold.
+    if let Some(uik) = pv.keyset.uik.as_mut() {
+        uik.creds.clear();
+        uik.approver_cids.clear();
+    }
+    adopt_membership_triple(&mut pv, vault, anchor, body).is_ok()
+        && pv.verified_membership(vault, &us) == Some(false)
+}
+
+const REVOKED_REASON: &str =
+    "this device can no longer use this vault: your account was removed from it";
+
+/// Complete, idempotent teardown for a vault this process must stop serving.
+/// `verified_delete` is reserved for an already-verified tombstone or device
+/// ledger revocation; ordinary access refusals may delete only through their
+/// attached, locally verified membership triple.
+async fn teardown_vault_access(
+    state: &Arc<AppState>,
+    vault: &str,
+    membership: Option<serde_json::Value>,
+    verified_delete: bool,
+) {
+    // Latch first: unlock and every queued writer fail from this point onward.
+    state
+        .revoked_vaults
+        .lock()
+        .unwrap()
+        .insert(vault.to_string());
     state.lock_vault(vault);
-    // 2. Disk.
-    drop_local_vault_disk(&state.config.state_dir, vault);
-    // 3. Audit handle (closes the SQLite connection; idempotent).
-    state.audits.forget(vault);
-    // 4. CLI config — drop from known_vaults / clear active if it was active.
-    match active::forget_vault(vault) {
-        Ok(true) => {}
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(vault = %vault, "cloud sync: failed to forget vault from CLI config: {}", e)
-        }
-    }
-}
 
-/// Async wrapper that acquires the per-vault write lock, then drops all local
-/// state. EVERY runtime drop (while the daemon is serving, with concurrent
-/// approve.rs / connect writers) MUST go through this so the destroy can't race
-/// a concurrent `vault.dat` write — `write_atomic`'s tmp+rename could otherwise
-/// land AFTER `remove_file` and re-create a live file for a tombstoned id. The
-/// ONLY lock-free drop is `pull_on_start`'s (pre-serve: no AppState, no
-/// concurrent writers yet), which uses `drop_local_vault_disk` directly.
-pub(crate) async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) {
+    state.cloud_contact.lock().unwrap().remove(vault);
+    state.vault_shared.lock().unwrap().remove(vault);
+    state.vault_upgrade_required.lock().unwrap().remove(vault);
+    state.sync_conflicts.lock().unwrap().remove(vault);
+    state.catch_up_failures.lock().unwrap().remove(vault);
+    state.pending_format_mark.lock().unwrap().remove(vault);
+    state.pending_config_ids.lock().unwrap().remove(vault);
+    state.pending_rotations.lock().unwrap().remove(vault);
+    state
+        .oauth_pending
+        .lock()
+        .unwrap()
+        .retain(|_, p| p.vault_id != vault);
+    state
+        .oauth_reauth_needed
+        .lock()
+        .unwrap()
+        .retain(|(v, _)| v != vault);
+    state
+        .live_ceremony_ops
+        .lock()
+        .unwrap()
+        .retain(|(v, _), _| v != vault);
+    if let Some(semaphore) = state.sse_semaphores.lock().unwrap().remove(vault) {
+        semaphore.close();
+    }
+    state.access_probes.lock().unwrap().remove(vault);
+    // These stores are not vault-indexed. Clear their bounded process-local
+    // contents so no object belonging to the removed vault can remain.
+    state.challenges.lock().unwrap().clear();
+    state.batch_roots.lock().unwrap().clear();
+    state.oauth_redeemed_codes.lock().unwrap().clear();
+    state.op_payloads.lock().unwrap().clear();
+    state.audits.forget(vault);
+
+    let rejected = state
+        .approvals
+        .lock()
+        .unwrap()
+        .reject_vault(vault, REVOKED_REASON);
+    for approval_id in rejected {
+        let _ = state.events.send(crate::state::ApprovalEvent {
+            vault_id: vault.to_string(),
+            approval_id,
+            kind: "rejected".into(),
+            op_summary: None,
+            response_preview: None,
+            reason: Some(REVOKED_REASON.into()),
+        });
+    }
+
+    if let Some(cell) = state.watcher_cells.lock().unwrap().remove(vault) {
+        cell.set_mode(Mode::Fallback);
+    }
+    let watcher = { state.watchers.lock().unwrap().remove(vault) };
+    if let Some(handle) = watcher {
+        handle.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    // Wait out a writer that acquired the mutex before the latch. Later writers
+    // pass through `vault_write_guard` and refuse after acquisition.
     let lock = {
         let mut locks = state.vault_write_locks.lock().unwrap();
         Arc::clone(
@@ -1136,7 +1475,70 @@ pub(crate) async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) 
         )
     };
     let _guard = lock.lock().await;
-    drop_local_vault(state, vault);
+    let delete =
+        verified_delete || attached_membership_excludes_us(state, vault, membership.as_ref());
+    if delete {
+        if let Err(e) = remove_vault_dir(&state.config.state_dir, vault) {
+            tracing::warn!(vault = %vault, "vault access revoked: local copy removal failed: {}", e);
+        }
+    }
+    if let Err(e) = active::forget_vault(vault) {
+        tracing::warn!(vault = %vault, "vault access revoked: failed to forget catalog entry: {}", e);
+    }
+    if delete {
+        tracing::warn!(vault = %vault, "vault access revoked: locked and forgot vault; local copy deleted (verified authorization)");
+    } else {
+        tracing::warn!(vault = %vault, "vault access revoked: locked and forgot vault; local copy kept (no verified membership)");
+    }
+}
+
+pub(crate) async fn revoke_vault_access(
+    state: &Arc<AppState>,
+    vault: &str,
+    membership: Option<serde_json::Value>,
+) {
+    teardown_vault_access(state, vault, membership, false).await;
+}
+
+pub(crate) async fn revoke_vault_access_verified(state: &Arc<AppState>, vault: &str) {
+    teardown_vault_access(state, vault, None, true).await;
+}
+
+pub(crate) fn schedule_revoke_vault_access(
+    state: &Arc<AppState>,
+    vault: &str,
+    membership: Option<serde_json::Value>,
+) {
+    state
+        .revoked_vaults
+        .lock()
+        .unwrap()
+        .insert(vault.to_string());
+    state.lock_vault(vault);
+    let state = state.clone();
+    let vault = vault.to_string();
+    tokio::spawn(async move {
+        revoke_vault_access(&state, &vault, membership).await;
+    });
+}
+
+fn schedule_revoke_vault_access_verified(state: &Arc<AppState>, vault: &str) {
+    state
+        .revoked_vaults
+        .lock()
+        .unwrap()
+        .insert(vault.to_string());
+    state.lock_vault(vault);
+    let state = state.clone();
+    let vault = vault.to_string();
+    tokio::spawn(async move {
+        revoke_vault_access_verified(&state, &vault).await;
+    });
+}
+
+/// Compatibility name for verified tombstone callers.
+pub(crate) async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) {
+    revoke_vault_access_verified(state, vault).await;
 }
 
 /// §15 leg-B: if THIS account's UIK is VERIFIED-not-a-member of a shared vault (an
@@ -1158,7 +1560,7 @@ async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool
             vault = %vault, us = %us,
             "membership: this account is VERIFIED not a member of this vault (owner offboarded) — locking + wiping local state"
         );
-        drop_local_vault_locked(state, vault).await;
+        schedule_revoke_vault_access_verified(state, vault);
         return true;
     }
     false
@@ -1191,8 +1593,12 @@ fn tombstone_should_drop(state_dir: &Path, vault: &str, body: &serde_json::Value
         // A whole-blob vault holds credentials too: only the paired account's
         // signature drops it.
         let (Some(sig), Some(signer)) = (
-            body.get("tombstone_sig").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
-            body.get("tombstone_signer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+            body.get("tombstone_sig")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty()),
+            body.get("tombstone_signer")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty()),
         ) else {
             tracing::warn!(vault = %vault, "tombstone: the delete carries no owner signature; NOT dropping");
             return false;
@@ -1211,8 +1617,12 @@ fn tombstone_verified_for(
     account_pub: Option<[u8; 32]>,
 ) -> bool {
     let (Some(sig), Some(signer)) = (
-        body.get("tombstone_sig").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
-        body.get("tombstone_signer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+        body.get("tombstone_sig")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty()),
+        body.get("tombstone_signer")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty()),
     ) else {
         tracing::warn!(vault = %vault, "tombstone: the delete carries no owner signature; NOT dropping");
         return false;
@@ -1389,6 +1799,9 @@ pub async fn push_blob_best_effort(state: &Arc<AppState>, vault_id: &str) {
         }
 
         if !status.is_success() {
+            if handle_refusal_response(state, vault_id, resp).await {
+                return;
+            }
             tracing::warn!(vault = %vault_id, "push-back: cloud rejected (HTTP {})", status);
             return;
         }
@@ -1434,6 +1847,9 @@ async fn recover_after_conflict(
             return false;
         }
         Err(e) => {
+            if let Some(membership) = e.revoked() {
+                revoke_vault_access(state, vault_id, membership).await;
+            }
             tracing::warn!(vault = %vault_id, "push-back: conflict-recovery pull failed: {}", e);
             return false;
         }
@@ -1650,8 +2066,12 @@ async fn ship_vault_audit(
                 }
             }
             Ok(r) => {
+                let status = r.status();
+                if handle_refusal_response(state, vault, r).await {
+                    return;
+                }
                 tracing::debug!(
-                    vault = %vault, status = %r.status(),
+                    vault = %vault, status = %status,
                     "audit ship: backend rejected batch; retrying next tick"
                 );
                 return;
@@ -1876,6 +2296,10 @@ pub async fn watch_loop(
                             clean = clean && !persist_failed && pulls_ok;
                         }
                         Err(ProbeError::Auth) => auth_park = true,
+                        Err(ProbeError::Revoked(membership)) => {
+                            schedule_revoke_vault_access(&state, &vault, membership);
+                            return;
+                        }
                         Err(ProbeError::Other(e)) => {
                             tracing::debug!(vault = %vault, "cloud sync watch: sse blob probe failed: {}", e);
                             clean = false;
@@ -1943,6 +2367,10 @@ pub async fn watch_loop(
                         pulls_ok,
                     }) => ok = !persist_failed && pulls_ok,
                     Err(ProbeError::Auth) => auth_park = true,
+                    Err(ProbeError::Revoked(membership)) => {
+                        schedule_revoke_vault_access(&state, &vault, membership);
+                        return;
+                    }
                     Err(ProbeError::Other(e)) => {
                         tracing::debug!(vault = %vault, "cloud sync watch: sse reconcile probe failed: {}", e);
                         ok = false;
@@ -2112,7 +2540,13 @@ pub async fn watch_loop(
                     // No blob in the cloud yet — gentle retry.
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-                401 | 403 => {
+                401 => {
+                    crate::sync_stream::notify_device_auth_rejected();
+                    state.set_vault_upgrade_required(&vault, false);
+                    tracing::warn!(vault = %vault, "cloud sync watch: auth rejected (HTTP 401); retrying in {}s", AUTH_RETRY.as_secs());
+                    tokio::time::sleep(AUTH_RETRY).await;
+                }
+                403 => {
                     // Distinguish a FORCED UPGRADE (`SC_UPGRADE_REQUIRED`: this daemon
                     // is too old for the vault's item format, design 甲) from a
                     // transient 403. On the former, flag the vault so the broker fails
@@ -2120,9 +2554,12 @@ pub async fn watch_loop(
                     // it's transient — park, don't die (backend deploy / auth
                     // migration). See AUTH_RETRY.
                     let status = resp.status();
-                    let upgrade = resp
-                        .json::<serde_json::Value>()
-                        .await
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    if let Some(CloudError::Revoked(membership)) = refusal_error(status, &bytes) {
+                        schedule_revoke_vault_access(&state, &vault, membership);
+                        return;
+                    }
+                    let upgrade = serde_json::from_slice::<serde_json::Value>(&bytes)
                         .ok()
                         .and_then(|b| {
                             b.get("code")
@@ -2176,7 +2613,17 @@ pub async fn watch_loop(
                     items_channel = false;
                     tracing::info!(vault = %vault, "cloud sync watch: /items/wait unavailable (404); content rides blob-channel wakes only");
                 }
-                401 | 403 => {
+                401 => {
+                    crate::sync_stream::notify_device_auth_rejected();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                403 => {
+                    let status = resp.status();
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    if let Some(CloudError::Revoked(membership)) = refusal_error(status, &bytes) {
+                        schedule_revoke_vault_access(&state, &vault, membership);
+                        return;
+                    }
                     // Could be a deletion in progress (a tombstoned vault fails this
                     // route's ownership gate) or a revoked device — either way the
                     // blob channel owns the verdict. Back off, never stop from here.
@@ -2300,7 +2747,10 @@ async fn handle_blob_wake_body(
         if tombstone_should_drop(state_dir, vault, body) {
             // Drop under the per-vault write lock so the destroy can't race a
             // concurrent approve.rs / connect write to vault.dat.
-            drop_local_vault_locked(state, vault).await;
+            // This runs inside the vault watcher. Hand teardown to a separate
+            // task so aborting the retained watcher handle cannot cancel its
+            // own disk removal.
+            schedule_revoke_vault_access_verified(state, vault);
             tracing::info!(vault = %vault, "cloud sync: vault deleted upstream (owner-verified); dropped local state");
             return BlobWake::Stopped;
         }
@@ -2323,15 +2773,9 @@ async fn handle_blob_wake_body(
     let mut persist_failed = false;
     if let Some(blob) = body.get("blob").filter(|b| b.get("lifecycle").is_none()) {
         // Serialize against approve.rs's vault.dat writes.
-        let lock = {
-            let mut locks = state.vault_write_locks.lock().unwrap();
-            Arc::clone(
-                locks
-                    .entry(vault.to_string())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
+        let Ok(_guard) = state.vault_write_guard(vault).await else {
+            return BlobWake::Stopped;
         };
-        let _guard = lock.lock().await;
         if let Err(e) = persist_blob(state_dir, vault, blob, version) {
             tracing::warn!(vault = %vault, "cloud sync watch: persist failed: {}", e);
             persist_failed = true;
@@ -2354,6 +2798,7 @@ async fn handle_blob_wake_body(
 enum ProbeError {
     /// 401/403 — the caller applies the long-poll AUTH_RETRY parking.
     Auth,
+    Revoked(Option<serde_json::Value>),
     /// Network/decode/unexpected status — the caller's bounded 2s→60s retry.
     Other(String),
 }
@@ -2392,7 +2837,18 @@ async fn probe_blob_and_handle(
     match resp.status().as_u16() {
         200 => {}
         404 => return Ok(BlobWake::Unchanged),
-        401 | 403 => return Err(ProbeError::Auth),
+        401 => {
+            crate::sync_stream::notify_device_auth_rejected();
+            return Err(ProbeError::Auth);
+        }
+        403 => {
+            let status = resp.status();
+            let body = resp.bytes().await.unwrap_or_default();
+            return match refusal_error(status, &body) {
+                Some(CloudError::Revoked(membership)) => Err(ProbeError::Revoked(membership)),
+                _ => Err(ProbeError::Auth),
+            };
+        }
         other => return Err(ProbeError::Other(format!("blob GET HTTP {}", other))),
     }
     let body: serde_json::Value = resp
@@ -2435,6 +2891,9 @@ async fn pull_and_process(
             }
         }
         Err(e) => {
+            if let Some(membership) = e.revoked() {
+                schedule_revoke_vault_access(state, vault, membership);
+            }
             tracing::debug!(vault = %vault, "cloud sync watch: keyset pull failed: {}", e);
             ok = false;
         }
@@ -2459,6 +2918,9 @@ async fn pull_and_process(
         }
         Ok(_) => {}
         Err(e) => {
+            if let Some(membership) = e.revoked() {
+                schedule_revoke_vault_access(state, vault, membership);
+            }
             tracing::debug!(vault = %vault, "cloud sync watch: per-item pull failed: {}", e);
             ok = false;
         }
@@ -2484,8 +2946,9 @@ async fn confirm_unreadable_after_refresh(state: &Arc<AppState>, vault_id: &str)
         return;
     };
     let keys = item_layer::VaultKeys::from_material(&k);
-    let lock = state.vault_write_lock(vault_id);
-    let _guard = lock.lock().await;
+    let Ok(_guard) = state.vault_write_guard(vault_id).await else {
+        return;
+    };
     let state_dir = &state.config.state_dir;
     let Some(mut pv) = read_per_item_store(state_dir, vault_id) else {
         return;
@@ -2681,7 +3144,7 @@ async fn fetch_item_rows(
     vault: &str,
     device_key: &str,
     since: u64,
-) -> Result<Option<(Vec<ItemRow>, u64)>, String> {
+) -> Result<Option<(Vec<ItemRow>, u64)>, CloudError> {
     let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
     let mut rows: Vec<ItemRow> = Vec::new();
@@ -2703,8 +3166,25 @@ async fn fetch_item_rows(
         match resp.status().as_u16() {
             200 => {}
             404 => return Ok(None), // /items not live yet — no-op (stubbed[])
-            401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
-            other => return Err(format!("items GET HTTP {}", other)),
+            401 => {
+                crate::sync_stream::notify_device_auth_rejected();
+                return Err(CloudError::Other(format!(
+                    "cloud auth rejected (HTTP {})",
+                    resp.status()
+                )));
+            }
+            403 => {
+                let status = resp.status();
+                let body = resp.bytes().await.unwrap_or_default();
+                if let Some(e) = refusal_error(status, &body) {
+                    return Err(e);
+                }
+                return Err(CloudError::Other(format!(
+                    "cloud auth rejected (HTTP {})",
+                    status
+                )));
+            }
+            other => return Err(format!("items GET HTTP {}", other).into()),
         }
         let body: serde_json::Value = resp
             .json()
@@ -2721,7 +3201,7 @@ async fn fetch_item_rows(
             }
         }
     }
-    Err(format!("items GET: more than {} pages", MAX_ITEM_PAGES))
+    Err(format!("items GET: more than {} pages", MAX_ITEM_PAGES).into())
 }
 
 /// One `/items` answer: its rows, and the cursor of the next page when it
@@ -2764,10 +3244,17 @@ pub(crate) enum StoreLock<'a> {
 }
 
 impl StoreLock<'_> {
-    async fn acquire(self, vault: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    async fn acquire(
+        self,
+        vault: &str,
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, String> {
         match self {
-            StoreLock::Take(state) => Some(state.vault_write_lock(vault).lock_owned().await),
-            StoreLock::Held | StoreLock::Boot => None,
+            StoreLock::Take(state) => state
+                .vault_write_guard(vault)
+                .await
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            StoreLock::Held | StoreLock::Boot => Ok(None),
         }
     }
 }
@@ -2798,7 +3285,7 @@ pub(crate) async fn pull_items(
     device_key: &str,
     key: Option<&[u8]>,
     lock: StoreLock<'_>,
-) -> Result<usize, String> {
+) -> Result<usize, CloudError> {
     // Personal build: a SHARED (team) vault's content is left to the official
     // build; never lands on disk here (team-edition §9). Covers every caller.
     if leave_shared_to_official(vault) {
@@ -2810,7 +3297,9 @@ pub(crate) async fn pull_items(
     let Some((rows, max_seq)) = fetch_item_rows(cloud, vault, device_key, since).await? else {
         return Ok(0); // /items not live yet — no-op (stubbed[])
     };
-    adopt_pulled_item_rows(state_dir, vault, lock, &rows, max_seq, key).await
+    adopt_pulled_item_rows(state_dir, vault, lock, &rows, max_seq, key)
+        .await
+        .map_err(CloudError::Other)
 }
 
 /// The write-back of [`pull_items`]: under the vault write lock, re-read the
@@ -2824,7 +3313,7 @@ async fn adopt_pulled_item_rows(
     max_seq: u64,
     key: Option<&[u8]>,
 ) -> Result<usize, String> {
-    let _guard = lock.acquire(vault).await;
+    let _guard = lock.acquire(vault).await?;
     let Some(mut pv) = read_per_item_store(state_dir, vault) else {
         return Ok(0);
     };
@@ -2895,7 +3384,12 @@ pub(crate) async fn catch_up_at_unlock(
             state.record_cloud_contact(vault_id);
             (adopted > 0, None)
         }
-        Ok(Err(e)) => (adopted > 0, Some(e)),
+        Ok(Err(e)) => {
+            if let Some(membership) = e.revoked() {
+                schedule_revoke_vault_access(state, vault_id, membership);
+            }
+            (adopted > 0, Some(e.to_string()))
+        }
         Err(_) => (
             adopted > 0,
             Some(format!(
@@ -2953,6 +3447,7 @@ pub enum PushOutcome {
     EndpointMissing,
     Rejected { status: u16, error: String },
     KeysetChanged,
+    Revoked(Option<serde_json::Value>),
 }
 
 /// A non-2xx item PUT status the server returns for the write ITSELF (bad
@@ -3029,8 +3524,17 @@ pub async fn push_item(
             })
         }
         404 => Ok(PushOutcome::EndpointMissing),
+        401 => {
+            crate::sync_stream::notify_device_auth_rejected();
+            Err("item PUT HTTP 401".into())
+        }
         other if is_terminal_put_status(other) => {
-            let b: serde_json::Value = resp.json().await.unwrap_or_default();
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            if let Some(CloudError::Revoked(membership)) = refusal_error(status, &bytes) {
+                return Ok(PushOutcome::Revoked(membership));
+            }
+            let b: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
             Ok(PushOutcome::Rejected {
                 status: other,
                 error: b
@@ -3279,9 +3783,10 @@ fn apply_local_fixes(
                 }
             }
             LocalFix::Mirror { id, row } => {
-                let take = pv.items.get(&id).is_none_or(|s| {
-                    s.version < row.version && s.version <= s.synced_version
-                });
+                let take = pv
+                    .items
+                    .get(&id)
+                    .is_none_or(|s| s.version < row.version && s.version <= s.synced_version);
                 if take {
                     pv.items.insert(id, row);
                     out.changed = true;
@@ -3355,14 +3860,23 @@ enum Resolved {
     /// The cloud refused ours for good ([`rejection_fixes`]): `fixes` (none:
     /// ours stays dirty, unsent), and the user is told with `note`
     /// ([`rejection_note`]); never reverted silently.
-    Rejected { fixes: Vec<LocalFix>, note: String },
+    Rejected {
+        fixes: Vec<LocalFix>,
+        note: String,
+    },
+    Revoked(Option<serde_json::Value>),
 }
 
 /// What the user is told of a change of `ours` the cloud refused for good
 /// (`status`, `error`), and what became of it (`fixes`, as
 /// [`rejection_fixes`] made them): kept as its conflict copy, kept unsent,
 /// or not applied while the vault's version stays.
-fn rejection_note(ours: &item_layer::ItemPayload, status: u16, error: &str, fixes: &[LocalFix]) -> String {
+fn rejection_note(
+    ours: &item_layer::ItemPayload,
+    status: u16,
+    error: &str,
+    fixes: &[LocalFix],
+) -> String {
     let error: String = crate::util::terminal_safe(error).chars().take(80).collect();
     let why = if error.is_empty() {
         format!("HTTP {}", status)
@@ -3379,7 +3893,12 @@ fn rejection_note(ours: &item_layer::ItemPayload, status: u16, error: &str, fixe
     } else {
         "the vault keeps its version; re-run it once the cloud takes it".to_string()
     };
-    format!("{}: the cloud refused this change ({}); {}", conflict_record(ours), why, what)
+    format!(
+        "{}: the cloud refused this change ({}); {}",
+        conflict_record(ours),
+        why,
+        what
+    )
 }
 
 /// [`rejection_fixes`] as a [`Resolved::Rejected`], said to the user.
@@ -3450,6 +3969,9 @@ async fn load_conflict_pair(
                 }
                 Ok(None) => return Err(Resolved::EndpointMissing),
                 Err(e) => {
+                    if let Some(membership) = e.revoked() {
+                        return Err(Resolved::Revoked(membership));
+                    }
                     tracing::warn!(vault = %vault_id, "per-item reconcile: snapshot fetch failed ({}); rows left dirty", e);
                     TheirRows::Unavailable
                 }
@@ -3560,7 +4082,8 @@ fn unreadable_ours(
             let Ok(ct) = URL_SAFE_NO_PAD.decode(r.ct.as_bytes()) else {
                 return Resolved::LeaveDirty;
             };
-            let theirs = item_layer::open_wire_item::<S>(keys, vault_id, &r.item_id, r.version, &ct).ok();
+            let theirs =
+                item_layer::open_wire_item::<S>(keys, vault_id, &r.item_id, r.version, &ct).ok();
             let tombstone = theirs.as_ref().is_some_and(|p| p.is_tombstone());
             (
                 adopt_fix(ours_row, &r, ct, tombstone),
@@ -3819,7 +4342,13 @@ async fn resolve_conflict(
                         if let Ok(cct) = URL_SAFE_NO_PAD.decode(c.ct.as_bytes()) {
                             fixes.push(LocalFix::Mirror {
                                 id: wire.clone(),
-                                row: clean_row(c.version, cct, false, c.sig.clone(), c.signer.clone()),
+                                row: clean_row(
+                                    c.version,
+                                    cct,
+                                    false,
+                                    c.sig.clone(),
+                                    c.signer.clone(),
+                                ),
                             });
                         }
                     }
@@ -3830,14 +4359,15 @@ async fn resolve_conflict(
                     base_version,
                 }) => {
                     let version = base_version.map_or(1, |v| v + 1);
-                    let copy_ct =
-                        match item_layer::seal_wire_item::<S>(keys, vault_id, &wire, version, &payload) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: seal conflict copy failed ({}); left dirty", e);
-                                return Resolved::LeaveDirty;
-                            }
-                        };
+                    let copy_ct = match item_layer::seal_wire_item::<S>(
+                        keys, vault_id, &wire, version, &payload,
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(vault = %vault_id, item = %ours_row.id, "per-item 409: seal conflict copy failed ({}); left dirty", e);
+                            return Resolved::LeaveDirty;
+                        }
+                    };
                     match push_item(
                         cloud,
                         vault_id,
@@ -3859,6 +4389,9 @@ async fn resolve_conflict(
                             return Resolved::LeaveDirty
                         }
                         Ok(PushOutcome::EndpointMissing) => return Resolved::EndpointMissing,
+                        Ok(PushOutcome::Revoked(membership)) => {
+                            return Resolved::Revoked(membership)
+                        }
                         Ok(PushOutcome::Rejected { status, error }) => {
                             // The copy itself is refused for good (a NEW item on a
                             // frozen plan): keep it locally, dirty, and take theirs.
@@ -3895,7 +4428,12 @@ async fn resolve_conflict(
                 // (`coalesce(p_version, 1)`); re-creating at 1 like the console
                 // would be ignored by a device still holding the GC'd row at a
                 // higher version (a pull adopts strictly-newer only).
-                None => (None, ours_row.version, ours_row.ct.clone(), ours_row.generation),
+                None => (
+                    None,
+                    ours_row.version,
+                    ours_row.ct.clone(),
+                    ours_row.generation,
+                ),
                 Some((r, _, _)) => {
                     let v = r.version + 1;
                     match item_layer::seal_wire_item::<S>(keys, vault_id, &ours_row.id, v, &ours) {
@@ -3936,8 +4474,11 @@ async fn resolve_conflict(
                 }
                 // Raced again, or the vault key changed: one retry per item per
                 // push; the next push reconciles.
-                Ok(PushOutcome::Conflict { .. } | PushOutcome::KeysetChanged) => Resolved::LeaveDirty,
+                Ok(PushOutcome::Conflict { .. } | PushOutcome::KeysetChanged) => {
+                    Resolved::LeaveDirty
+                }
                 Ok(PushOutcome::EndpointMissing) => Resolved::EndpointMissing,
+                Ok(PushOutcome::Revoked(membership)) => Resolved::Revoked(membership),
                 Ok(PushOutcome::Rejected { status, error })
                     if is_signed_row_refusal(status, &error) =>
                 {
@@ -3974,7 +4515,8 @@ impl PushTally {
             Resolved::Fixed(f) => self.fixes.extend(f),
             Resolved::SetAside { fixes, record } => {
                 self.fixes.extend(fixes);
-                self.set_aside_rows.push((row.id.clone(), record, row.upgrade));
+                self.set_aside_rows
+                    .push((row.id.clone(), record, row.upgrade));
             }
             Resolved::Refused(why) => {
                 self.left_dirty += 1;
@@ -3996,6 +4538,7 @@ impl PushTally {
                 self.endpoint_missing = true;
                 return false;
             }
+            Resolved::Revoked(_) => return false,
         }
         true
     }
@@ -4010,7 +4553,11 @@ struct PushGens {
     session: Option<u64>,
 }
 
-fn push_gens(state_dir: &Path, vault_id: &str, keys: Option<item_layer::VaultKeys<'_>>) -> PushGens {
+fn push_gens(
+    state_dir: &Path,
+    vault_id: &str,
+    keys: Option<item_layer::VaultKeys<'_>>,
+) -> PushGens {
     let pv = read_per_item_store(state_dir, vault_id);
     PushGens {
         keyset: pv.as_ref().and_then(|pv| pv.keyset_generation()),
@@ -4134,6 +4681,7 @@ fn needs_unlock_note(record: &str, generation: Option<u64>) -> String {
 /// next version under the current key, CAS on their version. The fix that
 /// keeps it locally when it landed; `None` otherwise (theirs stands).
 async fn overwrite_unreadable(
+    state: &Arc<AppState>,
     cloud: &str,
     vault_id: &str,
     dk: &str,
@@ -4166,6 +4714,10 @@ async fn overwrite_unreadable(
                 expect: row.version,
                 row: clean_row(version, ct, o.ours.is_tombstone(), None, None),
             })
+        }
+        Ok(PushOutcome::Revoked(membership)) => {
+            revoke_vault_access(state, vault_id, membership).await;
+            None
         }
         _ => None,
     }
@@ -4316,7 +4868,15 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                 continue;
             }
             Gen::Unreadable => {
-                let r = set_aside_unreadable(cloud, vault_id, &dk, keys, &mut their_rows, row).await;
+                let r =
+                    set_aside_unreadable(cloud, vault_id, &dk, keys, &mut their_rows, row).await;
+                let r = match r {
+                    Resolved::Revoked(membership) => {
+                        revoke_vault_access(state, vault_id, membership).await;
+                        return;
+                    }
+                    other => other,
+                };
                 if !tally.take(row, r) {
                     break;
                 }
@@ -4353,7 +4913,9 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                 // Never dropped.
                 if !keyset_pulled {
                     keyset_pulled = true;
-                    if let Err(e) = pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state)).await {
+                    if let Err(e) =
+                        pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state)).await
+                    {
                         tracing::warn!(vault = %vault_id, "per-item push: keyset pull failed: {}", e);
                     }
                     gens = push_gens(state_dir, vault_id, keys);
@@ -4381,6 +4943,10 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                                 tally.endpoint_missing = true;
                                 break;
                             }
+                            Ok(PushOutcome::Revoked(membership)) => {
+                                revoke_vault_access(state, vault_id, membership).await;
+                                return;
+                            }
                             // Kept, re-sealed: the next push reconciles it.
                             _ => tally.left_dirty += 1,
                         }
@@ -4393,7 +4959,9 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                         ));
                     }
                     Gen::Unreadable => {
-                        let r = set_aside_unreadable(cloud, vault_id, &dk, keys, &mut their_rows, row).await;
+                        let r =
+                            set_aside_unreadable(cloud, vault_id, &dk, keys, &mut their_rows, row)
+                                .await;
                         if !tally.take(row, r) {
                             break;
                         }
@@ -4423,6 +4991,13 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     gens.session,
                 )
                 .await;
+                let r = match r {
+                    Resolved::Revoked(membership) => {
+                        revoke_vault_access(state, vault_id, membership).await;
+                        return;
+                    }
+                    other => other,
+                };
                 // Their row cannot be read: refresh the keyset first; if this
                 // session then holds the current generation's key, their row
                 // opens under no key a current member holds, and ours may go
@@ -4435,7 +5010,10 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     } => {
                         if !keyset_pulled {
                             keyset_pulled = true;
-                            if let Err(e) = pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state)).await {
+                            if let Err(e) =
+                                pull_keys(state_dir, cloud, vault_id, &dk, StoreLock::Take(state))
+                                    .await
+                            {
                                 tracing::warn!(vault = %vault_id, "per-item push: keyset pull failed: {}", e);
                             }
                             gens = push_gens(state_dir, vault_id, Some(keys));
@@ -4449,7 +5027,17 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                                 o.ours.is_tombstone(),
                             );
                         let landed = if may {
-                            overwrite_unreadable(cloud, vault_id, &dk, keys, row, &o, Some(current)).await
+                            overwrite_unreadable(
+                                state,
+                                cloud,
+                                vault_id,
+                                &dk,
+                                keys,
+                                row,
+                                &o,
+                                Some(current),
+                            )
+                            .await
                         } else {
                             None
                         };
@@ -4492,9 +5080,20 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
                     &error,
                 )
                 .await;
+                let r = match r {
+                    Resolved::Revoked(membership) => {
+                        revoke_vault_access(state, vault_id, membership).await;
+                        return;
+                    }
+                    other => other,
+                };
                 if !tally.take(row, r) {
                     break;
                 }
+            }
+            Ok(PushOutcome::Revoked(membership)) => {
+                revoke_vault_access(state, vault_id, membership).await;
+                return;
             }
             Err(e) => {
                 // Transient — skip this item, keep trying the others.
@@ -4526,8 +5125,9 @@ pub async fn push_items_best_effort(state: &Arc<AppState>, vault_id: &str) {
     // meanwhile stays dirty and goes out on the next sync.
     let mut content_changed = false;
     if !fixes.is_empty() {
-        let lock = state.vault_write_lock(vault_id);
-        let _guard = lock.lock().await;
+        let Ok(_guard) = state.vault_write_guard(vault_id).await else {
+            return;
+        };
         if let Some(mut pv) = read_per_item_store(state_dir, vault_id) {
             let applied = apply_local_fixes(&mut pv, fixes, keys.map(|k| (k, vault_id)));
             refused_rows.extend(applied.refused);
@@ -4704,7 +5304,7 @@ pub(crate) async fn pull_keys(
     vault: &str,
     device_key: &str,
     lock: StoreLock<'_>,
-) -> Result<usize, String> {
+) -> Result<usize, CloudError> {
     // Personal build: a SHARED (team) vault's keyset is left to the official
     // build; never lands on disk here (team-edition §9). Covers every caller.
     if leave_shared_to_official(vault) {
@@ -4735,8 +5335,25 @@ pub(crate) async fn pull_keys(
         // TRIPLE at /membership, not row-shaped /keys. Route there. Legacy fmt=1 personal
         // vaults keep the row path below (single request, unchanged).
         409 => return pull_membership(state_dir, cloud, vault, device_key, false, lock).await,
-        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
-        other => return Err(format!("keys GET HTTP {}", other)),
+        401 => {
+            crate::sync_stream::notify_device_auth_rejected();
+            return Err(CloudError::Other(format!(
+                "cloud auth rejected (HTTP {})",
+                resp.status()
+            )));
+        }
+        403 => {
+            let status = resp.status();
+            let body = resp.bytes().await.unwrap_or_default();
+            if let Some(e) = refusal_error(status, &body) {
+                return Err(e);
+            }
+            return Err(CloudError::Other(format!(
+                "cloud auth rejected (HTTP {})",
+                status
+            )));
+        }
+        other => return Err(format!("keys GET HTTP {}", other).into()),
     }
     let body: serde_json::Value = resp
         .json()
@@ -4750,7 +5367,9 @@ pub(crate) async fn pull_keys(
         .map_err(|e| format!("parse keys array: {}", e))?
         .unwrap_or_default();
     let seq = body.get("seq").and_then(|v| v.as_u64());
-    adopt_pulled_key_rows(state_dir, vault, lock, &rows, seq).await
+    adopt_pulled_key_rows(state_dir, vault, lock, &rows, seq)
+        .await
+        .map_err(CloudError::Other)
 }
 
 /// The write-back of [`pull_keys`]: under the vault write lock, re-read the
@@ -4764,7 +5383,7 @@ async fn adopt_pulled_key_rows(
     rows: &[KeyRow],
     seq: Option<u64>,
 ) -> Result<usize, String> {
-    let _guard = lock.acquire(vault).await;
+    let _guard = lock.acquire(vault).await?;
     let mut pv = store_or_empty_keyset(state_dir, vault)?;
     let adopted = adopt_key_rows(&mut pv, vault, rows)?;
     if let Some(seq) = seq.filter(|s| *s > pv.keyset_seq) {
@@ -4789,7 +5408,7 @@ async fn pull_membership(
     device_key: &str,
     force_full: bool,
     lock: StoreLock<'_>,
-) -> Result<usize, String> {
+) -> Result<usize, CloudError> {
     // Personal build: a SHARED (team) vault's membership triple is left to the
     // official build; never lands on disk here (team-edition §9).
     if leave_shared_to_official(vault) {
@@ -4810,7 +5429,11 @@ async fn pull_membership(
     // NOT bump keyset_seq, so a delta pull replies "nothing new" and never
     // refreshes the registry. A full pull re-adopts the triple (incl. each
     // credential's x/y) so `credential_lookup` stops missing it.
-    let since = if first_v2 || force_full { 0 } else { pv.keyset_seq };
+    let since = if first_v2 || force_full {
+        0
+    } else {
+        pv.keyset_seq
+    };
     let url = format!(
         "{}/v/{}/membership?since={}",
         cloud.trim_end_matches('/'),
@@ -4829,14 +5452,33 @@ async fn pull_membership(
     match resp.status().as_u16() {
         200 => {}
         404 => return Ok(0), // /membership not live yet — no-op
-        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
-        other => return Err(format!("membership GET HTTP {}", other)),
+        401 => {
+            crate::sync_stream::notify_device_auth_rejected();
+            return Err(CloudError::Other(format!(
+                "cloud auth rejected (HTTP {})",
+                resp.status()
+            )));
+        }
+        403 => {
+            let status = resp.status();
+            let body = resp.bytes().await.unwrap_or_default();
+            if let Some(e) = refusal_error(status, &body) {
+                return Err(e);
+            }
+            return Err(CloudError::Other(format!(
+                "cloud auth rejected (HTTP {})",
+                status
+            )));
+        }
+        other => return Err(format!("membership GET HTTP {}", other).into()),
     }
     let body: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| format!("parse membership response: {}", e))?;
-    adopt_pulled_membership(state_dir, vault, lock, &body).await
+    adopt_pulled_membership(state_dir, vault, lock, &body)
+        .await
+        .map_err(CloudError::Other)
 }
 
 /// The write-back of [`pull_membership`]: under the vault write lock, re-read
@@ -4848,7 +5490,7 @@ async fn adopt_pulled_membership(
     lock: StoreLock<'_>,
     body: &serde_json::Value,
 ) -> Result<usize, String> {
-    let _guard = lock.acquire(vault).await;
+    let _guard = lock.acquire(vault).await?;
     let mut pv = store_or_empty_keyset(state_dir, vault)?;
     let first_v2 = pv.keyset.uik.is_none();
     let max_seq = body
@@ -4858,7 +5500,9 @@ async fn adopt_pulled_membership(
     // A since-delta "nothing new" reply carries only keyset_seq; a pre-bootstrap vault
     // carries a null anchor. Either way there is no triple to adopt — just advance the cursor.
     let adopted = match body.get("anchor").and_then(|v| v.as_str()) {
-        Some(anchor) if !anchor.is_empty() => adopt_membership_triple(&mut pv, vault, anchor, body)?,
+        Some(anchor) if !anchor.is_empty() => {
+            adopt_membership_triple(&mut pv, vault, anchor, body)?
+        }
         _ => 0,
     };
     if first_v2 {
@@ -4948,10 +5592,16 @@ fn adopt_membership_triple(
         // alone) so the owner-set is identical across all three even for a member whose
         // nullable `enc_pub` / K fields are missing. A member with no `sig_pub` can't be
         // self-certified → skip (fail-closed); the delegation log still folds them from sigs.
-        let Some(sig_pub) = ident.and_then(|i| i.get("sig_pub")).and_then(|v| v.as_str()) else {
+        let Some(sig_pub) = ident
+            .and_then(|i| i.get("sig_pub"))
+            .and_then(|v| v.as_str())
+        else {
             continue;
         };
-        let enc_pub = ident.and_then(|i| i.get("enc_pub")).and_then(|v| v.as_str()).unwrap_or("");
+        let enc_pub = ident
+            .and_then(|i| i.get("enc_pub"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let k_encapped = m.get("k_encapped").and_then(|v| v.as_str()).unwrap_or("");
         let k_ct = m.get("k_ct").and_then(|v| v.as_str()).unwrap_or("");
         // A bad/absent role token degrades to Member (least privilege) — NEVER `?`-fail the
@@ -5009,7 +5659,9 @@ fn adopt_membership_triple(
     let root_succession = proof.and_then(|p| p.get("succession")).cloned();
     adopt_delegation_meta(pv, vault_id, &delegation_log, &root_succession)
         .map_err(|e| format!("adopt delegation meta: {}", e))?;
-    let generation = proof.and_then(|p| p.get("generation")).and_then(|v| v.as_u64());
+    let generation = proof
+        .and_then(|p| p.get("generation"))
+        .and_then(|v| v.as_u64());
     let rekey_proof = proof.and_then(|p| p.get("rekey_proof")).cloned();
     adopt_rekey_meta(pv, vault_id, generation, &rekey_proof)
         .map_err(|e| format!("adopt rekey meta: {}", e))?;
@@ -5338,7 +5990,10 @@ fn adopt_rekey_meta(
         .unwrap_or_default();
     // Membership anti-rollback commitment (Part 2): the re-key proof binds the
     // delegation-log prefix current at re-key time (owner-signed). Absent/0 = empty.
-    let membership_len = p.get("membership_len").and_then(|v| v.as_u64()).unwrap_or(0);
+    let membership_len = p
+        .get("membership_len")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let membership_hash = p
         .get("membership_hash")
         .and_then(|v| v.as_str())
@@ -5525,6 +6180,10 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let cloud_versions = match fetch_key_versions(cloud, vault_id, &dk).await {
         Ok(m) => m,
         Err(e) => {
+            if let Some(membership) = e.revoked() {
+                revoke_vault_access(state, vault_id, membership).await;
+                return;
+            }
             tracing::debug!(vault = %vault_id, "keyset push: version probe failed: {}", e);
             return;
         }
@@ -5571,6 +6230,10 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
                 return;
             }
             Ok(PushOutcome::KeysetChanged) => return,
+            Ok(PushOutcome::Revoked(membership)) => {
+                revoke_vault_access(state, vault_id, membership).await;
+                return;
+            }
             Err(e) => {
                 tracing::warn!(vault = %vault_id, cid = %cid_b64, "keyset push failed: {}", e);
                 return;
@@ -5587,7 +6250,7 @@ async fn fetch_key_versions(
     cloud: &str,
     vault: &str,
     device_key: &str,
-) -> Result<std::collections::HashMap<String, u64>, String> {
+) -> Result<std::collections::HashMap<String, u64>, CloudError> {
     let url = format!("{}/v/{}/keys?since=0", cloud.trim_end_matches('/'), vault);
     let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
@@ -5601,8 +6264,25 @@ async fn fetch_key_versions(
     match resp.status().as_u16() {
         200 => {}
         404 => return Ok(std::collections::HashMap::new()),
-        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
-        other => return Err(format!("keys GET HTTP {}", other)),
+        401 => {
+            crate::sync_stream::notify_device_auth_rejected();
+            return Err(CloudError::Other(format!(
+                "cloud auth rejected (HTTP {})",
+                resp.status()
+            )));
+        }
+        403 => {
+            let status = resp.status();
+            let body = resp.bytes().await.unwrap_or_default();
+            if let Some(e) = refusal_error(status, &body) {
+                return Err(e);
+            }
+            return Err(CloudError::Other(format!(
+                "cloud auth rejected (HTTP {})",
+                status
+            )));
+        }
+        other => return Err(format!("keys GET HTTP {}", other).into()),
     }
     let body: serde_json::Value = resp
         .json()
@@ -5666,6 +6346,18 @@ async fn push_key(
             })
         }
         404 => Ok(PushOutcome::EndpointMissing),
+        401 => {
+            crate::sync_stream::notify_device_auth_rejected();
+            Err("key PUT HTTP 401".into())
+        }
+        403 => {
+            let status = resp.status();
+            let body = resp.bytes().await.unwrap_or_default();
+            match refusal_error(status, &body) {
+                Some(CloudError::Revoked(membership)) => Ok(PushOutcome::Revoked(membership)),
+                _ => Err("key PUT HTTP 403".into()),
+            }
+        }
         other => Err(format!("key PUT HTTP {}", other)),
     }
 }
@@ -5676,6 +6368,377 @@ mod peritem_tests {
     use crate::storage::item::{ItemNs, VaultKeys};
     use crate::storage::sealed_vault::PerItemVault;
     use sudp::primitives::StdPrimitives;
+
+    #[test]
+    fn vault_refusal_requires_the_dedicated_403_json_signal() {
+        use reqwest::StatusCode;
+        let membership = serde_json::json!({ "anchor": "a" });
+        let by_code = serde_json::to_vec(&serde_json::json!({
+            "code": "SC_VAULT_ACCESS_REVOKED",
+            "membership": membership,
+        }))
+        .unwrap();
+        assert!(matches!(
+            vault_refusal(StatusCode::FORBIDDEN, &by_code),
+            Some(VaultRefusal::AccessRevoked {
+                membership: Some(_)
+            })
+        ));
+        let by_error = br#"{"error":"vault_access_revoked"}"#;
+        assert!(vault_refusal(StatusCode::FORBIDDEN, by_error).is_some());
+        for (status, body) in [
+            (StatusCode::UNAUTHORIZED, by_code.as_slice()),
+            (StatusCode::SERVICE_UNAVAILABLE, by_code.as_slice()),
+            (StatusCode::FORBIDDEN, b""),
+            (StatusCode::FORBIDDEN, b"not-json"),
+            (StatusCode::FORBIDDEN, br#"{"error":"vault_mismatch"}"#),
+            (StatusCode::FORBIDDEN, br#"{"code":"SC_UPGRADE_REQUIRED"}"#),
+        ] {
+            assert!(vault_refusal(status, body).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_readd_clears_revocation_and_restarts_the_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new(test_config(dir.path())));
+        state
+            .revoked_vaults
+            .lock()
+            .unwrap()
+            .insert("v-readd".into());
+        let discovered = vec![DiscoveredVault {
+            id: "v-readd".into(),
+            label: Some("Re-added".into()),
+            kind: Some("private".into()),
+        }];
+        assert_eq!(restore_discovered_access(&state, &discovered), ["v-readd"]);
+        assert!(!state.is_vault_revoked("v-readd"));
+
+        let (_health_tx, health_rx) = tokio::sync::watch::channel(StreamHealth::Down);
+        ensure_watcher(
+            state.clone(),
+            "v-readd".into(),
+            "http://127.0.0.1:1".into(),
+            "device-key".into(),
+            health_rx,
+            None,
+        );
+        assert!(state.watchers.lock().unwrap().contains_key("v-readd"));
+        assert!(state.watcher_cells.lock().unwrap().contains_key("v-readd"));
+        let handle = { state.watchers.lock().unwrap().remove("v-readd") };
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    fn assert_app_state_fields_classified(state: &AppState) {
+        let AppState {
+            config: _,
+            vaults: _,
+            cloud_contact: _,
+            vault_shared: _,
+            vault_upgrade_required: _,
+            sync_conflicts: _,
+            catch_up_failures: _,
+            pending_rotations: _,
+            team: _,
+            pending_format_mark: _,
+            pending_config_ids: _,
+            challenges: _,
+            approvals: _,
+            batch_roots: _,
+            services: _,
+            events: _,
+            vault_states: _,
+            revoked_vaults: _,
+            last_host_unions: _,
+            host_unions_persisted: _,
+            audits: _,
+            sc: _,
+            vault_write_locks: _,
+            watchers: _,
+            watcher_cells: _,
+            access_probes: _,
+            sse_semaphores: _,
+            ledger: _,
+            ledger_sync: _,
+            external_fill_lock: _,
+            oauth_reauth_needed: _,
+            oauth_redeemed_codes: _,
+            live_ceremony_ops: _,
+            boot_id: _,
+            egress_proxy: _,
+            oauth_pending: _,
+            oauth_listener_running: _,
+            op_payloads: _,
+        } = state;
+    }
+
+    fn test_config(state_dir: &Path) -> crate::config::Config {
+        crate::config::Config {
+            state_dir: state_dir.to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        }
+    }
+
+    fn fake_operation(vault: &str) -> crate::protocol::operation::Operation {
+        use crate::protocol::operation::{Act, ActType, Bind, Valid};
+        crate::protocol::operation::Operation {
+            act: Act {
+                kind: ActType::Export,
+                target: "x".into(),
+                scope: serde_json::Value::Null,
+            },
+            bind: Bind {
+                redeemer: vault.into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_teardown_clears_every_vault_object_and_deletes_only_with_proof() {
+        use crate::approval::ApprovalStatus;
+        use crate::crypto::vault_key::UikRoot;
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let state_dir = home.path().join("state");
+        let state = Arc::new(AppState::new(test_config(&state_dir)));
+        assert_app_state_fields_classified(&state);
+        state.open_ledger_for_tests(&[]);
+
+        let vault = "vault-lock-only";
+        state.vaults.ensure_dir(vault).unwrap();
+        std::fs::write(
+            state.vaults.dir_for(vault).unwrap().join("sentinel"),
+            b"keep",
+        )
+        .unwrap();
+        state.unlock_vault(
+            vault.into(),
+            crate::state::SecretsCache::default(),
+            zeroize::Zeroizing::new(vec![7; 32]),
+        );
+        state
+            .cloud_contact
+            .lock()
+            .unwrap()
+            .insert(vault.into(), std::time::Instant::now());
+        state
+            .vault_shared
+            .lock()
+            .unwrap()
+            .insert(vault.into(), true);
+        state
+            .vault_upgrade_required
+            .lock()
+            .unwrap()
+            .insert(vault.into());
+        state.note_sync(vault, "item", crate::state::SyncNote::Refused("x".into()));
+        state.note_catch_up(vault, "x");
+        state.note_rotation_pending(vault, "conn", "role", "token", "x");
+        state
+            .pending_format_mark
+            .lock()
+            .unwrap()
+            .insert(vault.into());
+        state
+            .pending_config_ids
+            .lock()
+            .unwrap()
+            .insert(vault.into(), vec!["id".into()]);
+        state.note_loopback_pending("oauth-state", vault, "conn", 8765);
+        state
+            .oauth_reauth_needed
+            .lock()
+            .unwrap()
+            .insert((vault.into(), "conn".into()));
+        state
+            .live_ceremony_ops
+            .lock()
+            .unwrap()
+            .insert((vault.into(), "unlock".into()), "op".into());
+        state
+            .sse_semaphores
+            .lock()
+            .unwrap()
+            .insert(vault.into(), Arc::new(tokio::sync::Semaphore::new(1)));
+        state.access_probes.lock().unwrap().insert(vault.into());
+        state
+            .last_host_unions
+            .lock()
+            .unwrap()
+            .insert(vault.into(), vec!["api.example".into()]);
+        let approval =
+            state
+                .approvals
+                .lock()
+                .unwrap()
+                .create(vault.into(), fake_operation(vault), "r".into());
+        let cell = Arc::new(WakeCell::new());
+        state
+            .watcher_cells
+            .lock()
+            .unwrap()
+            .insert(vault.into(), cell);
+        state
+            .watchers
+            .lock()
+            .unwrap()
+            .insert(vault.into(), tokio::spawn(std::future::pending::<()>()));
+        let _ = state.audits.for_vault(vault).unwrap();
+        drop(state.vault_write_guard(vault).await.unwrap());
+
+        revoke_vault_access(&state, vault, None).await;
+        assert!(state.is_vault_revoked(vault));
+        assert!(state.is_vault_locked(vault));
+        state.unlock_vault(
+            vault.into(),
+            crate::state::SecretsCache::default(),
+            zeroize::Zeroizing::new(vec![8; 32]),
+        );
+        assert!(state.is_vault_locked(vault));
+        assert!(state.vault_write_guard(vault).await.is_err());
+        assert!(!state.cloud_contact.lock().unwrap().contains_key(vault));
+        assert!(!state.vault_shared.lock().unwrap().contains_key(vault));
+        assert!(!state.vault_upgrade_required.lock().unwrap().contains(vault));
+        assert!(!state.sync_conflicts.lock().unwrap().contains_key(vault));
+        assert!(!state.catch_up_failures.lock().unwrap().contains_key(vault));
+        assert!(!state.pending_rotations.lock().unwrap().contains_key(vault));
+        assert!(!state.pending_format_mark.lock().unwrap().contains(vault));
+        assert!(!state.pending_config_ids.lock().unwrap().contains_key(vault));
+        assert!(!state
+            .oauth_pending
+            .lock()
+            .unwrap()
+            .values()
+            .any(|p| p.vault_id == vault));
+        assert!(!state
+            .oauth_reauth_needed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(v, _)| v == vault));
+        assert!(!state
+            .live_ceremony_ops
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(v, _)| v == vault));
+        assert!(!state.sse_semaphores.lock().unwrap().contains_key(vault));
+        assert!(!state.access_probes.lock().unwrap().contains(vault));
+        assert!(!state.watchers.lock().unwrap().contains_key(vault));
+        assert!(!state.watcher_cells.lock().unwrap().contains_key(vault));
+        assert!(state.last_host_unions.lock().unwrap().contains_key(vault));
+        let rec = state
+            .approvals
+            .lock()
+            .unwrap()
+            .get(&approval)
+            .unwrap()
+            .clone();
+        assert!(
+            matches!(rec.status, ApprovalStatus::Rejected { ref reason } if reason == REVOKED_REASON)
+        );
+        assert!(
+            state.vaults.dir_for(vault).unwrap().exists(),
+            "unsigned refusal keeps disk"
+        );
+
+        let untrusted = "vault-untrusted-triple";
+        write_per_item_store(&state_dir, untrusted, &empty_keyset_store()).unwrap();
+        revoke_vault_access(
+            &state,
+            untrusted,
+            Some(serde_json::json!({
+                "anchor": STANDARD.encode([3u8; 32]),
+                "members": {},
+                "identities": {},
+                "proof": { "delegation_log": [], "succession": [], "generation": 0 }
+            })),
+        )
+        .await;
+        assert!(
+            state.vaults.dir_for(untrusted).unwrap().exists(),
+            "an unpinned response triple keeps disk"
+        );
+
+        let deleted = "vault-signed-exclusion";
+        let creator = UikRoot::from_root([0x61; 32]);
+        let creator_id = creator.user_id();
+        let creator_pub = creator.signing().public_bytes();
+        let role_sig = STANDARD.encode(creator.signing().sign(
+            &crate::identity::role_grant_input(deleted, &creator_id, "owner", 0),
+        ));
+        let prior = serde_json::json!({
+            "anchor": STANDARD.encode(creator_pub),
+            "keyset_seq": 1,
+            "members": {
+                (creator_id.clone()): { "role": "owner", "role_sig": role_sig.clone() }
+            },
+            "identities": {
+                (creator_id.clone()): { "sig_pub": STANDARD.encode(creator_pub), "enc_pub": STANDARD.encode([9u8; 32]) }
+            },
+            "proof": { "delegation_log": [], "succession": [], "generation": 0 }
+        });
+        let mut local = empty_keyset_store();
+        adopt_membership_triple(
+            &mut local,
+            deleted,
+            prior["anchor"].as_str().unwrap(),
+            &prior,
+        )
+        .unwrap();
+        assert_eq!(
+            local.verified_membership(deleted, "us_removed"),
+            Some(false)
+        );
+        write_per_item_store(&state_dir, deleted, &local).unwrap();
+
+        let membership = serde_json::json!({
+            "anchor": STANDARD.encode(creator_pub),
+            "keyset_seq": 1,
+            "members": {
+                (creator_id.clone()): { "role": "owner", "role_sig": role_sig }
+            },
+            "identities": {
+                (creator_id): { "sig_pub": STANDARD.encode(creator_pub), "enc_pub": STANDARD.encode([9u8; 32]) }
+            },
+            "proof": { "delegation_log": [], "succession": [], "generation": 0 }
+        });
+        let mut cli = crate::cli::active::CliConfig::default();
+        cli.account_uik = Some("us_removed".into());
+        crate::cli::active::save(&cli).unwrap();
+        assert!(attached_membership_excludes_us(
+            &state,
+            deleted,
+            Some(&membership)
+        ));
+        revoke_vault_access(&state, deleted, Some(membership)).await;
+        assert!(!state.vaults.dir_for(deleted).unwrap().exists());
+
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 
     /// §15 W1: a vault with a keyset drops only on a VERIFIED owner tombstone.
     /// Unsigned or forged deletes never drop, on a personal (v1) keyset (signed
@@ -5701,11 +6764,26 @@ mod peritem_tests {
         // Personal (v1 keyset): the paired account's key.
         let pv = empty_pv();
         let pin = Some(me.public_bytes());
-        assert!(!tombstone_verified_for(&pv, vid, &unsigned, pin), "unsigned");
-        assert!(tombstone_verified_for(&pv, vid, &signed(&me), pin), "the account");
-        assert!(!tombstone_verified_for(&pv, vid, &signed(&other), pin), "someone else");
-        assert!(!tombstone_verified_for(&pv, vid, &signed(&me), None), "no pinned key");
-        assert!(!tombstone_verified_for(&pv, "vault-other", &signed(&me), pin), "another vault");
+        assert!(
+            !tombstone_verified_for(&pv, vid, &unsigned, pin),
+            "unsigned"
+        );
+        assert!(
+            tombstone_verified_for(&pv, vid, &signed(&me), pin),
+            "the account"
+        );
+        assert!(
+            !tombstone_verified_for(&pv, vid, &signed(&other), pin),
+            "someone else"
+        );
+        assert!(
+            !tombstone_verified_for(&pv, vid, &signed(&me), None),
+            "no pinned key"
+        );
+        assert!(
+            !tombstone_verified_for(&pv, "vault-other", &signed(&me), pin),
+            "another vault"
+        );
 
         // Shared (v2 keyset): an admin of the verified fold.
         let (svid, creator, _b, _cid, _bid, spv) =
@@ -5715,8 +6793,14 @@ mod peritem_tests {
             "tombstone_sig": b64(&creator.signing().sign(&sinput)),
             "tombstone_signer": creator.user_id(),
         });
-        assert!(!tombstone_verified_for(&spv, svid, &unsigned, None), "unsigned");
-        assert!(tombstone_verified_for(&spv, svid, &admin, None), "the admin");
+        assert!(
+            !tombstone_verified_for(&spv, svid, &unsigned, None),
+            "unsigned"
+        );
+        assert!(
+            tombstone_verified_for(&spv, svid, &admin, None),
+            "the admin"
+        );
     }
 
     fn empty_pv() -> PerItemVault {
@@ -5896,7 +6980,14 @@ mod peritem_tests {
             .unwrap();
         pv.items.get_mut(&id).unwrap().synced_version = 1;
         let s_id = pv
-            .plant::<StdPrimitives>(keys, vault, ItemNs::Secret, "S", 1, &ItemPayload::secret_live("S", "one"))
+            .plant::<StdPrimitives>(
+                keys,
+                vault,
+                ItemNs::Secret,
+                "S",
+                1,
+                &ItemPayload::secret_live("S", "one"),
+            )
             .unwrap();
         pv.items.get_mut(&s_id).unwrap().synced_version = 1;
         pv.items_seq = 3;
@@ -5917,24 +7008,42 @@ mod peritem_tests {
         assert_eq!(pv.row_kinds[&s_id], RowKind::Data);
         assert_eq!(pv.row_kinds[&id], RowKind::Guarded);
         // Persisted with the store.
-        let back: PerItemVault = serde_json::from_str(&serde_json::to_string(&pv).unwrap()).unwrap();
+        let back: PerItemVault =
+            serde_json::from_str(&serde_json::to_string(&pv).unwrap()).unwrap();
         assert_eq!(back.held, pv.held);
         assert_eq!(back.row_kinds, pv.row_kinds);
         // The next pull (nothing new) offers it again: still held.
-        assert_eq!(adopt_item_rows(&mut pv, &[], 6, Some((keys, vault))).unwrap(), 0);
+        assert_eq!(
+            adopt_item_rows(&mut pv, &[], 6, Some((keys, vault))).unwrap(),
+            0
+        );
         assert!(pv.held.contains_key(&id));
 
         // Locked: a data record's replacement lands, a new row lands, the
         // owner-config replacement waits for the key.
         let s2 = cloud_row(&k, vault, &ItemPayload::secret_live("S", "two"), 2, 7, None);
-        let new_secret = cloud_row(&k, vault, &ItemPayload::secret_live("NEW", "v1"), 1, 8, None);
+        let new_secret = cloud_row(
+            &k,
+            vault,
+            &ItemPayload::secret_live("NEW", "v1"),
+            1,
+            8,
+            None,
+        );
         let n = adopt_item_rows(&mut pv, &[s2, new_secret], 8, None).unwrap();
         assert_eq!(n, 2);
         assert_eq!(pv.items_seq, 8);
         assert_eq!(pv.held[&id].reason, HELD_LOCKED);
         assert_eq!(view(&pv).native_secrets["S"], b"two");
         // A row not yet read with the key, replaced while locked: held.
-        let new2 = cloud_row(&k, vault, &ItemPayload::secret_live("NEW", "v2"), 2, 9, None);
+        let new2 = cloud_row(
+            &k,
+            vault,
+            &ItemPayload::secret_live("NEW", "v2"),
+            2,
+            9,
+            None,
+        );
         let new_id = new2.item_id.clone();
         assert_eq!(adopt_item_rows(&mut pv, &[new2], 9, None).unwrap(), 0);
         assert_eq!(pv.held[&new_id].reason, HELD_LOCKED);
@@ -5942,7 +7051,10 @@ mod peritem_tests {
 
         // Unlock: offered again under the key. The data row lands; the
         // unsigned tombstone is held again, as not owner-signed.
-        assert_eq!(adopt_item_rows(&mut pv, &[], 9, Some((keys, vault))).unwrap(), 1);
+        assert_eq!(
+            adopt_item_rows(&mut pv, &[], 9, Some((keys, vault))).unwrap(),
+            1
+        );
         assert_eq!(view(&pv).native_secrets["NEW"], b"v2");
         assert_eq!(pv.held.len(), 1);
         assert_eq!(pv.held[&id].reason, HELD_NOT_OWNER_SIGNED);
@@ -5997,13 +7109,19 @@ mod peritem_tests {
         let tomb = ItemPayload::tombstone(ItemNs::Aux, "policy");
         // A row the server wrote before it (seq 4) does not replace it.
         let older = cloud_row(&k, vault, &tomb, 2, 4, Some((&creator, "policy")));
-        assert_eq!(adopt_item_rows(&mut pv, &[older], 6, Some((keys, vault))).unwrap(), 0);
+        assert_eq!(
+            adopt_item_rows(&mut pv, &[older], 6, Some((keys, vault))).unwrap(),
+            0
+        );
         assert_eq!(pv.held[&id], unreadable);
         assert_eq!(timeout(&pv), Some(7));
         // One it wrote after (seq 9) does, at a lower stated version, and is
         // adopted (owner-signed).
         let later = cloud_row(&k, vault, &tomb, 3, 9, Some((&creator, "policy")));
-        assert_eq!(adopt_item_rows(&mut pv, &[later], 9, Some((keys, vault))).unwrap(), 1);
+        assert_eq!(
+            adopt_item_rows(&mut pv, &[later], 9, Some((keys, vault))).unwrap(),
+            1
+        );
         assert!(pv.held.is_empty());
         assert_eq!(pv.get_item(&id).unwrap().version, 3);
         assert_eq!(timeout(&pv), None);
@@ -6036,9 +7154,11 @@ mod peritem_tests {
     #[test]
     fn a_paged_items_answer_is_followed() {
         let row = serde_json::json!({ "item_id": "a", "version": 1, "seq": 4, "ct": "AA" });
-        let (rows, next) =
-            parse_items_page(&serde_json::json!({ "items": [row], "seq": 4, "more": true }), 0)
-                .unwrap();
+        let (rows, next) = parse_items_page(
+            &serde_json::json!({ "items": [row], "seq": 4, "more": true }),
+            0,
+        )
+        .unwrap();
         assert_eq!((rows.len(), next), (1, Some(4)));
         let (_, next) =
             parse_items_page(&serde_json::json!({ "items": [], "seq": 4, "next": 9 }), 0).unwrap();
@@ -6208,9 +7328,21 @@ mod peritem_tests {
             Some((keys, vid)),
         );
         assert_eq!(applied.refused.len(), 1);
-        assert!(applied.refused[0].1.contains("cannot be read"), "{:?}", applied.refused);
-        assert_eq!(blocked.get_item(&id).unwrap().version, 3, "ours still dirty");
-        assert_eq!(blocked.get_item(&copy_id).unwrap().ct, vec![0u8; 40], "not written over");
+        assert!(
+            applied.refused[0].1.contains("cannot be read"),
+            "{:?}",
+            applied.refused
+        );
+        assert_eq!(
+            blocked.get_item(&id).unwrap().version,
+            3,
+            "ours still dirty"
+        );
+        assert_eq!(
+            blocked.get_item(&copy_id).unwrap().ct,
+            vec![0u8; 40],
+            "not written over"
+        );
 
         let applied = apply_local_fixes(
             &mut pv,
@@ -6240,7 +7372,9 @@ mod peritem_tests {
 
         // Each refusal is said to the user, with what became of ours; none
         // is reverted silently.
-        let Resolved::Rejected { fixes, note } = rejected(&dirty, &ours, theirs(), 413, "too_large") else {
+        let Resolved::Rejected { fixes, note } =
+            rejected(&dirty, &ours, theirs(), 413, "too_large")
+        else {
             panic!("said to the user");
         };
         assert!(fixes.iter().any(|f| matches!(f, LocalFix::KeepCopy { .. })));
@@ -6253,11 +7387,20 @@ mod peritem_tests {
             panic!("said to the user");
         };
         assert!(fixes.is_empty());
-        assert!(note.ends_with("(HTTP 402); it is kept on this device, unsent"), "{}", note);
-        let Resolved::Rejected { note, .. } = rejected(&dirty, &tomb, theirs(), 413, "too_large") else {
+        assert!(
+            note.ends_with("(HTTP 402); it is kept on this device, unsent"),
+            "{}",
+            note
+        );
+        let Resolved::Rejected { note, .. } = rejected(&dirty, &tomb, theirs(), 413, "too_large")
+        else {
             panic!("said to the user");
         };
-        assert!(note.ends_with("the vault keeps its version; re-run it once the cloud takes it"), "{}", note);
+        assert!(
+            note.ends_with("the vault keeps its version; re-run it once the cloud takes it"),
+            "{}",
+            note
+        );
     }
 
     /// THEIR row on a 409 (or a terminal refusal) that this device cannot
@@ -6336,11 +7479,27 @@ mod peritem_tests {
             let Resolved::NotReadable { fixes, note, .. } = resolved else {
                 panic!("set aside, not left dirty");
             };
-            assert!(note.starts_with("secret API: this item was changed with a vault key this device does not have"), "{}", note);
-            assert!(note.contains("run `sc sync` after the vault owner's console finishes, then re-run"), "{}", note);
+            assert!(
+                note.starts_with(
+                    "secret API: this item was changed with a vault key this device does not have"
+                ),
+                "{}",
+                note
+            );
+            assert!(
+                note.contains(
+                    "run `sc sync` after the vault owner's console finishes, then re-run"
+                ),
+                "{}",
+                note
+            );
             apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
             let row = pv.get_item(&id).unwrap();
-            assert_eq!((row.version, row.synced_version), (5, 5), "clean: no longer sent");
+            assert_eq!(
+                (row.version, row.synced_version),
+                (5, 5),
+                "clean: no longer sent"
+            );
             assert_eq!(row.ct, their_ct, "theirs as it is");
             assert_eq!(pv.items.len(), 1, "ours is not kept");
         }
@@ -6364,7 +7523,8 @@ mod peritem_tests {
         };
         // The session's material after unlock: the bundle and the earlier
         // key its own keyset row carries.
-        let sealed_prev = il::seal_prev_content_keys::<StdPrimitives>(&fx.c_new, vid, 1, &[(&fx.c_old, &[])]);
+        let sealed_prev =
+            il::seal_prev_content_keys::<StdPrimitives>(&fx.c_new, vid, 1, &[(&fx.c_old, &[])]);
         let mut material = vault_key_bundle(&fx.id_seed, &fx.c_new);
         material.extend_from_slice(
             &il::open_prev_content_keys::<StdPrimitives>(&fx.c_new, vid, 1, &sealed_prev).unwrap(),
@@ -6378,17 +7538,31 @@ mod peritem_tests {
         assert_eq!(pv.seal_generation(current), Some(1));
         assert_eq!(pv.seal_generation(stale_session), None);
         let id = pv
-            .seal_and_upsert::<StdPrimitives>(current, vid, ItemNs::Secret, "S", 1, &ItemPayload::secret_live("S", "s"))
+            .seal_and_upsert::<StdPrimitives>(
+                current,
+                vid,
+                ItemNs::Secret,
+                "S",
+                1,
+                &ItemPayload::secret_live("S", "s"),
+            )
             .unwrap();
         assert_eq!(pv.items[&id].generation, Some(1));
 
         let row = |keys: VaultKeys, generation: Option<u64>| {
-            let ctx = il::ItemCtx::for_item::<StdPrimitives>(&fx.id_seed, vid, ItemNs::Secret, "A", 2).unwrap();
+            let ctx =
+                il::ItemCtx::for_item::<StdPrimitives>(&fx.id_seed, vid, ItemNs::Secret, "A", 2)
+                    .unwrap();
             DirtyRow {
                 id: ctx.item_id_b64(),
                 version: 2,
                 synced_version: 1,
-                ct: il::seal_item::<StdPrimitives>(keys.content, &ctx, &ItemPayload::secret_live("A", "a")).unwrap(),
+                ct: il::seal_item::<StdPrimitives>(
+                    keys.content,
+                    &ctx,
+                    &ItemPayload::secret_live("A", "a"),
+                )
+                .unwrap(),
                 tombstone: false,
                 base: None,
                 upgrade: false,
@@ -6398,16 +7572,28 @@ mod peritem_tests {
         let gens = |keyset: Option<u64>, session: Option<u64>| PushGens { keyset, session };
         // At the current generation: as is.
         let at_current = row(current, Some(1));
-        assert!(matches!(check_generation(&gens(Some(1), Some(1)), Some(current), vid, &at_current), Gen::Send));
-        assert!(matches!(check_generation(&gens(Some(1), None), None, vid, &at_current), Gen::Send));
+        assert!(matches!(
+            check_generation(&gens(Some(1), Some(1)), Some(current), vid, &at_current),
+            Gen::Send
+        ));
+        assert!(matches!(
+            check_generation(&gens(Some(1), None), None, vid, &at_current),
+            Gen::Send
+        ));
         // Sealed under the earlier key, this session holding the current one:
         // re-sealed under it, same version, kept by the fix.
         let stale = row(old, Some(0));
-        let Gen::Redone(redone, fix) = check_generation(&gens(Some(1), Some(1)), Some(current), vid, &stale) else {
+        let Gen::Redone(redone, fix) =
+            check_generation(&gens(Some(1), Some(1)), Some(current), vid, &stale)
+        else {
             panic!("redone under the current key");
         };
-        assert_eq!((redone.version, redone.synced_version, redone.generation), (2, 1, Some(1)));
-        let opened = il::open_wire_item::<StdPrimitives>(current, vid, &redone.id, 2, &redone.ct).unwrap();
+        assert_eq!(
+            (redone.version, redone.synced_version, redone.generation),
+            (2, 1, Some(1))
+        );
+        let opened =
+            il::open_wire_item::<StdPrimitives>(current, vid, &redone.id, 2, &redone.ct).unwrap();
         assert_eq!(opened.body, serde_json::json!("a"));
         assert!(matches!(fix, LocalFix::Replace { expect: 2, .. }));
         // A generation not recorded is treated the same.
@@ -6416,26 +7602,49 @@ mod peritem_tests {
             Gen::Redone(..)
         ));
         // Locked, or a session from before the key changed: waits for `sc unlock`.
-        assert!(matches!(check_generation(&gens(Some(1), None), None, vid, &stale), Gen::NeedsUnlock));
+        assert!(matches!(
+            check_generation(&gens(Some(1), None), None, vid, &stale),
+            Gen::NeedsUnlock
+        ));
         assert!(matches!(
             check_generation(&gens(Some(1), None), Some(stale_session), vid, &stale),
             Gen::NeedsUnlock
         ));
-        assert!(matches!(check_generation(&gens(Some(1), None), None, vid, &row(old, None)), Gen::NeedsUnlock));
+        assert!(matches!(
+            check_generation(&gens(Some(1), None), None, vid, &row(old, None)),
+            Gen::NeedsUnlock
+        ));
         let changed = needs_unlock_note("secret A", Some(0));
-        assert!(changed.contains("the vault key changed") && changed.contains("run `sc unlock`"), "{changed}");
+        assert!(
+            changed.contains("the vault key changed") && changed.contains("run `sc unlock`"),
+            "{changed}"
+        );
         // A change from before the generation was recorded: not said to be
         // under a changed key; sent after unlock.
         let unrecorded = needs_unlock_note("secret A", None);
-        assert!(!unrecorded.contains("key changed") && unrecorded.contains("run `sc unlock`"), "{unrecorded}");
+        assert!(
+            !unrecorded.contains("key changed") && unrecorded.contains("run `sc unlock`"),
+            "{unrecorded}"
+        );
         // Under no key this device holds: never sent.
-        let other = VaultKeys { content: &[0x99u8; 32], ..old };
+        let other = VaultKeys {
+            content: &[0x99u8; 32],
+            ..old
+        };
         assert!(matches!(
-            check_generation(&gens(Some(1), Some(1)), Some(current), vid, &row(other, Some(1))),
+            check_generation(
+                &gens(Some(1), Some(1)),
+                Some(current),
+                vid,
+                &row(other, Some(1))
+            ),
             Gen::Unreadable
         ));
         // No keyset: not checked.
-        assert!(matches!(check_generation(&gens(None, Some(0)), None, vid, &stale), Gen::Send));
+        assert!(matches!(
+            check_generation(&gens(None, Some(0)), None, vid, &stale),
+            Gen::Send
+        ));
     }
 
     /// OUR dirty row that this device cannot read (sealed under a key it no
@@ -6506,12 +7715,19 @@ mod peritem_tests {
             let Err(Resolved::NotReadable { fixes, note, .. }) = resolved else {
                 panic!("set aside, not left dirty");
             };
-            assert!(note.contains("this item was changed with a vault key this device does not have"), "{}", note);
+            assert!(
+                note.contains("this item was changed with a vault key this device does not have"),
+                "{}",
+                note
+            );
             apply_local_fixes(&mut pv, fixes, Some((keys, vid)));
             if theirs_present {
                 assert!(note.starts_with("secret API: "), "{}", note);
                 let row = pv.get_item(&id).unwrap();
-                assert_eq!((row.version, row.synced_version, &row.ct), (5, 5, &their_ct));
+                assert_eq!(
+                    (row.version, row.synced_version, &row.ct),
+                    (5, 5, &their_ct)
+                );
             } else {
                 assert!(note.starts_with(&format!("item {}: ", id)), "{}", note);
                 assert!(pv.get_item(&id).is_none(), "dropped: no longer offered");
@@ -7157,7 +8373,8 @@ mod peritem_tests {
             "keyset_seq": 3,
         });
         let pulled = ItemPayload::secret_live("PULLED", "cloud");
-        let ctx = il::ItemCtx::for_item::<StdPrimitives>(&k, vid, ItemNs::Secret, "PULLED", 1).unwrap();
+        let ctx =
+            il::ItemCtx::for_item::<StdPrimitives>(&k, vid, ItemNs::Secret, "PULLED", 1).unwrap();
         let item_row = ItemRow {
             item_id: ctx.item_id_b64(),
             version: 1,
@@ -7174,9 +8391,10 @@ mod peritem_tests {
         rt.block_on(async {
             for which in 0..3usize {
                 // A daemon write holds the lock as the call returns.
-                let guard = state.vault_write_lock(vid).lock_owned().await;
+                let guard = state.vault_write_guard(vid).await.unwrap();
                 let (st, sd) = (state.clone(), state_dir.clone());
-                let (key_row, triple, item_row) = (key_row.clone(), triple.clone(), item_row.clone());
+                let (key_row, triple, item_row) =
+                    (key_row.clone(), triple.clone(), item_row.clone());
                 let task = tokio::spawn(async move {
                     let lock = StoreLock::Take(&st);
                     match which {
@@ -7196,7 +8414,11 @@ mod peritem_tests {
         });
         let pv = read();
         assert!((0..3).all(|w| has(&format!("LOCAL{}", w))));
-        assert!(pv.keyset.credentials.iter().any(|c| c.credential_id == cid_raw));
+        assert!(pv
+            .keyset
+            .credentials
+            .iter()
+            .any(|c| c.credential_id == cid_raw));
         assert!(pv.uik_cred("us_m").is_some());
         assert!(has("PULLED"));
         assert_eq!(pv.items_seq, 9);
@@ -7253,7 +8475,10 @@ mod peritem_tests {
         assert_eq!(pv.uik_cred(&cid).unwrap().prev_content_ct, vec![0xCDu8; 73]);
         // On disk.
         let back: PerItemVault = serde_json::from_slice(&serde_json::to_vec(&pv).unwrap()).unwrap();
-        assert_eq!(back.uik_cred(&cid).unwrap().prev_content_ct, vec![0xCDu8; 73]);
+        assert_eq!(
+            back.uik_cred(&cid).unwrap().prev_content_ct,
+            vec![0xCDu8; 73]
+        );
 
         // A membership triple's member entry, on every cred of the member.
         let body = serde_json::json!({
@@ -7314,20 +8539,33 @@ mod peritem_tests {
             Vec::new(),
         );
         pv.set_registry_pubkey("YWRtaW4", "ax", "ay", "").unwrap();
-        assert!(pv.own_identities().contains("us_admin"), "the stale seat read as own");
+        assert!(
+            pv.own_identities().contains("us_admin"),
+            "the stale seat read as own"
+        );
 
         adopt_membership_triple(&mut pv, "v", &enc(&[7; 32]), &body).unwrap();
-        let pk = crate::storage::sealed_vault::find_pubkey_in_registry(&pv.keyset.registry, "YWRtaW4")
-            .expect("the admin's pubkey verifies assertions");
+        let pk =
+            crate::storage::sealed_vault::find_pubkey_in_registry(&pv.keyset.registry, "YWRtaW4")
+                .expect("the admin's pubkey verifies assertions");
         assert_eq!((pk.x.as_str(), pk.y.as_str()), ("ax", "ay"));
-        assert_eq!(pv.credential_identity("YWRtaW4").as_deref(), Some("us_admin"));
-        assert!(pv.uik_cred("YWRtaW4").is_none(), "no seat under the admin's cid");
+        assert_eq!(
+            pv.credential_identity("YWRtaW4").as_deref(),
+            Some("us_admin")
+        );
+        assert!(
+            pv.uik_cred("YWRtaW4").is_none(),
+            "no seat under the admin's cid"
+        );
         assert_eq!(pv.uik_cred("us_admin").unwrap().user_id, "us_admin");
         assert_eq!(pv.uik_cred("Yw").unwrap().user_id, "us_me");
         assert_eq!(pv.own_identities(), ["us_me".to_string()].into());
         // No pubkey: nothing to verify with, not adopted.
         assert!(pv.credential_identity("YmFk").is_none());
-        assert!(crate::storage::sealed_vault::find_pubkey_in_registry(&pv.keyset.registry, "YmFk").is_none());
+        assert!(
+            crate::storage::sealed_vault::find_pubkey_in_registry(&pv.keyset.registry, "YmFk")
+                .is_none()
+        );
     }
 
     /// DP-S1 wire plumbing (Part 1): a re-keyed vault's keyset-LEVEL `generation`
@@ -7357,7 +8595,12 @@ mod peritem_tests {
         let rk_sig = owner
             .signing()
             .sign(&crate::identity::rekey_sig_input(
-                vault, gen, &commit, &owner_id, 0, &membership,
+                vault,
+                gen,
+                &commit,
+                &owner_id,
+                0,
+                &membership,
             ))
             .to_vec();
         let grant = owner
@@ -7494,7 +8737,12 @@ mod peritem_tests {
             let commit = [gen as u8; 32];
             let membership = crate::identity::membership_commitment(&[]);
             let sig = owner.signing().sign(&crate::identity::rekey_sig_input(
-                vault, gen, &commit, &owner_id, 0, &membership,
+                vault,
+                gen,
+                &commit,
+                &owner_id,
+                0,
+                &membership,
             ));
             Some(serde_json::json!({
                 "generation": gen,
@@ -7892,7 +9140,12 @@ mod peritem_tests {
         let mut source = empty_keyset_store();
         let cg = creator
             .signing()
-            .sign(&crate::identity::role_grant_input(vault, &creator_id, "owner", 0))
+            .sign(&crate::identity::role_grant_input(
+                vault,
+                &creator_id,
+                "owner",
+                0,
+            ))
             .to_vec();
         source.set_uik_cred(
             "cid-c".into(),
@@ -7926,13 +9179,8 @@ mod peritem_tests {
                     vault, "set", subj, "owner", &gid, seq, 0,
                 ))
                 .to_vec();
-            source
-                .keyset
-                .uik
-                .as_mut()
-                .unwrap()
-                .delegation_log
-                .push(sealed_vault::DelegationEvent {
+            source.keyset.uik.as_mut().unwrap().delegation_log.push(
+                sealed_vault::DelegationEvent {
                     op: "set".into(),
                     subject_id: subj.clone(),
                     role: MemberRole::Admin,
@@ -7941,7 +9189,8 @@ mod peritem_tests {
                     seq,
                     role_epoch: 0,
                     sig,
-                });
+                },
+            );
         }
         let src_owners = source.fold_roles(vault);
         assert_eq!(src_owners.get(&a_id), Some(&MemberRole::Admin));
@@ -7960,9 +9209,7 @@ mod peritem_tests {
             }
             m
         };
-        let ident = |uik: &UikRoot| {
-            serde_json::json!({ "sig_pub": enc(&uik.signing().public_bytes()), "enc_pub": enc(&[9u8; 32]) })
-        };
+        let ident = |uik: &UikRoot| serde_json::json!({ "sig_pub": enc(&uik.signing().public_bytes()), "enc_pub": enc(&[9u8; 32]) });
         let mut members = serde_json::Map::new();
         members.insert(creator_id.clone(), member("owner", Some(&cg)));
         members.insert(a_id.clone(), member("member", None));
@@ -8011,19 +9258,39 @@ mod peritem_tests {
         let enc = |b: &[u8]| STANDARD.encode(b);
 
         // Both owner via root-signed checkpoint grants @0; `m` gets NO enc_pub / k_encapped / k_ct.
-        let cg = creator.signing().sign(&crate::identity::role_grant_input(vault, &creator_id, "owner", 0)).to_vec();
-        let mg = creator.signing().sign(&crate::identity::role_grant_input(vault, &m_id, "owner", 0)).to_vec();
+        let cg = creator
+            .signing()
+            .sign(&crate::identity::role_grant_input(
+                vault,
+                &creator_id,
+                "owner",
+                0,
+            ))
+            .to_vec();
+        let mg = creator
+            .signing()
+            .sign(&crate::identity::role_grant_input(vault, &m_id, "owner", 0))
+            .to_vec();
         let mut members = serde_json::Map::new();
         members.insert(creator_id.clone(), serde_json::json!({
             "role": "owner", "k_encapped": enc(&[1u8; 40]), "k_ct": enc(&[2u8; 40]), "role_sig": enc(&cg),
         }));
-        members.insert(m_id.clone(), serde_json::json!({ "role": "owner", "role_sig": enc(&mg) }));
+        members.insert(
+            m_id.clone(),
+            serde_json::json!({ "role": "owner", "role_sig": enc(&mg) }),
+        );
         let mut identities = serde_json::Map::new();
-        identities.insert(creator_id.clone(), serde_json::json!({
-            "sig_pub": enc(&creator.signing().public_bytes()), "enc_pub": enc(&[9u8; 32]),
-        }));
+        identities.insert(
+            creator_id.clone(),
+            serde_json::json!({
+                "sig_pub": enc(&creator.signing().public_bytes()), "enc_pub": enc(&[9u8; 32]),
+            }),
+        );
         // `m`: sig_pub present, enc_pub MISSING (nullable column).
-        identities.insert(m_id.clone(), serde_json::json!({ "sig_pub": enc(&m.signing().public_bytes()) }));
+        identities.insert(
+            m_id.clone(),
+            serde_json::json!({ "sig_pub": enc(&m.signing().public_bytes()) }),
+        );
         let anchor_b64 = enc(&creator.signing().public_bytes());
         let body = serde_json::json!({
             "anchor": anchor_b64,

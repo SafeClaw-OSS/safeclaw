@@ -358,6 +358,10 @@ fn rotation_note_key(conn_id: &str) -> String {
     format!("rotation {}", conn_id)
 }
 
+/// Process-wide daemon state.
+///
+/// Any new per-vault field must be classified by the revocation teardown and
+/// the exhaustive `revoke_teardown_clears_every_vault_object_and_deletes_only_with_proof` test.
 pub struct AppState {
     pub config: Config,
     pub vaults: VaultDir,
@@ -427,6 +431,9 @@ pub struct AppState {
     /// Per-vault Locked/Unlocked state. Absent entry = Locked. Lives entirely
     /// in process memory; daemon restart returns all vaults to Locked.
     pub vault_states: Mutex<HashMap<String, VaultState>>,
+    /// Vaults explicitly refused by the backend as no longer accessible to
+    /// this account. In-memory only: discovery clears a mark on re-add.
+    pub revoked_vaults: Mutex<HashSet<String>>,
     /// The hosts each vault anchored the last time it was seen Unlocked
     /// (lowercased, refreshed on every union pass). Kept ACROSS Lock so the
     /// proxy still recognizes — and MITMs — brokered-host traffic while the
@@ -456,6 +463,14 @@ pub struct AppState {
     /// Holding this lock for the full approve lifetime prevents that race.
     /// Uses tokio::sync::Mutex so it can be held across await points.
     pub vault_write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One live cloud watcher per vault. Entries are retained when a task exits
+    /// and replaced by `ensure_watcher` after observing `is_finished()`.
+    pub watchers: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Wake cells owned alongside watcher handles so teardown can park a vault
+    /// before aborting its task.
+    pub watcher_cells: Mutex<HashMap<String, Arc<crate::sync_stream::WakeCell>>>,
+    /// Debounce set for account-stream `access` hint probes.
+    pub access_probes: Mutex<HashSet<String>>,
     /// Per-vault SSE connection semaphore (cap = MAX_SSE_PER_VAULT).
     /// OwnedSemaphorePermit is stored in each live stream; dropping the
     /// stream drops the permit, automatically releasing the slot.
@@ -532,6 +547,15 @@ pub struct AppState {
     /// takes the stash, re-verifies the digest, and writes the values. In-memory
     /// + daemon-local; entries self-reap after their own op-window TTL.
     pub op_payloads: Mutex<HashMap<String, OpPayloadEntry>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultWriteRevoked;
+
+impl std::fmt::Display for VaultWriteRevoked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("vault access revoked")
+    }
 }
 
 /// One deposited value-set awaiting its op's approval. See
@@ -618,11 +642,15 @@ impl AppState {
             services: ServiceRegistry::load(),
             events,
             vault_states: Mutex::new(HashMap::new()),
+            revoked_vaults: Mutex::new(HashSet::new()),
             last_host_unions: Mutex::new(loaded_unions),
             host_unions_persisted: Mutex::new(loaded_unions_json),
             audits,
             sc,
             vault_write_locks: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
+            watcher_cells: Mutex::new(HashMap::new()),
+            access_probes: Mutex::new(HashSet::new()),
             sse_semaphores: Mutex::new(HashMap::new()),
             ledger: Mutex::new(crate::principal_ledger::LedgerGate::default()),
             ledger_sync: tokio::sync::Mutex::new(None),
@@ -888,7 +916,9 @@ impl AppState {
     /// True when at least one vault is currently unlocked.
     pub fn has_unlocked_vault(&self) -> bool {
         let states = self.vault_states.lock().unwrap();
-        states.values().any(|state| matches!(state, VaultState::Unlocked { .. }))
+        states
+            .values()
+            .any(|state| matches!(state, VaultState::Unlocked { .. }))
     }
 
     /// Transition a vault to Unlocked with the given bootstrap cache and the
@@ -900,6 +930,14 @@ impl AppState {
         cache: SecretsCache,
         state_key: zeroize::Zeroizing<Vec<u8>>,
     ) {
+        // Hold the latch through the state insertion. Teardown takes this same
+        // mutex before locking the vault, so an unlock either linearizes before
+        // revocation (and is immediately locked) or refuses after it.
+        let revoked = self.revoked_vaults.lock().unwrap();
+        if revoked.contains(&vault_id) {
+            tracing::warn!(vault = %vault_id, "unlock refused: vault access was revoked");
+            return;
+        }
         // A parked or locked device holds no K (I3): a refresh or apply that
         // cloned K before the park must not write it back.
         if self.ledger.lock().unwrap().device != crate::principal_ledger::DeviceGate::Open {
@@ -953,6 +991,7 @@ impl AppState {
                 unlocked_at,
             },
         );
+        drop(revoked);
     }
 
     /// Clone the retained state key `K` for an Unlocked vault, or `None` when
@@ -1231,13 +1270,30 @@ impl AppState {
     /// The per-vault async write lock — serializes anything that reseals the
     /// vault body (connect exchange, oauth refresh-token rotation) so two writers
     /// can't clobber each other. Same map the connect + sync paths use inline.
-    pub fn vault_write_lock(&self, vault_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn vault_write_lock(&self, vault_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.vault_write_locks.lock().unwrap();
         Arc::clone(
             locks
                 .entry(vault_id.to_string())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         )
+    }
+
+    /// Acquire the per-vault persistence lock and then re-check the revocation
+    /// latch, closing the race with a writer that was queued before teardown.
+    pub async fn vault_write_guard(
+        &self,
+        vault_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, VaultWriteRevoked> {
+        let guard = self.vault_write_lock(vault_id).lock_owned().await;
+        if self.is_vault_revoked(vault_id) {
+            return Err(VaultWriteRevoked);
+        }
+        Ok(guard)
+    }
+
+    pub fn is_vault_revoked(&self, vault_id: &str) -> bool {
+        self.revoked_vaults.lock().unwrap().contains(vault_id)
     }
 
     pub fn oauth_access_lookup(&self, vault_id: &str, refresh_hash: &str) -> Option<Vec<u8>> {
@@ -1641,7 +1697,14 @@ impl AppState {
 
     /// A rotated refresh token of `conn_id` (`role`) was not stored (`why`):
     /// kept to store again, and noted for `sc status` / `sc sync`.
-    pub fn note_rotation_pending(&self, vault_id: &str, conn_id: &str, role: &str, token: &str, why: &str) {
+    pub fn note_rotation_pending(
+        &self,
+        vault_id: &str,
+        conn_id: &str,
+        role: &str,
+        token: &str,
+        why: &str,
+    ) {
         self.pending_rotations
             .lock()
             .unwrap()
@@ -1707,7 +1770,11 @@ impl AppState {
 
     /// Why the changes from the cloud since unlock are not pulled yet.
     pub fn catch_up_failure(&self, vault_id: &str) -> Option<String> {
-        self.catch_up_failures.lock().unwrap().get(vault_id).cloned()
+        self.catch_up_failures
+            .lock()
+            .unwrap()
+            .get(vault_id)
+            .cloned()
     }
 
     /// Record a successful cloud contact for this vault (sync pull/push, or
@@ -2120,10 +2187,21 @@ mod tests {
     fn a_parked_device_never_gets_k_back() {
         let s = test_state();
         s.set_ledger(crate::principal_ledger::LedgerGate::default()); // parked
-        s.unlock_vault("v".into(), SecretsCache::default(), zeroize::Zeroizing::new(vec![7u8; 32]));
-        assert!(s.is_vault_locked("v"), "a refresh that cloned K before the park must not reinstall it");
+        s.unlock_vault(
+            "v".into(),
+            SecretsCache::default(),
+            zeroize::Zeroizing::new(vec![7u8; 32]),
+        );
+        assert!(
+            s.is_vault_locked("v"),
+            "a refresh that cloned K before the park must not reinstall it"
+        );
         s.open_ledger_for_tests(&[]);
-        s.unlock_vault("v".into(), SecretsCache::default(), zeroize::Zeroizing::new(vec![7u8; 32]));
+        s.unlock_vault(
+            "v".into(),
+            SecretsCache::default(),
+            zeroize::Zeroizing::new(vec![7u8; 32]),
+        );
         assert!(!s.is_vault_locked("v"));
     }
 

@@ -281,7 +281,24 @@ async fn run(
         .await
         .map_err(|e| format!("relay register: {}", e))?;
     if !reg.status().is_success() {
-        return Err(format!("relay register HTTP {}", reg.status()));
+        let status = reg.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            crate::sync_stream::notify_device_auth_rejected();
+        }
+        let body = reg.bytes().await.unwrap_or_default();
+        if let Some(crate::sync::VaultRefusal::AccessRevoked { membership }) =
+            crate::sync::vault_refusal(status, &body)
+        {
+            crate::sync::revoke_vault_access(&state, vault_id, membership).await;
+            apply_reject(
+                state.clone(),
+                op_id,
+                Some(crate::error::VAULT_ACCESS_REVOKED_MSG),
+            )
+            .await;
+            return Ok(());
+        }
+        return Err(format!("relay register HTTP {}", status));
     }
     tracing::info!(op = %op_id, "registered with op-relay");
 
@@ -438,7 +455,17 @@ async fn run(
                 // refusal of THIS poll: end it without rejecting anything; the
                 // op stays pending locally until its own expiry.
                 let body = resp.text().await.unwrap_or_default();
-                if is_user_rejection(&body) {
+                if let Some(crate::sync::VaultRefusal::AccessRevoked { membership }) =
+                    crate::sync::vault_refusal(reqwest::StatusCode::FORBIDDEN, body.as_bytes())
+                {
+                    crate::sync::revoke_vault_access(&state, vault_id, membership).await;
+                    apply_reject(
+                        state.clone(),
+                        op_id,
+                        Some(crate::error::VAULT_ACCESS_REVOKED_MSG),
+                    )
+                    .await;
+                } else if is_user_rejection(&body) {
                     apply_reject(state.clone(), op_id, None).await;
                 } else {
                     tracing::warn!(op = %op_id, "relay poll refused (HTTP 403, not a user rejection): {}; poll ending, op left pending", body.chars().take(200).collect::<String>());
@@ -447,6 +474,10 @@ async fn run(
             }
             202 => {
                 next_poll_due(&op_wait, vault_id, last_poll).await;
+            }
+            401 => {
+                crate::sync_stream::notify_device_auth_rejected();
+                return Ok(());
             }
             404 => return Ok(()), // unknown/expired on the relay side
             409 => {
@@ -644,8 +675,14 @@ mod tests {
 
     #[test]
     fn a_device_that_cannot_serve_keeps_the_op_pending() {
-        for c in ["approver_not_authorized", "grant_id_invalid", "wk_refused_v2",
-                  "device_not_admitted", "ledger_stale", "ledger_device_revoked"] {
+        for c in [
+            "approver_not_authorized",
+            "grant_id_invalid",
+            "wk_refused_v2",
+            "device_not_admitted",
+            "ledger_stale",
+            "ledger_device_revoked",
+        ] {
             assert!(refusal_keeps_op_pending(Some(c)), "{c}");
         }
         assert!(!refusal_keeps_op_pending(Some("bad_request")));

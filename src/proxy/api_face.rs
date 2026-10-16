@@ -126,7 +126,19 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
         };
         let mut vaults: Vec<Value> = Vec::new();
         let ids = state.vaults.list().unwrap_or_default();
+        let mut catalogued: std::collections::HashSet<String> = crate::cli::active::known_vaults()
+            .into_iter()
+            .map(|v| v.vault)
+            .collect();
+        if let Ok(cfg) = crate::cli::active::load() {
+            if let Some(active) = cfg.vault.filter(|v| !v.is_empty()) {
+                catalogued.insert(active);
+            }
+        }
         for vid in ids {
+            if state.is_vault_revoked(&vid) || !catalogued.contains(&vid) {
+                continue;
+            }
             let locked = state.is_vault_locked(&vid);
             let mut conns: Vec<Value> = Vec::new();
             if !locked {
@@ -144,7 +156,10 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
                     conns.push(row);
                 }
                 conns.sort_by(|a, b| {
-                    a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or(""))
+                    a["id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(b["id"].as_str().unwrap_or(""))
                 });
             }
             vaults.push(json!({
@@ -205,12 +220,20 @@ async fn require_agent(
             crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
         )
     });
-    match crate::principal_ledger::authorize_agent(state, verified.as_deref(), None).await {
+    let vault = pq
+        .strip_prefix("/v/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|vid| !vid.is_empty());
+    match crate::principal_ledger::authorize_agent(state, verified.as_deref(), vault).await {
         Ok(ag) => Ok(ag),
         Err(AgentRefusal::Device(e)) => {
             let (code, msg) = e.code();
             Err(problem(code, &msg))
         }
+        Err(AgentRefusal::Revoked) => Err(problem(
+            ScCode::VaultAccessRevoked,
+            crate::error::VAULT_ACCESS_REVOKED_MSG,
+        )),
         Err(AgentRefusal::NoIdentity) => Err(problem(
             ScCode::Unauthorized,
             crate::principal_ledger::NO_AGENT_IDENTITY_MSG,
@@ -219,10 +242,9 @@ async fn require_agent(
             ScCode::AgentNotAdmitted,
             crate::error::AGENT_NOT_ADMITTED_MSG,
         )),
-        Err(AgentRefusal::Locked) => Err(problem(
-            ScCode::VaultLocked,
-            crate::error::VAULT_LOCKED_MSG,
-        )),
+        Err(AgentRefusal::Locked) => {
+            Err(problem(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG))
+        }
         // Verified and admitted, but NOT turned on anywhere yet: distinct from a
         // bad credential — the fix is a Console authorize (Agent access page).
         Err(AgentRefusal::NotAuthorized) => Err(problem(
@@ -404,15 +426,26 @@ mod tests {
         cache.agents.insert(ag.clone(), Default::default());
         // Admitted by the ledger (a parked device holds no K) and listed: served.
         state.open_ledger_for_tests(&[&ag]);
-        state.unlock_vault("v1".into(), cache, zeroize::Zeroizing::new(vec![0x42u8; 32]));
-        assert_eq!(require_agent(&state, &headers("/vaults"), "/vaults").await.unwrap(), ag);
+        state.unlock_vault(
+            "v1".into(),
+            cache,
+            zeroize::Zeroizing::new(vec![0x42u8; 32]),
+        );
+        assert_eq!(
+            require_agent(&state, &headers("/vaults"), "/vaults")
+                .await
+                .unwrap(),
+            ag
+        );
 
         // Revoked in the ledger (the latest fold no longer admits it): refused
         // with agent_not_admitted, though the vault still lists it. The on-miss
         // re-pull finds no pairing in this test and changes nothing.
         state.open_ledger_for_tests(&[]);
         *state.ledger_sync.lock().await = Some(std::time::Instant::now());
-        let r = require_agent(&state, &headers("/vaults"), "/vaults").await.unwrap_err();
+        let r = require_agent(&state, &headers("/vaults"), "/vaults")
+            .await
+            .unwrap_err();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         assert_eq!(code(&r).as_deref(), Some("agent_not_admitted"));
 
@@ -423,9 +456,21 @@ mod tests {
         let r = require_agent(&state, &h, "/vaults").await.unwrap_err();
         assert_eq!(code(&r).as_deref(), Some("unauthorized"));
 
+        // A named revoked vault is explicit and wins over its locked state or
+        // vault-level agent table.
+        state.open_ledger_for_tests(&[&ag]);
+        state.revoked_vaults.lock().unwrap().insert("v1".into());
+        let pq = "/v/v1/registry";
+        let r = require_agent(&state, &headers(pq), pq).await.unwrap_err();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(code(&r).as_deref(), Some("vault_access_revoked"));
+        state.revoked_vaults.lock().unwrap().remove("v1");
+
         // This device not admitted: every agent refused with device_not_admitted.
         state.set_ledger(crate::principal_ledger::LedgerGate::default());
-        let r = require_agent(&state, &headers("/vaults"), "/vaults").await.unwrap_err();
+        let r = require_agent(&state, &headers("/vaults"), "/vaults")
+            .await
+            .unwrap_err();
         assert_eq!(code(&r).as_deref(), Some("device_not_admitted"));
         assert!(state.is_vault_locked("v1"), "parking evicts K");
     }

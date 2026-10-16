@@ -568,15 +568,9 @@ pub(crate) async fn apply_pending_connects(
         return ConnectReport::default(); // Locked — no retained K; next unlock retries.
     };
 
-    let lock = {
-        let mut locks = state.vault_write_locks.lock().unwrap();
-        Arc::clone(
-            locks
-                .entry(vault_id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
+    let Ok(_guard) = state.vault_write_guard(vault_id).await else {
+        return ConnectReport::default();
     };
-    let _guard = lock.lock().await;
 
     // Rotated refresh tokens not stored yet: stored again now.
     retry_pending_rotations_locked(state, vault_id).await;
@@ -764,7 +758,11 @@ pub(crate) async fn apply_pending_connects(
 /// A completed connect whose `connection:<id>` row the store refused or set
 /// aside (`not_applied`: `(item id, why)`) did not complete: moved to
 /// `failed`, with why. `id_seed` derives the row ids.
-fn fail_refused_connects(report: &mut ConnectReport, not_applied: &[(String, String)], id_seed: &[u8]) {
+fn fail_refused_connects(
+    report: &mut ConnectReport,
+    not_applied: &[(String, String)],
+    id_seed: &[u8],
+) {
     let completed = std::mem::take(&mut report.completed);
     for conn in completed {
         let wire = crate::storage::item::wire_id_for::<sudp::primitives::StdPrimitives>(
@@ -1029,12 +1027,16 @@ fn write_view(
     )?;
     match vault_dat {
         Some(mut vault) if k.len() == crate::storage::item::SINGLE_KEY_LEN => {
-            let mirrored = crate::server::handlers::metadata::reseal_body_with_key(k, &mut vault, m)
-                .map_err(|e| format!("reseal vault.dat: {}", e))
-                .and_then(|()| {
-                    crate::storage::sealed_vault::write_atomic(&vault_dat_path(state, vault_id), &vault)
+            let mirrored =
+                crate::server::handlers::metadata::reseal_body_with_key(k, &mut vault, m)
+                    .map_err(|e| format!("reseal vault.dat: {}", e))
+                    .and_then(|()| {
+                        crate::storage::sealed_vault::write_atomic(
+                            &vault_dat_path(state, vault_id),
+                            &vault,
+                        )
                         .map_err(|e| format!("write vault.dat: {}", e))
-                });
+                    });
             if let Err(e) = mirrored {
                 if written.is_none() {
                     return Err(e);
@@ -1048,7 +1050,9 @@ fn write_view(
         }
         Some(_) => {}
         None if written.is_none() => {
-            return Err("this vault has neither a per-item store nor vault.dat; nothing was written".into());
+            return Err(
+                "this vault has neither a per-item store nor vault.dat; nothing was written".into(),
+            );
         }
         None => {}
     }
@@ -1132,7 +1136,12 @@ fn reconcile_per_item_after_connect(
     let keys = crate::storage::item::VaultKeys::from_material(k);
     let reconciled = pv
         .reconcile_from_view::<S>(keys, vault_id, view, base)
-        .map_err(|e| format!("the change could not be applied to the vault's store: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "the change could not be applied to the vault's store: {}",
+                e
+            )
+        })?;
     // Fold before writing: a store this key cannot fold is never written.
     // Fold even when nothing changed: an existing conflict copy (an
     // idempotent no-op) still means the store differs from `view`.
@@ -1990,7 +1999,14 @@ refresh_token = "REFRESH_TOKEN"
         state.open_ledger_for_tests(&[]);
         let mut pv = fx.pv.clone();
         let a = pv
-            .seal_and_upsert::<S>(keys, vid, ItemNs::Secret, "A", 1, &ItemPayload::secret_live("A", "a"))
+            .seal_and_upsert::<S>(
+                keys,
+                vid,
+                ItemNs::Secret,
+                "A",
+                1,
+                &ItemPayload::secret_live("A", "a"),
+            )
             .unwrap();
         pv.items.get_mut(&a).unwrap().synced_version = 1;
         let path = state.vaults.per_item_path(vid).unwrap();
@@ -2013,7 +2029,10 @@ refresh_token = "REFRESH_TOKEN"
             .unwrap();
         assert_eq!(folded.native_secrets["A"], b"a");
         assert_eq!(folded.native_secrets["B"], b"b");
-        assert!(!state.is_vault_locked(vid), "the session serves the store's fold");
+        assert!(
+            !state.is_vault_locked(vid),
+            "the session serves the store's fold"
+        );
 
         // A row this key cannot open is never written over: the change to it
         // is refused and said in the error (a conflict, not an internal
@@ -2025,7 +2044,14 @@ refresh_token = "REFRESH_TOKEN"
         };
         let mut pv = read_per_item(&path).unwrap().unwrap();
         let x = pv
-            .plant::<S>(other, vid, ItemNs::Secret, "X", 1, &ItemPayload::secret_live("X", "x"))
+            .plant::<S>(
+                other,
+                vid,
+                ItemNs::Secret,
+                "X",
+                1,
+                &ItemPayload::secret_live("X", "x"),
+            )
             .unwrap();
         pv.items.get_mut(&x).unwrap().synced_version = 1;
         write_per_item_atomic(&path, &pv).unwrap();
@@ -2045,13 +2071,23 @@ refresh_token = "REFRESH_TOKEN"
         }
         let pv = read_per_item(&path).unwrap().unwrap();
         assert_eq!(pv.items[&x].version, 1, "not written over");
-        assert_eq!(pv.fold_view::<S>(keys, vid).unwrap().native_secrets["D"], b"d");
+        assert_eq!(
+            pv.fold_view::<S>(keys, vid).unwrap().native_secrets["D"],
+            b"d"
+        );
 
         // A store whose re-key proof no longer verifies: the write is refused,
         // the store is left byte for byte, and a locked session stays locked.
         state.lock_vault(vid);
         let mut bad = read_per_item(&path).unwrap().unwrap();
-        bad.keyset.uik.as_mut().unwrap().rekey_proof.as_mut().unwrap().sig[0] ^= 1;
+        bad.keyset
+            .uik
+            .as_mut()
+            .unwrap()
+            .rekey_proof
+            .as_mut()
+            .unwrap()
+            .sig[0] ^= 1;
         write_per_item_atomic(&path, &bad).unwrap();
         let before = std::fs::read(&path).unwrap();
         let mut again = changed;
@@ -2082,23 +2118,34 @@ refresh_token = "REFRESH_TOKEN"
                 agent_prefix: None,
             },
         );
-        cache
-            .allow_secrets
-            .insert("codex".into(), [("REFRESH_TOKEN".to_string(), b"old-rt".to_vec())].into());
+        cache.allow_secrets.insert(
+            "codex".into(),
+            [("REFRESH_TOKEN".to_string(), b"old-rt".to_vec())].into(),
+        );
         state.unlock_vault(vid.into(), cache, zeroize::Zeroizing::new(vec![0u8; 32]));
-        rotation_not_stored(&state, vid, "codex", "refresh_token", b"old-rt", "new-rt", "the store failed");
+        rotation_not_stored(
+            &state,
+            vid,
+            "codex",
+            "refresh_token",
+            b"old-rt",
+            "new-rt",
+            "the store failed",
+        );
         assert_eq!(state.cache_lookup(vid, "codex").unwrap(), b"new-rt");
         assert_eq!(
             state.cache_lookup_secrets(vid, "codex").unwrap()["REFRESH_TOKEN"],
             b"new-rt"
         );
-        assert!(state
-            .sync_note_lines(vid)
-            .iter()
-            .any(|l| l.starts_with("connection codex: the provider's new refresh token could not be stored")));
+        assert!(state.sync_note_lines(vid).iter().any(|l| l.starts_with(
+            "connection codex: the provider's new refresh token could not be stored"
+        )));
         let pending = state.take_pending_rotations(vid);
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].0, ("codex".to_string(), "refresh_token".to_string()));
+        assert_eq!(
+            pending[0].0,
+            ("codex".to_string(), "refresh_token".to_string())
+        );
         assert_eq!(pending[0].1.as_str(), "new-rt");
         state.clear_rotation_note(vid, "codex");
         assert!(state.sync_note_lines(vid).is_empty());
@@ -2110,18 +2157,29 @@ refresh_token = "REFRESH_TOKEN"
     fn a_connect_whose_connection_row_was_refused_is_reported_failed() {
         type S = sudp::primitives::StdPrimitives;
         let k = [0x42u8; 32];
-        let refused = crate::storage::item::wire_id_for::<S>(&k, crate::storage::item::ItemNs::Connection, "gmail")
-            .unwrap();
+        let refused = crate::storage::item::wire_id_for::<S>(
+            &k,
+            crate::storage::item::ItemNs::Connection,
+            "gmail",
+        )
+        .unwrap();
         let mut report = ConnectReport {
             completed: vec!["gmail".into(), "github".into()],
             failed: Vec::new(),
             unreached: Vec::new(),
         };
-        fail_refused_connects(&mut report, &[(refused, "connection gmail: not applied".into())], &k);
+        fail_refused_connects(
+            &mut report,
+            &[(refused, "connection gmail: not applied".into())],
+            &k,
+        );
         assert_eq!(report.completed, vec!["github".to_string()]);
         assert_eq!(
             report.failed,
-            vec![("gmail".to_string(), "connection gmail: not applied".to_string())]
+            vec![(
+                "gmail".to_string(),
+                "connection gmail: not applied".to_string()
+            )]
         );
     }
 }

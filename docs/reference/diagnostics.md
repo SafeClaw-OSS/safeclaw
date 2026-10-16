@@ -32,6 +32,7 @@ SafeClaw because it is the hop that observed them.
 | `method_not_allowed` | 405 | fix_request | request | API face is GET-only |
 | `conflict` | 409 | fix_request | request | state conflict |
 | `vault_locked` | 423 | unlock | vault | vault has no in-memory key; canonical hint: run `sc up` |
+| `vault_access_revoked` | 403 | configure | auth | this account is no longer a member of the vault; ask a vault admin to add it back |
 | `rate_limited` | 429 | retry | request | slow down |
 | `internal` | 500 | retry | internal | daemon bug/failure |
 | `ca_unavailable` | 500 | retry | internal | resident CA unreadable |

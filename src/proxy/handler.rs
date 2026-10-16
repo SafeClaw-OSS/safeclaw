@@ -368,6 +368,13 @@ impl BrokerHandler {
                     let (code, msg) = e.code();
                     return err_response(code, &msg).into();
                 }
+                Err(AgentRefusal::Revoked) => {
+                    return err_response(
+                        ScCode::VaultAccessRevoked,
+                        crate::error::VAULT_ACCESS_REVOKED_MSG,
+                    )
+                    .into();
+                }
                 Err(AgentRefusal::NoIdentity) => {
                     return err_response(
                         ScCode::AgentKey,
@@ -383,7 +390,8 @@ impl BrokerHandler {
                     .into();
                 }
                 Err(AgentRefusal::Locked) => {
-                    return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG).into();
+                    return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG)
+                        .into();
                 }
                 Err(AgentRefusal::NotAuthorized) => {
                     // Deep-link straight to THIS vault's Agent access page so the
@@ -412,6 +420,13 @@ impl BrokerHandler {
                 .into()
             }
         };
+        if self.state.is_vault_revoked(&vault_id) {
+            return err_response(
+                ScCode::VaultAccessRevoked,
+                crate::error::VAULT_ACCESS_REVOKED_MSG,
+            )
+            .into();
+        }
         // Daemon too old for this vault's format (cloud returned SC_UPGRADE_REQUIRED
         // for its sync, design 甲) → fail LOUDLY so the agent runs `sc upgrade`,
         // instead of a silent parked-sync mystery the agent works around or calls a bug.
@@ -570,7 +585,13 @@ impl BrokerHandler {
         // the client's URL parser reads it must be a canonical, public host
         // (`core::egress`), anchored or not.
         if !crate::core::egress::host_egress_allowed(&dest_host) {
-            write_forward_audit(&self.state, &refused, 0, Some(&dest_host), Some(ScCode::HostForbidden));
+            write_forward_audit(
+                &self.state,
+                &refused,
+                0,
+                Some(&dest_host),
+                Some(ScCode::HostForbidden),
+            );
             return err_response(
                 ScCode::HostForbidden,
                 &format!(
@@ -582,7 +603,13 @@ impl BrokerHandler {
         }
         if !crate::core::host::host_allowed(&dest_host, &resolved_hosts) {
             // Refused whether or not the widen request below registers.
-            write_forward_audit(&self.state, &refused, 0, Some(&dest_host), Some(ScCode::HostNotAnchored));
+            write_forward_audit(
+                &self.state,
+                &refused,
+                0,
+                Some(&dest_host),
+                Some(ScCode::HostNotAnchored),
+            );
             return self.widen_deny(&vault_id, &conn, &dest_host, ip).await;
         }
 

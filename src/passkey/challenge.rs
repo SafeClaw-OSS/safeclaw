@@ -84,6 +84,12 @@ impl ChallengeStore {
         self.challenges.remove(challenge_b64);
     }
 
+    /// Drop all outstanding challenges. Used when vault revocation cancels
+    /// pending operations; challenges are intentionally not vault-indexed.
+    pub fn clear(&mut self) {
+        self.challenges.clear();
+    }
+
     /// Remove expired challenges and stale rate limit entries.
     pub fn cleanup(&mut self) {
         let now = Instant::now();

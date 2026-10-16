@@ -115,8 +115,10 @@ pub async fn create(
     // Serialize with every other writer that reseals this vault body (connect
     // exchange, oauth rotation, grant-approve writes) — same lock those use.
     let (removed_prior_anchor, current_anchors) = {
-        let lock = state.vault_write_lock(&vault_id);
-        let _guard = lock.lock().await;
+        let _guard = state
+            .vault_write_guard(&vault_id)
+            .await
+            .map_err(|_| AppError::VaultAccessRevoked)?;
         let mut view =
             crate::server::handlers::metadata::open_view_with_state_key(&state, &vault_id, &k)?;
         let base = crate::storage::sealed_vault::ViewBase::of(&view)?;
