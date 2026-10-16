@@ -17,6 +17,7 @@
 use std::time::Duration;
 
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use crate::cli::active::put_cloud_coords;
 use crate::config::LoginArgs;
@@ -116,16 +117,48 @@ struct ExchangeResp {
     console_url: Option<String>,
 }
 
+/// Device material prepared in memory for a pairing. The DIK is not written
+/// until the complete approval has verified.
+pub(crate) struct PreparedDevice {
+    pub path: std::path::PathBuf,
+    pub seed: Zeroizing<[u8; 32]>,
+    pub id: String,
+    pub signer: crate::identity::SigningIdentity,
+    pub sc_pk: [u8; 32],
+}
+
+pub(crate) fn prepare_device() -> Result<PreparedDevice, String> {
+    let path = crate::identity_file::device_identity_path()?;
+    let (seed, id) = match crate::identity_file::load(&path) {
+        Ok(loaded) if loaded.kind == crate::identity::IdKind::Device => (loaded.seed, loaded.id),
+        _ => crate::identity_file::mint(crate::identity::IdKind::Device),
+    };
+    let (signer, _) = crate::identity_file::resolve(crate::identity::IdKind::Device, &seed);
+    let sc = crate::crypto::envelope::ScKeyPair::load_or_generate()
+        .map_err(|e| format!("load this machine's daemon key: {}", e))?;
+    let sc_pk = sc
+        .pk_bytes()
+        .try_into()
+        .map_err(|_| "daemon key is not 32 bytes".to_string())?;
+    Ok(PreparedDevice {
+        path,
+        seed,
+        id,
+        signer,
+        sc_pk,
+    })
+}
+
 pub async fn run(args: LoginArgs) -> Result<(), String> {
     pair_and_persist(args, true).await?;
     eprintln!("Starting SafeClaw…");
     if let Err(e) = bring_up(true).await {
         if let Some(e) = e.strip_prefix("auto-start: ") {
-            eprintln!("  couldn't auto-start the daemon ({e}); run `sc up` to finish.");
+            eprintln!("  couldn't auto-start the daemon ({e}); run sc up to finish.");
         } else if let Some(e) = e.strip_prefix("auto-unlock: ") {
-            eprintln!("  couldn't auto-unlock ({e}); run `sc up` to finish.");
+            eprintln!("  couldn't auto-unlock ({e}); run sc up to finish.");
         } else {
-            eprintln!("  couldn't finish bring-up ({e}); run `sc up` to finish.");
+            eprintln!("  couldn't finish bring-up ({e}); run sc up to finish.");
         }
     }
     Ok(())
@@ -170,22 +203,7 @@ pub async fn pair_and_persist(args: LoginArgs, allow_account_switch: bool) -> Re
     // only the PUBLIC key is registered with the cloud (authorized-devices set),
     // additive to the legacy device-key bearer that still authenticates
     // daemon↔cloud during the dual-auth window (§7).
-    let dik_path = crate::identity_file::device_identity_path()?;
-    let (dik_seed, dev_id) = match crate::identity_file::load(&dik_path) {
-        Ok(loaded) if loaded.kind == crate::identity::IdKind::Device => (loaded.seed, loaded.id),
-        _ => crate::identity_file::mint(crate::identity::IdKind::Device),
-    };
-    let (dik, _) = crate::identity_file::resolve(crate::identity::IdKind::Device, &dik_seed);
-
-    // ── The daemon's grant-seal key: the admit binds it (C1), so approvals can
-    // only ever be sealed to this exact key. Created now if this machine has none.
-    let sc = crate::crypto::envelope::ScKeyPair::load_or_generate()
-        .map_err(|e| format!("load this machine's daemon key: {}", e))?;
-    let sc_pk: [u8; 32] = sc
-        .pk_bytes()
-        .try_into()
-        .map_err(|_| "daemon key is not 32 bytes".to_string())?;
-    drop(sc);
+    let device = prepare_device()?;
 
     // ── Pair (PAKE short code). The link's origin is the console of the
     // custodian resolved above (first-party allowlist / self-host env), never
@@ -194,17 +212,37 @@ pub async fn pair_and_persist(args: LoginArgs, allow_account_switch: bool) -> Re
     let paired = crate::cli::pair_flow::pair(
         &client,
         &crate::cli::pair_flow::PairRequest {
-            principal: "device",
-            name: &device_name,
-            principal_id: &dev_id,
-            signer: &dik,
-            sc_pk: Some(sc_pk),
+            entries: vec![crate::cli::pair_flow::PairPrincipal {
+                kind: "device",
+                name: &device_name,
+                id: &device.id,
+                signer: &device.signer,
+                sc_pk: Some(device.sc_pk),
+            }],
             cloud: &custodian,
             origin: &origin,
             restart: "sc login",
         },
     )
     .await?;
+    persist_device_approval(
+        &paired,
+        &device,
+        &custodian,
+        allow_account_switch,
+        Vec::new(),
+    )
+}
+
+/// Persist a fully verified approval that contains a device. This is shared by
+/// `sc login` and the one-code `sc setup` device+agent flow.
+pub(crate) fn persist_device_approval(
+    paired: &crate::cli::pair_flow::Paired,
+    device: &PreparedDevice,
+    custodian: &str,
+    allow_account_switch: bool,
+    admitted_agents: Vec<String>,
+) -> Result<(), String> {
     let parsed: ExchangeResp = serde_json::from_value(paired.body.clone())
         .map_err(|e| format!("approved, but the server's response is incomplete: {}", e))?;
     // The VERIFIED owner (admit signer, owner_mac), never the poll's label.
@@ -245,11 +283,14 @@ pub async fn pair_and_persist(args: LoginArgs, allow_account_switch: bool) -> Re
     // Idempotent when reused. The daemon reads this for the daemon↔cloud mTLS /
     // signed-request path once hop-B ships; until then the device-key bearer
     // above stays the active transport.
-    if let Err(e) = crate::identity_file::write(&dik_path, crate::identity::IdKind::Device, &dik_seed)
+    if let Err(e) =
+        crate::identity_file::write(&device.path, crate::identity::IdKind::Device, &device.seed)
     {
         // Non-fatal: pairing succeeded; the DIK is an additive upgrade. Warn but
         // don't strand the device on a write hiccup.
-        eprintln!("warning: could not persist device identity ({e}); device-key pairing still succeeded");
+        eprintln!(
+            "warning: could not persist device identity ({e}); device-key pairing still succeeded"
+        );
     }
 
     // ── Persist active vault + cloud sync coordinates ────────────────────
@@ -288,14 +329,16 @@ pub async fn pair_and_persist(args: LoginArgs, allow_account_switch: bool) -> Re
     // revoke, lease from now), so it serves at once and an old revoke of this
     // device never wipes the new pairing before the first pull.
     let admit_seq = paired
-        .body
-        .get("admit")
-        .and_then(|a| a.get("seq"))
-        .and_then(|v| v.as_u64())
-        .ok_or("approved, but the admit carries no seq")?;
+        .entries
+        .iter()
+        .find(|entry| entry.kind == "device")
+        .map(|entry| entry.admit_seq)
+        .ok_or("approved, but the device admit is missing")?;
     crate::principal_ledger::write_pairing_floor(
         &crate::config::default_state_dir(),
         admit_seq,
+        paired.head_max_seq,
+        admitted_agents,
         crate::util::now_unix(),
     )
     .map_err(|e| format!("save this device's standing: {}", e))?;

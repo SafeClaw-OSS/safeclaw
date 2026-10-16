@@ -12,11 +12,17 @@ use std::path::{Path, PathBuf};
 pub const STATUS_ENV: &str = "SAFECLAW_SETUP_STATUS";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupEntry {
+    pub kind: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SetupStatus {
     pub phase: String,
     pub state: String,
     #[serde(default)]
-    pub name: String,
+    pub entries: Vec<SetupEntry>,
     #[serde(default)]
     pub profile: Option<String>,
     pub url: Option<String>,
@@ -32,13 +38,13 @@ impl SetupStatus {
         phase: &str,
         state: &str,
         pid: u32,
-        name: impl Into<String>,
+        entries: Vec<SetupEntry>,
         profile: Option<String>,
     ) -> Self {
         Self {
             phase: phase.to_string(),
             state: state.to_string(),
-            name: name.into(),
+            entries,
             profile,
             url: None,
             code: None,
@@ -124,7 +130,10 @@ pub fn ensure_private_dir(path: &Path) -> Result<(), String> {
             fn getuid() -> u32;
         }
         if metadata.uid() != unsafe { getuid() } {
-            return Err(format!("{} is not owned by the current user", path.display()));
+            return Err(format!(
+                "{} is not owned by the current user",
+                path.display()
+            ));
         }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("chmod 0700 {}: {}", path.display(), e))?;
@@ -214,7 +223,16 @@ mod tests {
     fn status_file_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("status.json");
-        let mut want = SetupStatus::new("agent", "needs_user", 42, "codex", Some("dev".into()));
+        let mut want = SetupStatus::new(
+            "pairing",
+            "needs_user",
+            42,
+            vec![SetupEntry {
+                kind: "agent".into(),
+                name: "codex".into(),
+            }],
+            Some("dev".into()),
+        );
         want.url = Some("https://safeclaw.pro/pair".into());
         want.code = Some("1234-5678-9012".into());
         want.expires_in = Some(90);
@@ -224,7 +242,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
@@ -237,8 +258,18 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
         }
     }
 }

@@ -618,8 +618,7 @@ pub struct SetupArgs {
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum SetupPhase {
-    Device,
-    Agent,
+    Pairing,
 }
 
 #[derive(Debug, Args)]

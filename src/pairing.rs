@@ -19,6 +19,8 @@ use zeroize::Zeroizing;
 pub const DS_PAIR: &[u8] = b"safeclaw/v1/pair";
 /// HKDF info of `k_keys` and the `keys_mac` domain.
 pub const DS_PAIR_KEYS: &[u8] = b"safeclaw/v1/pair/keys";
+/// Domain of the ordered principal-set MAC input.
+pub const DS_PAIR_KEYS_SET: &[u8] = b"safeclaw/v1/pair/keys-set";
 /// HKDF info of `k_owner` and the `owner_mac` domain.
 pub const DS_PAIR_OWNER: &[u8] = b"safeclaw/v1/pair/owner";
 
@@ -73,14 +75,30 @@ pub fn subkeys(k: &[u8]) -> Subkeys {
     Subkeys { k_keys, k_owner }
 }
 
-/// `lp("safeclaw/v1/pair/keys") ‖ lp(principal) ‖ lp(principal_id) ‖ lp(id_pub) ‖ lp(sc_pk | empty)`.
-pub fn keys_mac_input(principal: &str, principal_id: &str, id_pub: &[u8], sc_pk: &[u8]) -> Vec<u8> {
+/// One entry in the ordered principal set authenticated by [`keys_mac`].
+#[derive(Debug, Clone, Copy)]
+pub struct PairEntry<'a> {
+    pub kind: &'a str,
+    pub id: &'a str,
+    pub name: &'a str,
+    pub id_pub: &'a [u8],
+    /// Raw X25519 public key for a device, empty for an agent.
+    pub sc_pk: &'a [u8],
+}
+
+/// `lp("safeclaw/v1/pair/keys-set") ‖ u32_be(n) ‖` each ordered entry as
+/// `lp(kind) ‖ lp(id) ‖ lp(name) ‖ lp(id_pub) ‖ lp(sc_pk | empty)`.
+pub fn keys_mac_set_input(entries: &[PairEntry<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
-    push_lp(&mut out, DS_PAIR_KEYS);
-    push_lp(&mut out, principal.as_bytes());
-    push_lp(&mut out, principal_id.as_bytes());
-    push_lp(&mut out, id_pub);
-    push_lp(&mut out, sc_pk);
+    push_lp(&mut out, DS_PAIR_KEYS_SET);
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for entry in entries {
+        push_lp(&mut out, entry.kind.as_bytes());
+        push_lp(&mut out, entry.id.as_bytes());
+        push_lp(&mut out, entry.name.as_bytes());
+        push_lp(&mut out, entry.id_pub);
+        push_lp(&mut out, entry.sc_pk);
+    }
     out
 }
 
@@ -99,10 +117,11 @@ fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-/// `keys_mac = HMAC-SHA256(k_keys, keys_mac_input(..))`: this machine's keys,
-/// authenticated to the browser that holds the same code.
-pub fn keys_mac(k_keys: &[u8], principal: &str, principal_id: &str, id_pub: &[u8], sc_pk: &[u8]) -> [u8; 32] {
-    hmac(k_keys, &keys_mac_input(principal, principal_id, id_pub, sc_pk))
+/// `keys_mac = HMAC-SHA256(k_keys, keys_mac_set_input(entries))`: this
+/// command's complete ordered principal set, authenticated to the browser that
+/// holds the same code.
+pub fn keys_mac(k_keys: &[u8], entries: &[PairEntry<'_>]) -> [u8; 32] {
+    hmac(k_keys, &keys_mac_set_input(entries))
 }
 
 /// `owner_mac = HMAC-SHA256(k_owner, owner_mac_input(..))`: the approving owner,
@@ -187,9 +206,120 @@ mod tests {
         assert_eq!(&ka[..], &kb[..]);
         let s = subkeys(&ka);
         assert_ne!(&s.k_keys[..], &s.k_owner[..]);
-        let m = keys_mac(&s.k_keys[..], "device", "dev_x", &[1u8; 32], &[2u8; 32]);
-        assert_ne!(m, keys_mac(&s.k_keys[..], "device", "dev_x", &[1u8; 32], &[3u8; 32]));
-        assert_ne!(m, keys_mac(&s.k_keys[..], "agent", "dev_x", &[1u8; 32], &[2u8; 32]));
+        let id_pub = [1u8; 32];
+        let sc_pk = [2u8; 32];
+        let changed_sc_pk = [3u8; 32];
+        let entry = PairEntry {
+            kind: "device",
+            id: "dev_x",
+            name: "box",
+            id_pub: &id_pub,
+            sc_pk: &sc_pk,
+        };
+        let m = keys_mac(&s.k_keys[..], &[entry]);
+        assert_ne!(
+            m,
+            keys_mac(
+                &s.k_keys[..],
+                &[PairEntry {
+                    sc_pk: &changed_sc_pk,
+                    ..entry
+                }]
+            )
+        );
+    }
+
+    fn entry<'a>(
+        kind: &'a str,
+        id: &'a str,
+        name: &'a str,
+        id_pub: &'a [u8],
+        sc_pk: &'a [u8],
+    ) -> PairEntry<'a> {
+        PairEntry {
+            kind,
+            id,
+            name,
+            id_pub,
+            sc_pk,
+        }
+    }
+
+    #[test]
+    fn set_mac_input_binds_order_and_every_field() {
+        let device_pub = [1u8; 32];
+        let agent_pub = [2u8; 32];
+        let device_sc = [3u8; 32];
+        let changed_pub = [4u8; 32];
+        let changed_sc = [5u8; 32];
+        let device = entry("device", "dev_a", "box", &device_pub, &device_sc);
+        let agent = entry("agent", "ag_a", "codex", &agent_pub, &[]);
+        let input = keys_mac_set_input(&[device, agent]);
+
+        assert_ne!(input, keys_mac_set_input(&[agent, device]), "order");
+        assert_ne!(
+            input,
+            keys_mac_set_input(&[
+                entry("agent", "dev_a", "box", &device_pub, &device_sc),
+                agent
+            ]),
+            "kind"
+        );
+        assert_ne!(
+            input,
+            keys_mac_set_input(&[
+                entry("device", "dev_b", "box", &device_pub, &device_sc),
+                agent
+            ]),
+            "id"
+        );
+        assert_ne!(
+            input,
+            keys_mac_set_input(&[
+                entry("device", "dev_a", "laptop", &device_pub, &device_sc),
+                agent
+            ]),
+            "name"
+        );
+        assert_ne!(
+            input,
+            keys_mac_set_input(&[
+                entry("device", "dev_a", "box", &changed_pub, &device_sc),
+                agent
+            ]),
+            "id_pub"
+        );
+        assert_ne!(
+            input,
+            keys_mac_set_input(&[
+                entry("device", "dev_a", "box", &device_pub, &changed_sc),
+                agent
+            ]),
+            "sc_pk"
+        );
+    }
+
+    #[test]
+    fn set_mac_input_binds_count_and_domain() {
+        let id_pub = [1u8; 32];
+        let sc_pk = [2u8; 32];
+        let device = entry("device", "dev_a", "box", &id_pub, &sc_pk);
+        assert_ne!(
+            keys_mac_set_input(&[device]),
+            keys_mac_set_input(&[device, device]),
+            "n"
+        );
+        assert_ne!(
+            keys_mac_set_input(&[device]),
+            keys_mac_set_input(&[]),
+            "set versus no entries"
+        );
+        assert!(keys_mac_set_input(&[device]).starts_with(&[
+            0,
+            0,
+            0,
+            DS_PAIR_KEYS_SET.len() as u8
+        ]));
     }
 
     #[test]
@@ -217,8 +347,10 @@ mod tests {
 
     #[test]
     fn seeded_runs_are_deterministic() {
-        let a1 = PakeSession::start_with_rng("0421", "12345678", ORIGIN, StdRng::from_seed([1; 32]));
-        let a2 = PakeSession::start_with_rng("0421", "12345678", ORIGIN, StdRng::from_seed([1; 32]));
+        let a1 =
+            PakeSession::start_with_rng("0421", "12345678", ORIGIN, StdRng::from_seed([1; 32]));
+        let a2 =
+            PakeSession::start_with_rng("0421", "12345678", ORIGIN, StdRng::from_seed([1; 32]));
         assert_eq!(a1.msg(), a2.msg());
         assert_eq!(a1.msg().len(), MSG_LEN);
         assert_eq!(a1.msg()[0], 0x53);
