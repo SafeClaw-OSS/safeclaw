@@ -225,6 +225,7 @@ fn opts(no_browser: bool, cb_port: Option<u16>, timeout: u64) -> ApproveOpts {
         no_browser,
         cb_port,
         timeout,
+        return_after_remote_link: false,
     }
 }
 

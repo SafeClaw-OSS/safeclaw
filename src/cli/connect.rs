@@ -196,6 +196,7 @@ pub async fn run_add_host(args: ConnectionHostArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     let body = approve_op(
         &custodian,
@@ -238,6 +239,7 @@ pub async fn run_rm_host(args: ConnectionHostArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     let body = approve_op(
         &custodian,
@@ -304,6 +306,7 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     let body = approve_op(
         &custodian,
@@ -454,6 +457,7 @@ async fn run_raw(
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     approve_op(
         custodian,
@@ -594,6 +598,7 @@ async fn run_service_backed(
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     approve_op(
         custodian,

@@ -118,10 +118,10 @@ them together and send `/approvals`.
 `agent_not_authorized` means you are not turned on for this vault; its message
 links the vault's Agent access page for the user.
 
-A locked vault: `sc up` prints an unlock link for the user.
+A locked vault: run `sc unlock`; it prints a link for the user and the `sc op wait` command, like an approval.
 
 ## Updates
 
 `sc upgrade` updates `sc` and restarts the daemon, which locks the vault until the
 user taps their passkey. Upgrade when a command asks for it or the user agrees, then
-run `sc up` and send the unlock link.
+run `sc unlock` and send the unlock link.

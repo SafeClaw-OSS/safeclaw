@@ -303,6 +303,7 @@ async fn run_rm(args: VaultDeleteArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     crate::cli::approve::approve_op(
         &custodian,

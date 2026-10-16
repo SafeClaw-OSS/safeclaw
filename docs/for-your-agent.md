@@ -47,10 +47,12 @@ product name, such as `claude-code` or `codex`.
 
 The browser sequence is: the person signs in or creates an account, creates a
 passkey, and approves the machine; approves the agent and chooses which vaults
-it may use; then approves the vault unlock. Under the hood, setup runs `sc
-login` and `sc agent add` when needed, writes
-`~/.safeclaw/agents/<name>/agent.env`, installs the skill, and asks for the
-unlock. It is safe to re-run.
+it may use. Under the hood, setup runs `sc login` and `sc agent add` when needed,
+writes `~/.safeclaw/agents/<name>/agent.env`, and installs the skill. It is safe
+to re-run.
+
+On first use, if the vault is locked, run `sc unlock`; it prints an unlock link
+and the `sc op wait` command, like an approval.
 
 Never ask the person to paste a key or a code into chat. Relay the sentence
 that setup prints and run the next command it prints.
@@ -78,4 +80,4 @@ Changes to the vault come from you, but an agent may ask for one: a new host on 
 
 People can still run `sc login` to pair a machine and `sc agent add <name>` to
 register an agent at a terminal. `sc setup` runs whichever command is still
-needed, then handles the env file, skill, and unlock.
+needed, then handles the env file and skill.

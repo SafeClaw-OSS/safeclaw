@@ -602,16 +602,16 @@ pub struct SetupArgs {
     /// First-party environment selector: prod (default) or dev.
     #[arg(long)]
     pub profile: Option<String>,
-    /// Wait briefly for an already-running setup worker.
+    /// Wait briefly for an already-running setup background process.
     #[arg(long)]
     pub wait: bool,
-    /// Internal detached-worker entrypoint.
+    /// Internal detached-background entrypoint.
     #[arg(long, hide = true)]
-    pub worker: bool,
+    pub background: bool,
     /// Print the detected agent name and exit.
     #[arg(long, hide = true)]
     pub detect_agent: bool,
-    /// Internal setup phase run by the detached worker.
+    /// Internal setup phase run by the detached background process.
     #[arg(long, hide = true, value_enum)]
     pub phase: Option<SetupPhase>,
 }
@@ -620,7 +620,6 @@ pub struct SetupArgs {
 pub enum SetupPhase {
     Device,
     Agent,
-    Unlock,
 }
 
 #[derive(Debug, Args)]

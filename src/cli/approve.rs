@@ -25,6 +25,7 @@
 //! everywhere by construction.
 
 use std::time::{Duration, Instant};
+use std::io::IsTerminal;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -53,6 +54,8 @@ pub struct ApproveOpts {
     pub cb_port: Option<u16>,
     /// Local on-box gesture timeout (seconds).
     pub timeout: u64,
+    /// In a non-interactive remote unlock/lock, return after printing the link.
+    pub return_after_remote_link: bool,
 }
 
 /// Fallback remote-approval wait, used only until the first successful poll
@@ -194,7 +197,14 @@ pub async fn approve_op(
     // Paired ⇒ the user is (potentially) on another machine and can only reach
     // the cloud approval page. Local ⇒ the on-box ceremony.
     if crate::cli::active::frontend_origin().is_some() {
-        remote_approve(custodian, &created.op_id, label, waiter).await
+        remote_approve(
+            custodian,
+            &created.op_id,
+            label,
+            waiter,
+            opts.return_after_remote_link,
+        )
+        .await
     } else {
         // Sign the op as the daemon stored it (see CreatedOp::op).
         let stored = created.op.as_ref().unwrap_or(op);
@@ -310,6 +320,7 @@ async fn remote_approve(
     op_id: &str,
     label: &str,
     waiter: Option<&str>,
+    return_after_link: bool,
 ) -> Result<Value, String> {
     let url = crate::cli::active::grant_url(op_id);
     eprintln!();
@@ -318,6 +329,11 @@ async fn remote_approve(
         label.to_lowercase()
     );
     eprintln!("  {}", url);
+    if return_after_link && (!std::io::stdin().is_terminal() || !std::io::stderr().is_terminal()) {
+        eprintln!("{}", crate::cli::human_action::wait_command(op_id));
+        crate::cli::human_action::report(&url, None, None);
+        return Ok(Value::Null);
+    }
     eprintln!();
     eprintln!("Waiting for approval…");
     crate::cli::human_action::report(&url, None, None);

@@ -8,8 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::cli::human_action::{self, SetupStatus};
-use crate::cli::status::VaultState;
-use crate::config::{LoginArgs, SetupArgs, SetupPhase, UnlockArgs};
+use crate::config::{LoginArgs, SetupArgs, SetupPhase};
 
 struct Context {
     name: String,
@@ -31,8 +30,8 @@ pub async fn run(args: SetupArgs, json_output: bool) -> Result<(), i32> {
         return Err(1);
     }
 
-    if args.worker {
-        return run_worker(args).await;
+    if args.background {
+        return run_background(args).await;
     }
 
     let name = args
@@ -63,7 +62,7 @@ pub async fn run(args: SetupArgs, json_output: bool) -> Result<(), i32> {
     };
 
     loop {
-        match handle_prior_worker(&context, args.wait, json_output).await? {
+        match handle_prior_background(&context, args.wait, json_output).await? {
             Progress::Continue => {}
             Progress::Emitted => return Ok(()),
         }
@@ -139,35 +138,6 @@ pub async fn run(args: SetupArgs, json_output: bool) -> Result<(), i32> {
             messages.push("The existing SafeClaw skill was modified, so it was left unchanged.".to_string());
         }
         messages.extend(skill.notes.clone());
-
-        match crate::cli::active::resolve_active(None) {
-            Ok((custodian, vault)) => {
-                let state = crate::cli::status::fetch_status(&custodian, &vault).await;
-                match state.state {
-                    VaultState::Locked { .. } => {
-                        match spawn_and_report(&context, SetupPhase::Unlock, json_output).await? {
-                            Progress::Continue => continue,
-                            Progress::Emitted => return Ok(()),
-                        }
-                    }
-                    VaultState::NotFound => {
-                        messages.push("No vault is available yet, so vault unlock was skipped.".to_string());
-                    }
-                    VaultState::Unreachable => {
-                        emit_error(
-                            json_output,
-                            "The daemon stopped answering while setup checked the active vault.",
-                            &base_command(&context),
-                        );
-                        return Err(1);
-                    }
-                    VaultState::Unlocked { .. } => {}
-                }
-            }
-            Err(_) => {
-                messages.push("No active vault exists yet, so vault unlock was skipped.".to_string());
-            }
-        }
 
         if messages.is_empty() {
             messages.push("SafeClaw setup is complete.".to_string());
@@ -251,35 +221,20 @@ async fn preconditions(
             1,
         )
     })?;
-    let setup_dir = home.join(".safeclaw").join("setup");
+    let safeclaw_dir = home.join(".safeclaw");
+    let setup_dir = safeclaw_dir.join("setup");
     let retry = format!(
         "Re-run outside the sandbox with network access: {}",
         setup_command(&name, profile.as_deref())
     );
-    if let Err(e) = ensure_writable(&setup_dir) {
+    if let Err(e) = human_action::ensure_private_dir(&safeclaw_dir)
+        .and_then(|_| human_action::ensure_private_dir(&setup_dir))
+    {
         return Err((
-            format!("SafeClaw's setup directory is not writable: {}", e),
+            format!("SafeClaw's setup directory is not usable: {}", e),
             retry,
             1,
         ));
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| (format!("Network client initialization failed: {}", e), retry.clone(), 1))?;
-    // Mirror doctor's cloud reachability check: the cloud root is the public
-    // liveness endpoint, and any HTTP response proves the route answered. A
-    // transport failure is the sandbox/offline signal setup must surface.
-    match client.get(&cloud).send().await {
-        Ok(_) => {}
-        Err(e) => {
-            return Err((
-                format!("SafeClaw cloud health check failed: {}", e),
-                retry,
-                1,
-            ))
-        }
     }
 
     Ok(Context {
@@ -294,7 +249,7 @@ fn device_paired(cfg: &crate::cli::active::CliConfig) -> bool {
         && crate::sync::device_key().is_some()
 }
 
-async fn handle_prior_worker(
+async fn handle_prior_background(
     context: &Context,
     wait: bool,
     json_output: bool,
@@ -305,6 +260,11 @@ async fn handle_prior_worker(
     if let Some(pid) = lock_pid {
         if human_action::pid_is_live(pid) {
             if wait {
+                if let Ok(status) = human_action::read(&status_path) {
+                    if let Some(result) = name_mismatch(context, &status, json_output) {
+                        return result;
+                    }
+                }
                 return wait_for_existing(context, pid, json_output).await;
             }
             return status_now(context, pid, json_output).await;
@@ -326,14 +286,22 @@ async fn status_now(
 ) -> Result<Progress, i32> {
     let status_path = context.setup_dir.join("status.json");
     match human_action::read(&status_path) {
-        Ok(status) if status.state == "approved" => {
-            finish_approved(context, pid).await;
-            Ok(Progress::Continue)
-        }
-        Ok(status) if status.state == "failed" => failed_status(context, status, json_output),
-        Ok(status) if actionable(&status) => {
-            emit_action(json_output, context, &status);
-            Ok(Progress::Emitted)
+        Ok(status) => {
+            if let Some(result) = name_mismatch(context, &status, json_output) {
+                return result;
+            }
+            if status.state == "approved" {
+                finish_approved(context, pid).await;
+                Ok(Progress::Continue)
+            } else if status.state == "failed" {
+                failed_status(context, status, json_output)
+            } else if actionable(&status) {
+                emit_action(json_output, context, &status);
+                Ok(Progress::Emitted)
+            } else {
+                emit_waiting(json_output, &next_command(context));
+                Ok(Progress::Emitted)
+            }
         }
         _ => {
             emit_waiting(json_output, &next_command(context));
@@ -355,6 +323,9 @@ async fn wait_for_existing(
     let status_path = context.setup_dir.join("status.json");
     loop {
         if let Ok(status) = human_action::read(&status_path) {
+            if let Some(result) = name_mismatch(context, &status, json_output) {
+                return result;
+            }
             if status.state == "approved" {
                 finish_approved(context, pid).await;
                 return Ok(Progress::Continue);
@@ -389,7 +360,7 @@ fn consume_dead_status(
             let _ = fs::remove_file(status_path);
             emit_error(
                 json_output,
-                "The setup worker stopped before the approval finished.",
+                "The setup background process stopped before the approval finished.",
                 &base_command(context),
             );
             Err(1)
@@ -404,7 +375,7 @@ fn failed_status(
 ) -> Result<Progress, i32> {
     let message = status
         .message
-        .unwrap_or_else(|| "The setup worker failed.".to_string());
+        .unwrap_or_else(|| "The setup background process failed.".to_string());
     let lower = message.to_ascii_lowercase();
     let code = if lower.contains("expired")
         || lower.contains("declined")
@@ -440,7 +411,7 @@ async fn spawn_and_report(
     phase: SetupPhase,
     json_output: bool,
 ) -> Result<Progress, i32> {
-    let pid = match spawn_worker(context, phase) {
+    let pid = match spawn_background(context, phase) {
         Ok(pid) => pid,
         Err(e) => {
             emit_error(json_output, &e, &base_command(context));
@@ -474,7 +445,7 @@ async fn spawn_and_report(
     }
 }
 
-fn spawn_worker(context: &Context, phase: SetupPhase) -> Result<u32, String> {
+fn spawn_background(context: &Context, phase: SetupPhase) -> Result<u32, String> {
     let lock_path = context.setup_dir.join("lock");
     let status_path = context.setup_dir.join("status.json");
     let mut lock_options = OpenOptions::new();
@@ -486,7 +457,7 @@ fn spawn_worker(context: &Context, phase: SetupPhase) -> Result<u32, String> {
     }
     let mut lock = lock_options.open(&lock_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
-            "another setup worker is starting; re-run the same setup command".to_string()
+            "another setup background process is starting; re-run the same setup command".to_string()
         } else {
             format!("create {}: {}", lock_path.display(), e)
         }
@@ -495,12 +466,23 @@ fn spawn_worker(context: &Context, phase: SetupPhase) -> Result<u32, String> {
         .map_err(|e| format!("write {}: {}", lock_path.display(), e))?;
     let _ = fs::remove_file(&status_path);
 
-    let log_path = context.setup_dir.join("worker.log");
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let log_path = context.setup_dir.join("background.log");
+    let mut log_options = OpenOptions::new();
+    log_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_options.mode(0o600);
+    }
+    let stdout = log_options
         .open(&log_path)
         .map_err(|e| format!("open {}: {}", log_path.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 0600 {}: {}", log_path.display(), e))?;
+    }
     let stderr = stdout
         .try_clone()
         .map_err(|e| format!("open {} for stderr: {}", log_path.display(), e))?;
@@ -508,7 +490,7 @@ fn spawn_worker(context: &Context, phase: SetupPhase) -> Result<u32, String> {
     let mut command = Command::new(binary);
     command
         .arg("setup")
-        .arg("--worker")
+        .arg("--background")
         .arg("--phase")
         .arg(phase_name(phase))
         .arg("--name")
@@ -525,7 +507,7 @@ fn spawn_worker(context: &Context, phase: SetupPhase) -> Result<u32, String> {
         Ok(child) => child,
         Err(e) => {
             let _ = fs::remove_file(&lock_path);
-            return Err(format!("start setup worker: {}", e));
+            return Err(format!("start setup background process: {}", e));
         }
     };
     if let Err(e) = write_pid_file(&lock_path, child.id()) {
@@ -536,7 +518,7 @@ fn spawn_worker(context: &Context, phase: SetupPhase) -> Result<u32, String> {
     Ok(child.id())
 }
 
-async fn run_worker(args: SetupArgs) -> Result<(), i32> {
+async fn run_background(args: SetupArgs) -> Result<(), i32> {
     let phase = match args.phase {
         Some(phase) => phase,
         None => return Err(2),
@@ -551,7 +533,13 @@ async fn run_worker(args: SetupArgs) -> Result<(), i32> {
     };
     let pid = std::process::id();
     let phase_text = phase_name(phase);
-    let starting = SetupStatus::new(phase_text, "starting", pid);
+    let starting = SetupStatus::new(
+        phase_text,
+        "starting",
+        pid,
+        name.clone(),
+        args.profile.clone(),
+    );
     if human_action::write(&status_path, &starting).is_err() {
         return Err(1);
     }
@@ -561,7 +549,7 @@ async fn run_worker(args: SetupArgs) -> Result<(), i32> {
             let paired = crate::cli::login::pair_and_persist(
                 LoginArgs {
                     device_name: None,
-                    profile: args.profile,
+                    profile: args.profile.clone(),
                     insecure: false,
                 },
                 false,
@@ -573,18 +561,12 @@ async fn run_worker(args: SetupArgs) -> Result<(), i32> {
             }
         }
         SetupPhase::Agent => crate::cli::agent::add_and_persist(&name).await.map(|_| ()),
-        SetupPhase::Unlock => crate::cli::unlock::run_unlock(UnlockArgs {
-            no_browser: true,
-            cb_port: crate::cli::active::settings_cb_port(),
-            timeout: 15 * 60,
-        })
-        .await,
     };
 
     let (state, message, exit) = match result {
         Ok(()) => ("approved", None, 0),
         Err(detail) => {
-            eprintln!("setup {} worker failed: {}", phase_text, detail);
+            eprintln!("setup {} background process failed: {}", phase_text, detail);
             let lower = detail.to_ascii_lowercase();
             if lower.contains("expired") {
                 (
@@ -605,7 +587,7 @@ async fn run_worker(args: SetupArgs) -> Result<(), i32> {
                 (
                     "failed",
                     Some(format!(
-                        "The {} setup worker failed. See ~/.safeclaw/setup/worker.log.",
+                        "The {} setup background process failed. See ~/.safeclaw/setup/background.log.",
                         phase_text
                     )),
                     1,
@@ -614,7 +596,7 @@ async fn run_worker(args: SetupArgs) -> Result<(), i32> {
         }
     };
     let mut final_status = human_action::read(&status_path)
-        .unwrap_or_else(|_| SetupStatus::new(phase_text, state, pid));
+        .unwrap_or_else(|_| SetupStatus::new(phase_text, state, pid, name.clone(), args.profile.clone()));
     final_status.state = state.to_string();
     final_status.message = message;
     final_status.updated_at = crate::util::now_unix();
@@ -641,18 +623,45 @@ fn phase_name(phase: SetupPhase) -> &'static str {
     match phase {
         SetupPhase::Device => "device",
         SetupPhase::Agent => "agent",
-        SetupPhase::Unlock => "unlock",
     }
 }
 
 fn actionable(status: &SetupStatus) -> bool {
-    status.state == "needs_user"
-        && status.url.is_some()
-        && (status.phase == "unlock" || status.code.is_some())
+    status.state == "needs_user" && status.url.is_some() && status.code.is_some()
+}
+
+fn name_mismatch(
+    context: &Context,
+    status: &SetupStatus,
+    json_output: bool,
+) -> Option<Result<Progress, i32>> {
+    if let Some((message, fix)) = name_mismatch_details(&context.name, status) {
+        emit_error(json_output, &message, &fix);
+        Some(Err(1))
+    } else {
+        None
+    }
+}
+
+fn name_mismatch_details(current_name: &str, status: &SetupStatus) -> Option<(String, String)> {
+    if !status.name.is_empty() && status.name != current_name {
+        Some((
+            format!("Setup for agent '{}' is in progress.", status.name),
+            setup_wait_command(&status.name, status.profile.as_deref()),
+        ))
+    } else {
+        None
+    }
 }
 
 fn next_command(context: &Context) -> String {
-    format!("{} --wait", base_command(context))
+    setup_wait_command(&context.name, context.profile.as_deref())
+}
+
+fn setup_wait_command(name: &str, profile: Option<&str>) -> String {
+    let mut command = setup_command(name, profile);
+    command.push_str(" --wait");
+    command
 }
 
 fn base_command(context: &Context) -> String {
@@ -723,24 +732,21 @@ fn shell_word(value: &str) -> String {
 
 fn emit_action(json_output: bool, context: &Context, status: &SetupStatus) {
     let url = status.url.as_deref().unwrap_or("");
-    let expires_in = status
-        .expires_at
-        .map(|at| at.saturating_sub(crate::util::now_unix()));
-    let say = if status.phase == "unlock" {
-        format!(
-            "Ask the user to open {} and approve with their passkey to unlock the vault.",
-            url
-        )
-    } else {
+    let expires_in = status.expires_in;
+    let say = {
         let code = status.code.as_deref().unwrap_or("");
         let subject = if status.phase == "device" {
             format!("this machine ({})", crate::cli::login::device_name(None))
         } else {
-            format!("this agent ({})", context.name)
+            format!("this agent ({})", status.name)
         };
         pairing_say(&subject, url, code, expires_in)
     };
-    let next = next_command(context);
+    let next = if status.name.is_empty() {
+        next_command(context)
+    } else {
+        setup_wait_command(&status.name, status.profile.as_deref())
+    };
     if json_output {
         let mut object = Map::new();
         object.insert("status".into(), json!("action_required"));
@@ -766,10 +772,15 @@ fn emit_action(json_output: bool, context: &Context, status: &SetupStatus) {
 
 fn pairing_say(subject: &str, url: &str, code: &str, expires_in: Option<u64>) -> String {
     let expiry = match expires_in {
-        Some(seconds) => format!(
-            "The code expires in about {} minutes.",
-            ((seconds.saturating_add(59)) / 60).max(1)
-        ),
+        Some(seconds) if seconds < 60 => "The code expires soon.".to_string(),
+        Some(seconds) => {
+            let minutes = (seconds.saturating_add(59)) / 60;
+            format!(
+                "The code expires in about {} {}.",
+                minutes,
+                if minutes == 1 { "minute" } else { "minutes" }
+            )
+        }
         None => "The code expires soon.".to_string(),
     };
     format!(
@@ -836,18 +847,6 @@ fn emit_error(json_output: bool, message: &str, fix: &str) {
     }
 }
 
-fn ensure_writable(dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
-    let test = dir.join(format!(".write-test-{}", std::process::id()));
-    let result = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&test)
-        .and_then(|mut file| file.write_all(b"ok"));
-    let _ = fs::remove_file(&test);
-    result.map_err(|e| format!("write {}: {}", dir.display(), e))
-}
-
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if fs::read(path).ok().as_deref() == Some(bytes) {
         #[cfg(unix)]
@@ -883,6 +882,28 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::rename(&tmp, path)
         .map_err(|e| format!("rename {} to {}: {}", tmp.display(), path.display(), e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    #[test]
+    fn pairing_wording_uses_soon_and_singular_minute() {
+        let soon = pairing_say("this agent (codex)", "https://example.test", "1234", Some(59));
+        assert!(soon.ends_with("The code expires soon."));
+        let singular = pairing_say("this agent (codex)", "https://example.test", "1234", Some(60));
+        assert!(singular.ends_with("The code expires in about 1 minute."));
+        assert!(!singular.contains("1 minutes"));
+    }
+
+    #[test]
+    fn status_name_mismatch_waits_for_stored_agent() {
+        let status = SetupStatus::new("agent", "needs_user", 42, "other", Some("dev".into()));
+        let (message, fix) = name_mismatch_details("codex", &status).unwrap();
+        assert_eq!(message, "Setup for agent 'other' is in progress.");
+        assert!(fix.ends_with(" setup --name other --profile dev --wait"));
+    }
 }
 
 fn read_pid(path: &Path) -> Option<u32> {

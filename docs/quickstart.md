@@ -38,16 +38,15 @@ next command. The agent repeats this loop until setup reports `done`:
 
 In the browser, the person signs in or creates an account the first time,
 creates a passkey, and approves the machine. The passkey also creates the
-first vault. They then approve the agent and choose which vaults it may use,
-then approve the vault unlock. Under the hood, setup runs `sc login` if the
-machine is not paired and `sc agent add` if the agent is not registered. It
-writes `~/.safeclaw/agents/<name>/agent.env`, installs the skill, and asks for
-the unlock. It is safe to run again.
+first vault. They then approve the agent and choose which vaults it may use.
+Under the hood, setup runs `sc login` if the machine is not paired and `sc agent
+add` if the agent is not registered. It writes
+`~/.safeclaw/agents/<name>/agent.env` and installs the skill. It is safe to run
+again.
 
 At a terminal, a person can still use `sc login` to pair a machine or `sc agent
 add <name>` to add an agent by hand, such as a second agent. `sc setup` runs
-whichever of those is still needed and also handles the env file, skill, and
-unlock.
+whichever of those is still needed and also handles the env file and skill.
 
 ## 3. Add a credential
 
@@ -67,7 +66,12 @@ Prompts for the value, asks for one passkey approval, and mints the phantom
 `__sc__hf_token__` anchored to `huggingface.co`. Entered this way the value
 never leaves your machine.
 
-## 4. First brokered call
+## 4. First use
+
+If the vault is locked, run `sc unlock`; it prints an unlock link and the
+`sc op wait` command, like an approval.
+
+## 5. First brokered call
 
 Put the phantom where the credential belongs and route the command through
 `sc run --`:
@@ -81,14 +85,14 @@ The proxy swaps the phantom for the real value on the way out, only toward
 that connection's own hosts. The command gets the API response; the
 environment, the shell history, and the agent hold only the phantom.
 
-## 5. When an approval is needed
+## 6. When an approval is needed
 
 Policy-gated uses don't fail silently: the command's error output carries an
 approval link. Open it, tap your passkey, re-run the same command. Agents can
 block on `sc op wait <op_id>` instead of asking you to say "done". Approvals
 are cached per policy, so routine calls don't nag.
 
-## 6. Daily rhythm
+## 7. Daily rhythm
 
 ```bash
 sc up      # start of day: daemon up + vault unlocked, one passkey tap

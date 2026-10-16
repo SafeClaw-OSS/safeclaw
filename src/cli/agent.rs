@@ -62,7 +62,7 @@ pub struct AddedAgent {
 
 /// Run the agent admission ceremony and persist the identity without printing
 /// its env projection. The `sc agent add` wrapper below retains the command's
-/// existing stdout and stderr exactly; setup workers consume this result
+/// existing stdout and stderr exactly; setup background processes consume this result
 /// directly.
 pub async fn add_and_persist(name: &str) -> Result<AddedAgent, String> {
     // Requires a paired device: the cloud backend to run the admission ceremony

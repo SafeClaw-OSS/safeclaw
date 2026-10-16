@@ -85,7 +85,9 @@ sc setup
 ```
 
 `--name <name>` is optional and defaults to the agent's product name.
-It never prompts. Follow each printed instruction until it reports `done`: sign in or create an account, create a passkey, approve the machine, approve the agent and choose its vaults, then approve the vault unlock.
+It never prompts. Follow each printed instruction until it reports `done`: sign in or create an account, create a passkey, approve the machine, and approve the agent and choose its vaults.
+
+On first use, if the vault is locked, run `sc unlock`; it prints an unlock link and the `sc op wait` command, like an approval.
 
 **3. Add a credential.** In the console's Connections tab (values are encrypted in your browser before upload), or at your terminal:
 

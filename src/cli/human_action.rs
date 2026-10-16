@@ -1,4 +1,4 @@
-//! Status hand-off between a detached `sc setup` worker and its parent.
+//! Status hand-off between a detached `sc setup` background process and its parent.
 //!
 //! Ordinary `sc login`, `sc agent add`, and approval commands do not set
 //! `SAFECLAW_SETUP_STATUS`, so the hooks in their existing ceremony paths are
@@ -15,22 +15,34 @@ pub const STATUS_ENV: &str = "SAFECLAW_SETUP_STATUS";
 pub struct SetupStatus {
     pub phase: String,
     pub state: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub profile: Option<String>,
     pub url: Option<String>,
     pub code: Option<String>,
-    pub expires_at: Option<u64>,
+    pub expires_in: Option<u64>,
     pub message: Option<String>,
     pub pid: u32,
     pub updated_at: u64,
 }
 
 impl SetupStatus {
-    pub fn new(phase: &str, state: &str, pid: u32) -> Self {
+    pub fn new(
+        phase: &str,
+        state: &str,
+        pid: u32,
+        name: impl Into<String>,
+        profile: Option<String>,
+    ) -> Self {
         Self {
             phase: phase.to_string(),
             state: state.to_string(),
+            name: name.into(),
+            profile,
             url: None,
             code: None,
-            expires_at: None,
+            expires_in: None,
             message: None,
             pid,
             updated_at: crate::util::now_unix(),
@@ -84,8 +96,8 @@ fn configured_path() -> Option<PathBuf> {
 
 /// Ceremony hook used when a browser action becomes available. It deliberately
 /// ignores status-write failures: the ceremony itself must retain its original
-/// behavior, and the setup worker will report a phase failure if it exits.
-pub fn report(url: &str, code: Option<&str>, expires_at: Option<u64>) {
+/// behavior, and the setup background process will report a phase failure if it exits.
+pub fn report(url: &str, code: Option<&str>, expires_in: Option<u64>) {
     let Some(path) = configured_path() else {
         return;
     };
@@ -95,10 +107,36 @@ pub fn report(url: &str, code: Option<&str>, expires_at: Option<u64>) {
     status.state = "needs_user".to_string();
     status.url = Some(url.to_string());
     status.code = code.map(str::to_string);
-    status.expires_at = expires_at;
+    status.expires_in = expires_in;
     status.message = None;
     status.updated_at = crate::util::now_unix();
     let _ = write(&path, &status);
+}
+
+/// Create a directory for SafeClaw's private state and keep it private.
+pub fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|e| format!("mkdir {}: {}", path.display(), e))?;
+    let metadata = fs::metadata(path).map_err(|e| format!("stat {}: {}", path.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        extern "C" {
+            fn getuid() -> u32;
+        }
+        if metadata.uid() != unsafe { getuid() } {
+            return Err(format!("{} is not owned by the current user", path.display()));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod 0700 {}: {}", path.display(), e))?;
+    }
+    Ok(())
+}
+
+pub fn wait_command(op_id: &str) -> String {
+    format!(
+        "To wait: sc op wait {}   (background it; its exit is the signal)",
+        op_id
+    )
 }
 
 /// Once the browser's PAKE message has been accepted, the short code is spent.
@@ -129,7 +167,7 @@ pub fn pid_is_live(pid: u32) -> bool {
             return false;
         };
         // `/proc/<pid>/stat`: the state byte follows the final ')' of comm.
-        // A killed, unreaped worker is a zombie and must count as dead.
+        // A killed, unreaped background process is a zombie and must count as dead.
         return stat
             .rsplit_once(')')
             .and_then(|(_, tail)| tail.split_whitespace().next())
@@ -179,10 +217,10 @@ mod tests {
     fn status_file_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("status.json");
-        let mut want = SetupStatus::new("agent", "needs_user", 42);
+        let mut want = SetupStatus::new("agent", "needs_user", 42, "codex", Some("dev".into()));
         want.url = Some("https://safeclaw.pro/pair".into());
         want.code = Some("1234-5678-9012".into());
-        want.expires_at = Some(1_900_000_000);
+        want.expires_in = Some(90);
         want.message = Some("waiting".into());
         write(&path, &want).unwrap();
         assert_eq!(read(&path).unwrap(), want);
@@ -190,6 +228,20 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn private_directory_is_0700() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("safeclaw").join("setup");
+        ensure_private_dir(path.parent().unwrap()).unwrap();
+        ensure_private_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
         }
     }
 }

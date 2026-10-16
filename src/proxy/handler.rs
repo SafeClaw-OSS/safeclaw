@@ -1299,10 +1299,7 @@ pub(crate) fn grant_lookup(
 /// surface, and a hinted wait there would just block until the op expires.
 fn wait_hint(approve_url: &str, op_id: &str) -> String {
     if approve_url.starts_with("http") {
-        format!(
-            "To wait: sc op wait {}   (background it; its exit is the signal)\n",
-            op_id
-        )
+        format!("{}\n", crate::cli::human_action::wait_command(op_id))
     } else {
         String::new()
     }

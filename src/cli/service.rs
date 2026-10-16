@@ -455,6 +455,11 @@ pub fn run_ensure_running() -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 pub fn run_stop() -> Result<(), String> {
+    if detached_daemon_running() {
+        stop_detached()?;
+        eprintln!("✓ daemon stopped");
+        return Ok(());
+    }
     ensure_unit_installed()?;
     run_systemctl(&["stop", UNIT_BASENAME], "stop")?;
     eprintln!("✓ daemon stopped");
@@ -463,6 +468,11 @@ pub fn run_stop() -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 pub fn run_stop() -> Result<(), String> {
+    if detached_daemon_running() {
+        stop_detached()?;
+        eprintln!("✓ daemon stopped");
+        return Ok(());
+    }
     let plist_path = launchd_plist_path()?;
     if !plist_path.exists() {
         return Err("no LaunchAgent installed — run `sc up` first".to_string());
@@ -480,6 +490,11 @@ pub fn run_stop() -> Result<(), String> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn run_stop() -> Result<(), String> {
+    if detached_daemon_running() {
+        stop_detached()?;
+        eprintln!("✓ daemon stopped");
+        return Ok(());
+    }
     Err("`sc down` (service mode) is Linux/macOS-only.".into())
 }
 
@@ -678,13 +693,24 @@ async fn start_detached() -> Result<(), String> {
 
     let log_path = detached_log_path()?;
     if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+        crate::cli::human_action::ensure_private_dir(parent)?;
     }
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut log_options = OpenOptions::new();
+    log_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_options.mode(0o600);
+    }
+    let stdout = log_options
         .open(&log_path)
         .map_err(|e| format!("open {}: {}", log_path.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 0600 {}: {}", log_path.display(), e))?;
+    }
     let stderr = stdout
         .try_clone()
         .map_err(|e| format!("open {} for stderr: {}", log_path.display(), e))?;
@@ -731,6 +757,12 @@ fn stop_detached() -> Result<(), String> {
     }
     let _ = fs::remove_file(path);
     Ok(())
+}
+
+fn detached_daemon_running() -> bool {
+    read_detached_pid()
+        .map(crate::cli::human_action::pid_is_live)
+        .unwrap_or(false)
 }
 
 /// Start the normal user service when it is usable, otherwise run `sc serve`

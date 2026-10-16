@@ -132,8 +132,8 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
 }
 
 /// Run the existing device pairing ceremony and persist its result, but do not
-/// start or unlock the daemon. `sc setup --worker` uses this in-process so the
-/// PAKE session remains in one long-lived worker.
+/// start or unlock the daemon. `sc setup --background` uses this in-process so
+/// the PAKE session remains in one long-lived background process.
 pub async fn pair_and_persist(args: LoginArgs, allow_account_switch: bool) -> Result<(), String> {
     // ── Resolve cloud endpoint: env override > --profile selector > baked ─────
     let custodian = resolve_custodian(args.profile.as_deref())?;
@@ -315,7 +315,7 @@ pub async fn pair_and_persist(args: LoginArgs, allow_account_switch: bool) -> Re
 }
 
 /// Bring up the daemon after pairing. With `unlock=false`, used only by the
-/// setup device worker, no approval operation is created.
+/// setup device background process, no approval operation is created.
 pub async fn bring_up(unlock: bool) -> Result<(), String> {
     if crate::cli::service::unit_installed() {
         if unlock {

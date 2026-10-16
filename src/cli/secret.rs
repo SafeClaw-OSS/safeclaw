@@ -118,6 +118,7 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     let body = approve_op(
         &custodian,
@@ -281,6 +282,7 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     let body = approve_op(
         &custodian,
@@ -334,6 +336,7 @@ pub async fn run_get(args: GetArgs) -> Result<(), String> {
         no_browser: args.no_browser,
         cb_port: args.cb_port,
         timeout: args.timeout,
+        return_after_remote_link: false,
     };
     let body = approve_op(&custodian, &vault, &op, &format!("Reveal {}", key), &opts).await?;
     let value = body

@@ -157,8 +157,7 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
         crate::cli::human_action::report(
             &pair_url,
             Some(&display_code),
-            auth.expires_in
-                .map(|seconds| crate::util::now_unix().saturating_add(seconds)),
+            auth.expires_in,
         );
         Some(session)
     };
