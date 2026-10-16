@@ -219,6 +219,10 @@ async fn require_agent(
             ScCode::AgentNotAdmitted,
             crate::error::AGENT_NOT_ADMITTED_MSG,
         )),
+        Err(AgentRefusal::Locked) => Err(problem(
+            ScCode::VaultLocked,
+            crate::error::VAULT_LOCKED_MSG,
+        )),
         // Verified and admitted, but NOT turned on anywhere yet: distinct from a
         // bad credential — the fix is a Console authorize (Agent access page).
         Err(AgentRefusal::NotAuthorized) => Err(problem(

@@ -36,6 +36,9 @@ does not continue, then do what it prints until it reports `done`:
 - `action_required`: give the user its `say` text exactly as printed (an address
   and a code to type in their browser, or a link), then run its `next_step`.
 - `waiting`: run the same `next_step` again.
+- `done`: if it has a `next_step`, run it. This unlocks the vault: `sc unlock`
+  prints a link for the user and the `sc op wait` command. Run that wait command
+  and continue after the approval.
 - `error`: run its `fix`.
 
 `sc setup` is safe to re-run: it skips whatever is already done. It writes under

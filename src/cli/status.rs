@@ -343,7 +343,7 @@ pub async fn run(json: bool) -> Result<(), String> {
                     "  note:  vault {} was deleted on the web; this device's pairing to it is gone",
                     dead
                 );
-                println!("  hint:  generate a new install token in the console (\"Connect a new agent\"), then `sc login`");
+                println!("  hint:  run `sc vault ls` to pick another, or `sc login` to pair again");
             } else if d.vault_count == Some(0) {
                 println!("  hint:  no vaults yet — seal one on the web, then `sc login`");
             } else if crate::cli::active::known_vaults().is_empty() {

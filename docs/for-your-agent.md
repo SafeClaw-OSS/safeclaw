@@ -42,7 +42,9 @@ product name, such as `claude-code` or `codex`.
   open the `/pair` address and type the code shown, or open a link and approve
   with a passkey. Then run the printed `next_step`.
 - `waiting`: run the printed `next_step` again.
-- `done`: setup is complete.
+- `done`: if it has a `next_step`, run it. After the machine and agent are
+  approved, this unlocks the vault: `sc unlock` prints a link for the person and
+  the `sc op wait` command. Run that wait command and continue after approval.
 - `error`: apply the printed `fix`, then run setup again as directed.
 
 The browser sequence is: the person signs in or creates an account, creates a
@@ -50,9 +52,6 @@ passkey, and approves the machine; approves the agent and chooses which vaults
 it may use. Under the hood, setup runs `sc login` and `sc agent add` when needed,
 writes `~/.safeclaw/agents/<name>/agent.env`, and installs the skill. It is safe
 to re-run.
-
-On first use, if the vault is locked, run `sc unlock`; it prints an unlock link
-and the `sc op wait` command, like an approval.
 
 Never ask the person to paste a key or a code into chat. Relay the sentence
 that setup prints and run the next command it prints.

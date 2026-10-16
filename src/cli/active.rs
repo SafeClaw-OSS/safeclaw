@@ -795,12 +795,11 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
     // vault and point at re-pairing instead of the generic "no vault" error.
     if let Some(dead) = cfg.vault_deleted_upstream.as_deref() {
         return Err(format!(
-            "vault {} was deleted on the web, so this device's pairing to it is gone — \
-             generate a new install token in the console (\"Connect a new agent\") and run `sc login`",
+            "vault {} was deleted on the web; run `sc vault ls` to pick another, or `sc login` to pair again",
             dead
         ));
     }
-    Err("no vault selected — run `sc login` or `sc vault use`".to_string())
+    Err("no vault selected: run `sc vault ls`, then pass `--vault <name>` or run `sc vault use <name>`".to_string())
 }
 
 /// Client-side mirror of the daemon's vault-id rule (`op::validate_vault_id`:

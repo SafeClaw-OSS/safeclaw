@@ -142,12 +142,18 @@ pub async fn run(args: SetupArgs, json_output: bool) -> Result<(), i32> {
         if messages.is_empty() {
             messages.push("SafeClaw setup is complete.".to_string());
         }
+        let vault_guidance = setup_vault_guidance(crate::cli::active::known_vaults().len());
+        let done_message = vault_guidance
+            .as_ref()
+            .map(|(message, _)| message.clone())
+            .unwrap_or_else(|| messages.join(" "));
         emit_done(
             json_output,
             &context.name,
             &env_path,
             &skill.paths,
-            &messages.join(" "),
+            &done_message,
+            vault_guidance.as_ref().map(|(_, next)| next.as_str()),
         );
         return Ok(());
     }
@@ -700,6 +706,22 @@ fn running_binary() -> String {
     }
 }
 
+fn setup_vault_guidance(known_vault_count: usize) -> Option<(String, String)> {
+    let binary = shell_word(&running_binary());
+    match known_vault_count {
+        0 => None,
+        1 => Some((
+            "The vault is locked.".to_string(),
+            format!("{} unlock", binary),
+        )),
+        _ => Some((
+            "The vault is locked. Pick the vault to use: sc vault ls, then sc unlock --vault <name>."
+                .to_string(),
+            format!("{} vault ls", binary),
+        )),
+    }
+}
+
 fn executable_on_path(path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
@@ -804,23 +826,27 @@ fn emit_done(
     env_file: &Path,
     skill_paths: &[PathBuf],
     message: &str,
+    next_step: Option<&str>,
 ) {
     let paths: Vec<String> = skill_paths
         .iter()
         .map(|path| path.display().to_string())
         .collect();
     if json_output {
-        println!(
-            "{}",
-            json!({
-                "status": "done",
-                "name": name,
-                "env_file": env_file.display().to_string(),
-                "skill_paths": paths,
-                "message": message,
-                "load_env": format!("set -a; . {}; set +a", shell_word(&env_file.display().to_string())),
-            })
+        let mut object = Map::new();
+        object.insert("status".into(), json!("done"));
+        object.insert("name".into(), json!(name));
+        object.insert("env_file".into(), json!(env_file.display().to_string()));
+        object.insert("skill_paths".into(), json!(paths));
+        object.insert("message".into(), json!(message));
+        object.insert(
+            "load_env".into(),
+            json!(format!("set -a; . {}; set +a", shell_word(&env_file.display().to_string()))),
         );
+        if let Some(next_step) = next_step {
+            object.insert("next_step".into(), json!(next_step));
+        }
+        println!("{}", Value::Object(object));
     } else {
         println!("SafeClaw setup is done for agent '{}'.", name);
         println!("Environment file: {}", env_file.display());
@@ -828,6 +854,9 @@ fn emit_done(
             println!("Skill path: {}", path.display());
         }
         println!("Done: {}", message);
+        if let Some(next_step) = next_step {
+            println!("Next: {}", next_step);
+        }
         println!(
             "Before using sc run in a new session, load this agent's environment: set -a; . {}; set +a",
             shell_word(&env_file.display().to_string())
@@ -903,6 +932,22 @@ mod setup_tests {
         let (message, fix) = name_mismatch_details("codex", &status).unwrap();
         assert_eq!(message, "Setup for agent 'other' is in progress.");
         assert!(fix.ends_with(" setup --name other --profile dev --wait"));
+    }
+
+    #[test]
+    fn setup_vault_guidance_selects_unlock_step() {
+        assert!(setup_vault_guidance(0).is_none());
+
+        let (message, next) = setup_vault_guidance(1).unwrap();
+        assert_eq!(message, "The vault is locked.");
+        assert!(next.ends_with(" unlock"));
+
+        let (message, next) = setup_vault_guidance(2).unwrap();
+        assert_eq!(
+            message,
+            "The vault is locked. Pick the vault to use: sc vault ls, then sc unlock --vault <name>."
+        );
+        assert!(next.ends_with(" vault ls"));
     }
 }
 

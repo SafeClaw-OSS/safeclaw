@@ -747,12 +747,25 @@ fn stop_detached() -> Result<(), String> {
         return Ok(());
     };
     if crate::cli::human_action::pid_is_live(pid) {
-        let status = ProcCommand::new("kill")
-            .arg(pid.to_string())
-            .status()
-            .map_err(|e| format!("stop detached daemon {}: {}", pid, e))?;
-        if !status.success() {
-            return Err(format!("could not stop detached daemon {}", pid));
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            const SIGTERM: i32 = 15;
+            let result = unsafe { kill(pid as i32, SIGTERM) };
+            if result != 0 {
+                return Err(format!(
+                    "stop detached daemon {}: {}",
+                    pid,
+                    std::io::Error::last_os_error()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        #[cfg(not(unix))]
+        {
+            return Err("stopping a detached daemon is unsupported on this platform".into());
         }
     }
     let _ = fs::remove_file(path);

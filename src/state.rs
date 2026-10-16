@@ -885,6 +885,12 @@ impl AppState {
         !matches!(states.get(vault_id), Some(VaultState::Unlocked { .. }))
     }
 
+    /// True when at least one vault is currently unlocked.
+    pub fn has_unlocked_vault(&self) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        states.values().any(|state| matches!(state, VaultState::Unlocked { .. }))
+    }
+
     /// Transition a vault to Unlocked with the given bootstrap cache and the
     /// retained state key `K`. Overwrites any prior state (a fresh unlock
     /// invalidates the previous cache + key).

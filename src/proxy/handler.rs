@@ -382,6 +382,9 @@ impl BrokerHandler {
                     )
                     .into();
                 }
+                Err(AgentRefusal::Locked) => {
+                    return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG).into();
+                }
                 Err(AgentRefusal::NotAuthorized) => {
                     // Deep-link straight to THIS vault's Agent access page so the
                     // agent can relay a one-click fix (path matches the console's

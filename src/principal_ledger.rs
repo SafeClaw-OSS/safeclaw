@@ -662,6 +662,9 @@ pub enum AgentRefusal {
     /// Admitted to the account, but not turned on for this vault (or for any
     /// vault, on an account-scoped read).
     NotAuthorized,
+    /// The target vault is locked, or no vault is unlocked for an
+    /// account-scoped read.
+    Locked,
 }
 
 /// The one agent admission rule (W3), shared by the proxy and the API face: this
@@ -679,6 +682,13 @@ pub async fn authorize_agent(
     let ag = agent.ok_or(AgentRefusal::NoIdentity)?;
     if agent_not_admitted(state, ag).await {
         return Err(AgentRefusal::NotAdmitted);
+    }
+    let locked = match vault {
+        Some(v) => state.is_vault_locked(v),
+        None => !state.has_unlocked_vault(),
+    };
+    if locked {
+        return Err(AgentRefusal::Locked);
     }
     let listed = match vault {
         Some(v) => state.agent_is_authorized(v, ag),
@@ -707,6 +717,32 @@ mod tests {
 
     fn owner() -> SigningIdentity {
         SigningIdentity::from_seed(&OWNER_SEED)
+    }
+
+    #[tokio::test]
+    async fn locked_named_vault_returns_locked_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = Arc::new(AppState::new(cfg));
+        state.open_ledger_for_tests(&["ag_locked"]);
+
+        let refusal = authorize_agent(&state, Some("ag_locked"), Some("vault_locked"))
+            .await
+            .unwrap_err();
+        assert!(matches!(refusal, AgentRefusal::Locked));
     }
 
     fn ev(o: &SigningIdentity, op: &str, principal: &str, seq: u64, sc_pk: &[u8]) -> PrincipalEventJson {

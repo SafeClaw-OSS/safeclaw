@@ -33,7 +33,9 @@ next command. The agent repeats this loop until setup reports `done`:
   tells the person to open the `/pair` address and type the code shown, or open
   a link and approve with a passkey.
 - `waiting`: run the same `next_step` again.
-- `done`: continue to the next section.
+- `done`: if it has a `next_step`, run it. After the machine and agent are
+  approved, this is `sc unlock`, which prints an unlock link and the `sc op wait`
+  command. Continue to the next section after approval.
 - `error`: run `fix`, then continue the loop.
 
 In the browser, the person signs in or creates an account the first time,
@@ -66,10 +68,11 @@ Prompts for the value, asks for one passkey approval, and mints the phantom
 `__sc__hf_token__` anchored to `huggingface.co`. Entered this way the value
 never leaves your machine.
 
-## 4. First use
+## 4. Unlock the vault
 
-If the vault is locked, run `sc unlock`; it prints an unlock link and the
-`sc op wait` command, like an approval.
+After approving the machine and the agent, run `sc unlock`. It prints an unlock
+link for the person and the `sc op wait` command. For several vaults, run
+`sc vault ls`, choose one, then run `sc unlock --vault <name>`.
 
 ## 5. First brokered call
 
