@@ -1026,7 +1026,9 @@ impl AppState {
     /// True iff this vault is currently Locked (including "never unlocked
     /// since process boot").
     pub fn is_vault_locked(&self, vault_id: &str) -> bool {
-        let Ok(runtime) = self.runtime(vault_id) else {
+        // A read: a vault with no runtime (never unlocked here, or closed) is
+        // locked, and asking must not create one.
+        let Some(runtime) = self.runtime_if_present(vault_id) else {
             return true;
         };
         let state = runtime.state.lock().unwrap();

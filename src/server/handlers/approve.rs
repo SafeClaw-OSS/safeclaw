@@ -1237,23 +1237,21 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
-                // The general read seam can return a partial per-item view so
-                // existing rows remain usable. Unlock is stricter: the new key
-                // must open every current row before this flag is cleared.
+                // The read seam's view may be partial: a row this key can't open
+                // (or a body shape from a newer client) is skipped, never a reason
+                // to refuse the unlock. `complete` records whether every current
+                // row opened, which decides the key-changed note once K is held.
                 let has_per_item = state
                     .vaults
                     .per_item_path(&vault_id)
                     .ok()
                     .is_some_and(|p| p.exists());
+                let mut complete = !has_per_item;
                 if has_per_item {
-                    view = crate::sync::fold_with_key(&state, &vault_id, &unlock_key)
-                        .ok_or_else(|| {
-                            AppError::Unauthorized(
-                                "the approved key does not open the vault's current rows".into(),
-                            )
-                        })?;
-                } else {
-                    state.clear_vault_key_changed(&vault_id);
+                    if let Some(v) = crate::sync::fold_with_key(&state, &vault_id, &unlock_key) {
+                        view = v;
+                        complete = true;
+                    }
                 }
                 // Before the vault serves: every held row is offered again under
                 // the key, then the cloud is pulled. A failed pull keeps
@@ -1261,8 +1259,12 @@ pub async fn approve_op(
                 let (adopted, pull_error) =
                     crate::sync::catch_up_at_unlock(&state, &vault_id, &unlock_key).await;
                 if adopted {
-                    if let Some(v) = crate::sync::fold_with_key(&state, &vault_id, &unlock_key) {
-                        view = v;
+                    match crate::sync::fold_with_key(&state, &vault_id, &unlock_key) {
+                        Some(v) => {
+                            view = v;
+                            complete = true;
+                        }
+                        None => complete = false,
                     }
                 }
                 // vault-unlock is a pure STATE TRANSITION: it uses the grant's
@@ -1289,6 +1291,13 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache, unlock_key);
+                // Settled only now that the new K is held: a watcher refresh that
+                // ran on the old K during the catch-up may have marked it again.
+                if complete {
+                    state.clear_vault_key_changed(&vault_id);
+                } else {
+                    state.mark_vault_key_changed(&vault_id);
+                }
                 match pull_error {
                     Some(e) => {
                         crate::sync::retry_pull_after_unlock(state.clone(), vault_id.clone(), e)
