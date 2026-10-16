@@ -305,12 +305,15 @@ async fn status_now(
                 emit_action(json_output, context, &status);
                 Ok(Progress::Emitted)
             } else {
-                emit_waiting(json_output, &next_command(context));
+                emit_waiting(
+                    json_output,
+                    &next_command(context, effective_profile(context, &status)),
+                );
                 Ok(Progress::Emitted)
             }
         }
         _ => {
-            emit_waiting(json_output, &next_command(context));
+            emit_waiting(json_output, &next_command(context, context.profile.as_deref()));
             Ok(Progress::Emitted)
         }
     }
@@ -327,11 +330,13 @@ async fn wait_for_existing(
         .unwrap_or(90);
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let status_path = context.setup_dir.join("status.json");
+    let mut profile = context.profile.clone();
     loop {
         if let Ok(status) = human_action::read(&status_path) {
             if let Some(result) = name_mismatch(context, &status, json_output) {
                 return result;
             }
+            profile = context.profile.clone().or(status.profile.clone());
             if status.state == "approved" {
                 finish_approved(context, pid).await;
                 return Ok(Progress::Continue);
@@ -344,7 +349,7 @@ async fn wait_for_existing(
             return consume_dead_status(context, &status_path, json_output);
         }
         if Instant::now() >= deadline {
-            emit_waiting(json_output, &next_command(context));
+            emit_waiting(json_output, &next_command(context, profile.as_deref()));
             return Ok(Progress::Emitted);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -379,6 +384,7 @@ fn failed_status(
     status: SetupStatus,
     json_output: bool,
 ) -> Result<Progress, i32> {
+    let profile = context.profile.clone().or(status.profile.clone());
     let message = status
         .message
         .unwrap_or_else(|| "The setup background process failed.".to_string());
@@ -394,7 +400,11 @@ fn failed_status(
     };
     let _ = fs::remove_file(context.setup_dir.join("status.json"));
     let _ = fs::remove_file(context.setup_dir.join("lock"));
-    emit_error(json_output, &message, &base_command(context));
+    emit_error(
+        json_output,
+        &message,
+        &setup_command(&context.name, profile.as_deref()),
+    );
     Err(code)
 }
 
@@ -444,7 +454,7 @@ async fn spawn_and_report(
             return consume_dead_status(context, &status_path, json_output);
         }
         if Instant::now() >= deadline {
-            emit_waiting(json_output, &next_command(context));
+            emit_waiting(json_output, &next_command(context, context.profile.as_deref()));
             return Ok(Progress::Emitted);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -660,8 +670,12 @@ fn name_mismatch_details(current_name: &str, status: &SetupStatus) -> Option<(St
     }
 }
 
-fn next_command(context: &Context) -> String {
-    setup_wait_command(&context.name, context.profile.as_deref())
+fn effective_profile<'a>(context: &'a Context, status: &'a SetupStatus) -> Option<&'a str> {
+    context.profile.as_deref().or(status.profile.as_deref())
+}
+
+fn next_command(context: &Context, profile: Option<&str>) -> String {
+    setup_wait_command(&context.name, profile)
 }
 
 fn setup_wait_command(name: &str, profile: Option<&str>) -> String {
@@ -765,9 +779,9 @@ fn emit_action(json_output: bool, context: &Context, status: &SetupStatus) {
         pairing_say(&subject, url, code, expires_in)
     };
     let next = if status.name.is_empty() {
-        next_command(context)
+        next_command(context, effective_profile(context, status))
     } else {
-        setup_wait_command(&status.name, status.profile.as_deref())
+        setup_wait_command(&status.name, effective_profile(context, status))
     };
     if json_output {
         let mut object = Map::new();
@@ -806,7 +820,7 @@ fn pairing_say(subject: &str, url: &str, code: &str, expires_in: Option<u64>) ->
         None => "The code expires soon.".to_string(),
     };
     format!(
-        "Ask the user to open {} and enter the code {} to approve {}. {}",
+        "Ask the user to open {} and enter the code {} to pair {}. {}",
         url, code, subject, expiry
     )
 }
@@ -935,6 +949,26 @@ mod setup_tests {
     }
 
     #[test]
+    fn rerun_inherits_stored_profile_only_without_explicit_profile() {
+        let context = Context {
+            name: "codex".into(),
+            profile: None,
+            setup_dir: PathBuf::from("/tmp/setup"),
+        };
+        let status = SetupStatus::new("agent", "needs_user", 42, "codex", Some("dev".into()));
+        assert_eq!(effective_profile(&context, &status), Some("dev"));
+
+        let explicit = Context {
+            name: "codex".into(),
+            profile: Some("prod".into()),
+            setup_dir: PathBuf::from("/tmp/setup"),
+        };
+        assert_eq!(effective_profile(&explicit, &status), Some("prod"));
+        assert!(next_command(&context, effective_profile(&context, &status))
+            .ends_with(" setup --name codex --profile dev --wait"));
+    }
+
+    #[test]
     fn setup_vault_guidance_selects_unlock_step() {
         assert!(setup_vault_guidance(0).is_none());
 
@@ -980,7 +1014,7 @@ mod tests {
                 "1234-5678-9012",
                 Some(601),
             ),
-            "Ask the user to open https://safeclaw.pro/pair and enter the code 1234-5678-9012 to approve this machine (box). The code expires in about 11 minutes."
+            "Ask the user to open https://safeclaw.pro/pair and enter the code 1234-5678-9012 to pair this machine (box). The code expires in about 11 minutes."
         );
         assert_eq!(
             pairing_say(
@@ -989,7 +1023,7 @@ mod tests {
                 "1234-5678-9012",
                 None,
             ),
-            "Ask the user to open https://safeclaw.pro/pair and enter the code 1234-5678-9012 to approve this agent (claude-code). The code expires soon."
+            "Ask the user to open https://safeclaw.pro/pair and enter the code 1234-5678-9012 to pair this agent (claude-code). The code expires soon."
         );
     }
 }

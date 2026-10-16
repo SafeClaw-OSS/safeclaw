@@ -75,6 +75,7 @@ curl -s -o /dev/null --connect-timeout 1 "${SAFECLAW_BROKER_URL:-http://127.0.0.
 - `sc registry` is the catalog of supported services.
 - The user adds connections, with their credentials, on the console's Connections
   page (`<console_url>/connections`); a new one then appears in `sc connection ls`.
+  For an API that is not in the catalog, add #custom to that link; it opens the custom connection form.
   Keep any credential value you see out of your replies.
 - `sc secret ls` lists the names of secrets already in the vault. One can back a
   connection you propose with `sc connection add ... --from-secret`, so no value
