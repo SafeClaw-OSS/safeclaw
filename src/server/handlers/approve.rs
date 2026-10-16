@@ -27,16 +27,14 @@ use crate::approval::ApprovalStatus;
 use crate::audit::{STATUS_APPROVED, STATUS_REJECTED};
 use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
-use crate::protocol::operation::{
-    as_export_path, decode_credential_id, discriminator, ActType,
-};
 use crate::protocol::grant::{delivery_form, DeliveredVaultKey, DeliveryForm};
+use crate::protocol::operation::{as_export_path, decode_credential_id, discriminator, ActType};
 use crate::protocol::{render_operation, validate_batch_grant, validate_grant, Grant};
 use crate::state::{AppState, ApprovalEvent, SecretsCache};
 use crate::storage::plaintext::{Category, VaultPlaintextView};
 use crate::storage::sealed_vault::{
-    find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item,
-    write_atomic, ApprovalAuthority, PerItemVault,
+    find_pubkey, find_pubkey_in_registry, read as read_vault, read_per_item, write_atomic,
+    ApprovalAuthority, PerItemVault,
 };
 use std::collections::BTreeSet;
 
@@ -258,7 +256,7 @@ fn export_precheck(op: &crate::protocol::operation::Operation) -> Result<&str> {
     // no path can dump the whole vault's plaintext through one op.
     if path == "env" || path.is_empty() {
         return Err(AppError::BadRequest(
-            "reveal-all export is retired — export a specific secret by name".into(),
+            "reveal-all export is retired. Export a specific secret by name".into(),
         ));
     }
     Ok(path)
@@ -691,8 +689,14 @@ fn verify_grant_identity(
         .and_then(|v| <[u8; 64]>::try_from(v.as_slice()).ok())
         .ok_or_else(|| invalid("the approval carries no valid identity signature"))?;
     let (Some(k_enc), Some(k_ct)) = (
-        grant.k_enc.as_deref().and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()),
-        grant.k_ct.as_deref().and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()),
+        grant
+            .k_enc
+            .as_deref()
+            .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()),
+        grant
+            .k_ct
+            .as_deref()
+            .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok()),
     ) else {
         return Err(AppError::BadRequest(
             "a sealed grant needs both k_enc and k_ct (base64url)".into(),
@@ -708,9 +712,8 @@ fn verify_grant_identity(
         &serde_json::to_value(stored_op)?,
     )?;
     let sc_pk = state.sc.pk_bytes();
-    let input = crate::identity::grant_id_input(
-        vault_id, op_id, &beta, &cid, &k_enc, &k_ct, &sc_pk, id,
-    );
+    let input =
+        crate::identity::grant_id_input(vault_id, op_id, &beta, &cid, &k_enc, &k_ct, &sc_pk, id);
     let certifies =
         |pk: &[u8; 32]| crate::identity::derive_id(crate::identity::IdKind::User, pk) == id;
     let sig_pub = paired_account_pub()
@@ -800,7 +803,9 @@ fn open_grant_seal(
     let ct = URL_SAFE_NO_PAD
         .decode(ct_b64)
         .map_err(|_| AppError::BadRequest(format!("{name}_ct not base64url")))?;
-    Ok(zeroize::Zeroizing::new(state.sc.open(&enc, &ct, info, b"")?))
+    Ok(zeroize::Zeroizing::new(
+        state.sc.open(&enc, &ct, info, b"")?,
+    ))
 }
 
 /// Open the vault key a grant delivers (`k_*`, sealed to this daemon's `sc_pk`
@@ -919,15 +924,10 @@ pub async fn approve_op(
     // on-disk state and race to write_atomic — the second rename wins
     // silently. This per-vault async mutex ensures the full read-validate-
     // write cycle is atomic per vault without blocking unrelated vaults.
-    let vault_write_lock = {
-        let mut locks = state.vault_write_locks.lock().unwrap();
-        Arc::clone(
-            locks
-                .entry(vault_id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
-    };
-    let _vault_write_guard = vault_write_lock.lock().await;
+    let _vault_write_guard = state
+        .vault_write_guard(&vault_id)
+        .await
+        .map_err(|error| error.app_error())?;
 
     // 3a. Re-check UNDER the vault write lock (design/approvals-inbox.md D1,
     // atomic apply). One intent chain is always one vault (redeemer ==
@@ -1129,7 +1129,7 @@ pub async fn approve_op(
                 .ok_or_else(|| AppError::Conflict("vault not initialized".into()))?;
             if vault.credentials.len() <= 1 {
                 return Err(AppError::BadRequest(
-                    "cannot remove the last passkey — add another one first".into(),
+                    "cannot remove the last passkey. Add another one first".into(),
                 ));
             }
             let cid_bytes = decode_credential_id(cid_b64)?;
@@ -1237,14 +1237,34 @@ pub async fn approve_op(
                         &validated.credential_id_bytes,
                         existing_vault.as_ref(),
                     )?;
+                // The read seam's view may be partial: a row this key can't open
+                // (or a body shape from a newer client) is skipped, never a reason
+                // to refuse the unlock. `complete` records whether every current
+                // row opened, which decides the key-changed note once K is held.
+                let has_per_item = state
+                    .vaults
+                    .per_item_path(&vault_id)
+                    .ok()
+                    .is_some_and(|p| p.exists());
+                let mut complete = !has_per_item;
+                if has_per_item {
+                    if let Some(v) = crate::sync::fold_with_key(&state, &vault_id, &unlock_key) {
+                        view = v;
+                        complete = true;
+                    }
+                }
                 // Before the vault serves: every held row is offered again under
                 // the key, then the cloud is pulled. A failed pull keeps
                 // retrying in the background and is reported (`sc status`).
                 let (adopted, pull_error) =
                     crate::sync::catch_up_at_unlock(&state, &vault_id, &unlock_key).await;
                 if adopted {
-                    if let Some(v) = crate::sync::fold_with_key(&state, &vault_id, &unlock_key) {
-                        view = v;
+                    match crate::sync::fold_with_key(&state, &vault_id, &unlock_key) {
+                        Some(v) => {
+                            view = v;
+                            complete = true;
+                        }
+                        None => complete = false,
                     }
                 }
                 // vault-unlock is a pure STATE TRANSITION: it uses the grant's
@@ -1271,6 +1291,13 @@ pub async fn approve_op(
                     "vault unlocked"
                 );
                 state.unlock_vault(vault_id.clone(), cache, unlock_key);
+                // Settled only now that the new K is held: a watcher refresh that
+                // ran on the old K during the catch-up may have marked it again.
+                if complete {
+                    state.clear_vault_key_changed(&vault_id);
+                } else {
+                    state.mark_vault_key_changed(&vault_id);
+                }
                 match pull_error {
                     Some(e) => {
                         crate::sync::retry_pull_after_unlock(state.clone(), vault_id.clone(), e)
@@ -1340,25 +1367,14 @@ pub async fn approve_op(
                 if existing_vault.is_none() {
                     return Err(AppError::Conflict("vault not initialized".into()));
                 }
-                // Close the cached AuditStore SQLite handle BEFORE removing
-                // the directory. On Linux, unlinking a file that still has
-                // an open fd leaves the inode alive: any subsequent
-                // `state.audits.for_vault(vid)` call returns the cached
-                // Arc<AuditStore> and reads/writes against the now-orphan
-                // inode. Recreating the same vault_id (deterministic from
-                // user_id, so very common after delete) then sees the old
-                // approvals "from 50 minutes ago" instead of an empty log.
-                // Matches the admin DELETE path's ordering (admin.rs).
-                state.audits.forget(&vault_id);
+                drop(_vault_write_guard);
                 state
-                    .vaults
-                    .remove(&vault_id)
-                    .map_err(|e| AppError::Internal(format!("vault dir remove: {}", e)))?;
-                {
-                    let mut states = state.vault_states.lock().unwrap();
-                    states.remove(&vault_id);
-                }
-                state.last_host_unions.lock().unwrap().remove(&vault_id);
+                    .close_vault(
+                        &vault_id,
+                        crate::vault_runtime::TombstoneReason::Deleted,
+                        true,
+                    )
+                    .await;
                 tracing::info!(vault = %vault_id, "vault deleted");
                 (json!({ "ok": true, "act": "vault-delete" }), None)
             }
@@ -1569,7 +1585,9 @@ pub async fn approve_op(
                     }
                 }
                 if removed {
-                    crate::auth::connect::persist_mutated_view(&state, &vault_id, &base, &view, &k)?;
+                    crate::auth::connect::persist_mutated_view(
+                        &state, &vault_id, &base, &view, &k,
+                    )?;
                     {
                         let state = state.clone();
                         let vid = vault_id.clone();
@@ -1704,7 +1722,7 @@ pub async fn approve_op(
                     // misleading "not found".
                     if view.resolve_value_async(&key).await?.is_some() {
                         return Err(AppError::BadRequest(format!(
-                            "key '{}' is hosted by an external store — SafeClaw reads it pass-through and cannot delete it; remove it in the provider's console",
+                            "key '{}' is hosted by an external store. SafeClaw reads it pass-through and cannot delete it; remove it in the provider's console",
                             key
                         )));
                     }
@@ -1870,7 +1888,7 @@ pub async fn approve_op(
                 let values = match scope.get("values_digest").and_then(|v| v.as_str()) {
                     Some(d) => Some(state.op_payload_take(d).ok_or_else(|| {
                         AppError::BadRequest(
-                            "deposited values not found or expired — re-run the command".into(),
+                            "deposited values not found or expired. Re-run the command".into(),
                         )
                     })?),
                     None => None,
@@ -1908,12 +1926,11 @@ pub async fn approve_op(
                 // The service def, resolved as mint and the proxy resolve it:
                 // the vault's valid custom defs (never shadowing a built-in
                 // id), else the compiled registry.
-                let (custom_defs, _) =
-                    crate::service::vault_custom_services(
-            &view.aux.services,
-            view.aux.allows_installed_services(),
-            &state.services,
-        );
+                let (custom_defs, _) = crate::service::vault_custom_services(
+                    &view.aux.services,
+                    view.aux.allows_installed_services(),
+                    &state.services,
+                );
                 let def: Option<crate::service::ServiceDef> = match &service {
                     None => None,
                     Some(svc) => Some(
@@ -2072,7 +2089,7 @@ pub async fn approve_op(
                     })?;
                 let mut values = state.op_payload_take(digest).ok_or_else(|| {
                     AppError::BadRequest(
-                        "deposited value not found or expired — re-run the command".into(),
+                        "deposited value not found or expired. Re-run the command".into(),
                     )
                 })?;
                 let value = values.remove(&key).ok_or_else(|| {
@@ -2174,7 +2191,7 @@ pub async fn approve_op(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if let Ok(store) = state.audits.for_vault(&rec_vault_id) {
+    if let Ok(store) = state.audit_for_vault(&rec_vault_id) {
         if let Err(e) = store.finalize(
             &op_id,
             STATUS_APPROVED,
@@ -2495,7 +2512,7 @@ pub(crate) fn finish_chain_siblings(
                 crate::relay::client::CancelReason::Rejected,
             ),
         };
-        if let Ok(store) = state.audits.for_vault(&sib.vault_id) {
+        if let Ok(store) = state.audit_for_vault(&sib.vault_id) {
             if let Err(e) = store.finalize(
                 &sib.id,
                 crate::audit::STATUS_CANCELLED,
@@ -2560,7 +2577,7 @@ pub async fn reject_op(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if let Ok(store) = state.audits.for_vault(&rec_vault_id) {
+    if let Ok(store) = state.audit_for_vault(&rec_vault_id) {
         if let Err(e) = store.finalize(
             &op_id,
             STATUS_REJECTED,
@@ -2875,12 +2892,11 @@ pub(crate) fn bootstrap_cache_from_view(
     // Custom (per-vault `aux.services`) definitions: validate before they can
     // broker (defense in depth — never trust the stored blob), never shadow a
     // built-in id, load only if valid. Wiped on lock with the rest of the cache.
-    let (custom, skipped) =
-        crate::service::vault_custom_services(
-            &view.aux.services,
-            view.aux.allows_installed_services(),
-            &state.services,
-        );
+    let (custom, skipped) = crate::service::vault_custom_services(
+        &view.aux.services,
+        view.aux.allows_installed_services(),
+        &state.services,
+    );
     for (service_id, reason) in skipped {
         tracing::warn!(service = %service_id, "custom service {} — skipped", reason);
     }
@@ -2946,8 +2962,11 @@ pub(crate) async fn lazy_fill_external(
     let _fill = state.external_fill_lock.lock().await;
 
     let (policy, rec, adapters) = {
-        let states = state.vault_states.lock().unwrap();
-        let Some(crate::state::VaultState::Unlocked { cache, .. }) = states.get(vault_id) else {
+        let Some(runtime) = state.runtime_if_present(vault_id) else {
+            return Ok(false);
+        };
+        let runtime_state = runtime.state.lock().unwrap();
+        let crate::state::VaultState::Unlocked { cache, .. } = &*runtime_state else {
             return Ok(false);
         };
         if cache.entries.contains_key(conn) || cache.allow_secrets.contains_key(conn) {
@@ -3060,8 +3079,10 @@ pub(crate) async fn lazy_fill_external(
         return Ok(false);
     }
     {
-        let mut states = state.vault_states.lock().unwrap();
-        let Some(crate::state::VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id)
+        let Some(runtime) = state.runtime_if_present(vault_id) else {
+            return Ok(false);
+        };
+        let crate::state::VaultState::Unlocked { cache, .. } = &mut *runtime.state.lock().unwrap()
         else {
             return Ok(false); // locked while we were fetching — drop the bytes
         };
@@ -3196,7 +3217,8 @@ mod tests {
         )
         .unwrap();
         pv.seed_items_from_view::<S>(keys, vid, &view).unwrap();
-        let rule = wire_id_for::<S>(&k, ItemNs::Policy, &format!("{}gh", POLICY_CONNECTION)).unwrap();
+        let rule =
+            wire_id_for::<S>(&k, ItemNs::Policy, &format!("{}gh", POLICY_CONNECTION)).unwrap();
         assert!(pv.items.contains_key(&rule), "the rule is its own record");
 
         // A keyset: the rule stays in the view (and the device writes no
@@ -3204,7 +3226,13 @@ mod tests {
         let mut kept = pv.fold_view::<S>(keys, vid).unwrap();
         apply_connection_rm_to_view(&mut kept, "gh", true, true, &reg).unwrap();
         assert!(!kept.aux.connections.contains_key("gh"));
-        assert!(kept.aux.policy.as_ref().unwrap().connections.contains_key("gh"));
+        assert!(kept
+            .aux
+            .policy
+            .as_ref()
+            .unwrap()
+            .connections
+            .contains_key("gh"));
 
         // No keyset: the rule goes with the connection, as a tombstone.
         let mut gone = pv.fold_view::<S>(keys, vid).unwrap();
@@ -3216,7 +3244,11 @@ mod tests {
         assert!(r.changed.contains(&rule), "{:?}", r.changed);
         assert!(pv.items[&rule].tombstone);
         let after = pv.fold_view::<S>(keys, vid).unwrap();
-        assert!(!after.aux.policy.as_ref().is_some_and(|p| p.connections.contains_key("gh")));
+        assert!(!after
+            .aux
+            .policy
+            .as_ref()
+            .is_some_and(|p| p.connections.contains_key("gh")));
 
         // A later connection of the same id starts without it.
         let base = ViewBase::of(&after).unwrap();
@@ -3226,7 +3258,11 @@ mod tests {
             .unwrap();
         let now = pv.fold_view::<S>(keys, vid).unwrap();
         assert!(now.aux.connections.contains_key("gh"));
-        assert!(!now.aux.policy.as_ref().is_some_and(|p| p.connections.contains_key("gh")));
+        assert!(!now
+            .aux
+            .policy
+            .as_ref()
+            .is_some_and(|p| p.connections.contains_key("gh")));
     }
 
     // The shared secret-set mutation is the SSOT for BOTH write paths (grant
@@ -4295,9 +4331,10 @@ mod tests {
     }
 
     fn held_expiry(state: &AppState) -> Option<u64> {
-        let states = state.vault_states.lock().unwrap();
-        match states.get(RV) {
-            Some(crate::state::VaultState::Unlocked { cache, .. }) => {
+        let runtime = state.runtime_if_present(RV)?;
+        let runtime_state = runtime.state.lock().unwrap();
+        match &*runtime_state {
+            crate::state::VaultState::Unlocked { cache, .. } => {
                 cache.entries.get(RC).and_then(|e| e.expires_at)
             }
             _ => None,
@@ -4305,9 +4342,12 @@ mod tests {
     }
 
     fn ledger_len(state: &AppState) -> usize {
-        let states = state.vault_states.lock().unwrap();
-        match states.get(RV) {
-            Some(crate::state::VaultState::Unlocked { cache, .. }) => cache.ask_grants.len(),
+        let Some(runtime) = state.runtime_if_present(RV) else {
+            return 0;
+        };
+        let runtime_state = runtime.state.lock().unwrap();
+        match &*runtime_state {
+            crate::state::VaultState::Unlocked { cache, .. } => cache.ask_grants.len(),
             _ => 0,
         }
     }
@@ -4323,10 +4363,11 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let digest = crate::service::scope_digest(&pairs);
-        let states = state.vault_states.lock().unwrap();
-        match states.get(RV) {
+        let runtime = state.runtime_if_present(RV)?;
+        let runtime_state = runtime.state.lock().unwrap();
+        match &*runtime_state {
             // Whatever tier minted it: the request line + digest identify it.
-            Some(crate::state::VaultState::Unlocked { cache, .. }) => cache
+            crate::state::VaultState::Unlocked { cache, .. } => cache
                 .op_grants
                 .iter()
                 .find(|(k, _)| {
@@ -4976,9 +5017,10 @@ mod tests {
 
     fn grants_present(state: &AppState, agent: &str) -> (bool, bool) {
         let ledger = {
-            let states = state.vault_states.lock().unwrap();
-            match states.get("v1") {
-                Some(crate::state::VaultState::Unlocked { cache, .. }) => cache
+            let runtime = state.runtime_if_present("v1").unwrap();
+            let runtime_state = runtime.state.lock().unwrap();
+            match &*runtime_state {
+                crate::state::VaultState::Unlocked { cache, .. } => cache
                     .ask_grants
                     .keys()
                     .any(|(a, c, _, _)| a == agent && c == "github"),
@@ -5196,12 +5238,20 @@ mod tests {
         let c = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let (ax, ay) = xy(&admin);
         let (cx, cy) = xy(&c);
-        pv.set_approver_credential(ADMIN_CID, &admin_id, &ax, &ay).unwrap();
+        pv.set_approver_credential(ADMIN_CID, &admin_id, &ax, &ay)
+            .unwrap();
         pv.set_approver_credential(C_CID, &c_id, &cx, &cy).unwrap();
         let keys = VaultKeys::single(&VAULT_K);
         for (name, value) in [("FOO", "foo-value"), ("BAR", "bar-value")] {
-            pv.plant::<S>(keys, vault, ItemNs::Secret, name, 1, &ItemPayload::secret_live(name, value))
-                .unwrap();
+            pv.plant::<S>(
+                keys,
+                vault,
+                ItemNs::Secret,
+                name,
+                1,
+                &ItemPayload::secret_live(name, value),
+            )
+            .unwrap();
         }
         let path = state.vaults.per_item_path(vault).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -5243,12 +5293,11 @@ mod tests {
                 .unwrap()
                 .issue("127.0.0.1".parse().unwrap())
                 .unwrap();
-            let id = self
-                .state
-                .approvals
-                .lock()
-                .unwrap()
-                .create(self.vault.into(), op.clone(), r.clone());
+            let id = self.state.approvals.lock().unwrap().create(
+                self.vault.into(),
+                op.clone(),
+                r.clone(),
+            );
             self.ids.borrow_mut().insert(r.clone(), id.clone());
             (op, r, id)
         }
@@ -5280,8 +5329,10 @@ mod tests {
             let mut g = plain_grant(op.clone(), r);
             g.credential_id = cid.into();
             g.assertion = Some(assertion_over(key, &beta));
-            let (enc, ct) =
-                self.seal(material, &crate::crypto::envelope::grant_k_seal_info(seal_for));
+            let (enc, ct) = self.seal(
+                material,
+                &crate::crypto::envelope::grant_k_seal_info(seal_for),
+            );
             g.k_enc = Some(enc);
             g.k_ct = Some(ct);
             self.sign_id(g)
@@ -5344,7 +5395,10 @@ mod tests {
             assert!(matches!(rec.status, ApprovalStatus::Pending));
             assert_eq!(rec.fail_count, 0);
             drop(store);
-            assert!(self.state.challenges.lock().unwrap().peek(r), "challenge not consumed");
+            assert!(
+                self.state.challenges.lock().unwrap().peek(r),
+                "challenge not consumed"
+            );
         }
     }
 
@@ -5384,15 +5438,27 @@ mod tests {
         let d = b_daemon("-kadmin");
         let (op, r, id) = d.raise("FOO");
         let v = d
-            .approve(&id, d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id))
+            .approve(
+                &id,
+                d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id),
+            )
             .await
             .unwrap();
         assert_eq!(v["value"], "foo-value");
         assert!(matches!(
-            d.state.approvals.lock().unwrap().get_any(&id).unwrap().status,
+            d.state
+                .approvals
+                .lock()
+                .unwrap()
+                .get_any(&id)
+                .unwrap()
+                .status,
             ApprovalStatus::Approved
         ));
-        assert!(!d.state.challenges.lock().unwrap().peek(&r), "consumed once applied");
+        assert!(
+            !d.state.challenges.lock().unwrap().peek(&r),
+            "consumed once applied"
+        );
 
         let bundle = [VAULT_K, VAULT_K].concat();
         let (op, r, id) = d.raise("BAR");
@@ -5420,7 +5486,10 @@ mod tests {
         assert_eq!(err.code().0.status(), 403);
         d.assert_untouched(&id, &r);
         let v = d
-            .approve(&id, d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id))
+            .approve(
+                &id,
+                d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id),
+            )
             .await
             .unwrap();
         assert_eq!(v["value"], "foo-value");
@@ -5451,7 +5520,10 @@ mod tests {
         g.k_enc = Some("not base64url!".into());
         bad.push(("not base64url", g));
         let mut g = good();
-        let (enc, ct) = d.seal(&[0x42u8; 48], &crate::crypto::envelope::grant_k_seal_info(&id));
+        let (enc, ct) = d.seal(
+            &[0x42u8; 48],
+            &crate::crypto::envelope::grant_k_seal_info(&id),
+        );
         (g.k_enc, g.k_ct) = (Some(enc), Some(ct));
         bad.push(("48 bytes", d.sign_id(g)));
         for (why, grant) in bad {
@@ -5462,7 +5534,16 @@ mod tests {
         // A wrong vault key (well sealed) opens nothing: the apply fails, the
         // value never leaves.
         let err = d
-            .approve(&other_id, d.k_grant((&other_op, &other_r), ADMIN_CID, &d.admin, &[7u8; 32], &other_id))
+            .approve(
+                &other_id,
+                d.k_grant(
+                    (&other_op, &other_r),
+                    ADMIN_CID,
+                    &d.admin,
+                    &[7u8; 32],
+                    &other_id,
+                ),
+            )
             .await;
         assert!(err.is_err(), "a wrong vault key applies nothing");
         let v = d.approve(&id, good()).await.unwrap();
@@ -5478,13 +5559,20 @@ mod tests {
         let (op, r, id) = d.raise("FOO");
         let good = || d.k_grant((&op, &r), ADMIN_CID, &d.admin, &VAULT_K, &id);
         let mut both = good();
-        let (enc, ct) = d.seal(&[0x11u8; 32], &crate::crypto::envelope::grant_seal_info(&id));
+        let (enc, ct) = d.seal(
+            &[0x11u8; 32],
+            &crate::crypto::envelope::grant_seal_info(&id),
+        );
         (both.wk_enc, both.wk_ct) = (Some(enc), Some(ct));
         let mut plain_and_k = good();
         plain_and_k.wrapping_key = Some(STANDARD.encode([0x11u8; 32]));
         let mut neither = good();
         (neither.k_enc, neither.k_ct) = (None, None);
-        for (why, grant) in [("wk_* and k_*", both), ("wrapping_key and k_*", plain_and_k), ("neither", neither)] {
+        for (why, grant) in [
+            ("wk_* and k_*", both),
+            ("wrapping_key and k_*", plain_and_k),
+            ("neither", neither),
+        ] {
             let err = d.approve(&id, grant).await.unwrap_err();
             assert!(matches!(err, AppError::BadRequest(_)), "{why}: {err}");
             d.assert_untouched(&id, &r);
@@ -5528,7 +5616,10 @@ mod tests {
         pv.set_registry_pubkey(ADMIN_CID, "x", "y", "").unwrap();
         let only = |id: &str| -> BTreeSet<String> { [id.to_string()].into() };
         assert_eq!(requester_identities(&pv, Some(b_id.clone())), only(&b_id));
-        assert_eq!(requester_identities(&pv, Some("us_other".into())), only("us_other"));
+        assert_eq!(
+            requester_identities(&pv, Some("us_other".into())),
+            only("us_other")
+        );
         // The approver label (as the membership serves it) takes the admin out
         // of the fallback too.
         pv.keyset
@@ -5540,7 +5631,11 @@ mod tests {
         assert_eq!(requester_identities(&pv, None), only(&b_id));
         // So the admin approving B's op is an admin, never "the requester".
         assert_eq!(
-            pv.approval_authority(vault, &requester_identities(&pv, Some(b_id.clone())), &admin_id),
+            pv.approval_authority(
+                vault,
+                &requester_identities(&pv, Some(b_id.clone())),
+                &admin_id
+            ),
             ApprovalAuthority::Admin
         );
     }
@@ -5569,8 +5664,10 @@ mod tests {
             let mut g = batch_grant(op.clone(), r, ids.clone());
             g.credential_id = ADMIN_CID.into();
             g.batch.as_mut().unwrap().assertion = assertion.clone();
-            let (enc, ct) =
-                d.seal(&VAULT_K, &crate::crypto::envelope::grant_k_seal_info(seal_for));
+            let (enc, ct) = d.seal(
+                &VAULT_K,
+                &crate::crypto::envelope::grant_k_seal_info(seal_for),
+            );
             (g.k_enc, g.k_ct) = (Some(enc), Some(ct));
             d.sign_id(g)
         };
@@ -5580,7 +5677,10 @@ mod tests {
 
         let v1 = d.approve(&id1, row(&op1, &r1, &id1)).await.unwrap();
         let v2 = d.approve(&id2, row(&op2, &r2, &id2)).await.unwrap();
-        assert_eq!((v1["value"].as_str(), v2["value"].as_str()), (Some("foo-value"), Some("bar-value")));
+        assert_eq!(
+            (v1["value"].as_str(), v2["value"].as_str()),
+            (Some("foo-value"), Some("bar-value"))
+        );
     }
 
     // ── grant v3: the vault key + the approver's identity signature ────────
@@ -5593,7 +5693,10 @@ mod tests {
         let d = b_daemon("-v3wk");
         let (op, r, id) = d.raise("FOO");
         let mut sealed = d.k_grant((&op, &r), "Yw", &d.c, &VAULT_K, &id);
-        let (enc, ct) = d.seal(&[0x22u8; 32], &crate::crypto::envelope::grant_seal_info(&id));
+        let (enc, ct) = d.seal(
+            &[0x22u8; 32],
+            &crate::crypto::envelope::grant_seal_info(&id),
+        );
         (sealed.k_enc, sealed.k_ct) = (None, None);
         (sealed.wk_enc, sealed.wk_ct) = (Some(enc), Some(ct));
         let mut plain = d.k_grant((&op, &r), "Yw", &d.c, &VAULT_K, &id);
@@ -5650,7 +5753,9 @@ mod tests {
         g.id_sig = None;
         bad.push(("no signature", g));
         let mut g = good();
-        let mut sig = URL_SAFE_NO_PAD.decode(g.id_sig.as_deref().unwrap()).unwrap();
+        let mut sig = URL_SAFE_NO_PAD
+            .decode(g.id_sig.as_deref().unwrap())
+            .unwrap();
         sig[0] ^= 1;
         g.id_sig = Some(URL_SAFE_NO_PAD.encode(sig));
         bad.push(("tampered", g));
@@ -5663,9 +5768,11 @@ mod tests {
         let (_o2, _r2, other) = d.raise("BAR");
         let mut g = good();
         let uik = UikRoot::from_root([0x11u8; 32]);
-        g.id_sig = Some(URL_SAFE_NO_PAD.encode(
-            uik.signing().sign(&d.id_input(&g, &other, &uik.user_id())),
-        ));
+        g.id_sig = Some(URL_SAFE_NO_PAD.encode(uik.signing().sign(&d.id_input(
+            &g,
+            &other,
+            &uik.user_id(),
+        ))));
         bad.push(("signed for another op", g));
         for (why, g) in bad {
             let err = d.approve(&id, g).await.unwrap_err();
@@ -5716,8 +5823,8 @@ mod tests {
         check_approval_authority(None, "v-personal", &signer).unwrap();
         // Another account pinned: the signer's key is unknown here.
         pin_account_key(UikRoot::from_root([0x66u8; 32]).signing().public_bytes());
-        let err = verify_grant_identity(&state, None, "v-personal", "op-1", &g, &op, &r)
-            .unwrap_err();
+        let err =
+            verify_grant_identity(&state, None, "v-personal", "op-1", &g, &op, &r).unwrap_err();
         assert!(matches!(err, AppError::GrantIdInvalid(_)), "{err}");
         pin_account(None);
     }

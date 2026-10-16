@@ -121,7 +121,7 @@ pub fn validate_raw_host(h: &str) -> Result<(), String> {
         Some(suffix) => {
             if !suffix.contains('.') {
                 return Err(format!(
-                    "host '{}' is too broad — a wildcard needs a domain like *.example.com",
+                    "host '{}' is too broad. A wildcard needs a domain like *.example.com",
                     h
                 ));
             }
@@ -131,7 +131,7 @@ pub fn validate_raw_host(h: &str) -> Result<(), String> {
     };
     if bare.contains('*') {
         return Err(format!(
-            "host '{}' — only a single leftmost '*.' wildcard is allowed",
+            "host '{}': only a single leftmost '*.' wildcard is allowed",
             h
         ));
     }

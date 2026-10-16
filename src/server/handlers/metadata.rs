@@ -58,6 +58,11 @@ pub async fn passkeys(
     Path(vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     validate_vault_id(&vault_id)?;
+    // A vault this device lost access to says why (removed, deleted, device revoked),
+    // not that it never existed.
+    if let Some(gone) = state.vault_gone_error(&vault_id) {
+        return Err(gone);
+    }
     // Per-item vault (vault.per-item.json) is the current keyset home; fall back
     // to the legacy vault.dat for vaults predating the per-item rework. This
     // handler used to read ONLY vault.dat, so a per-item-enrolled vault (keyset
@@ -218,6 +223,9 @@ pub async fn held(
 /// is unlocked, and who signed it (or that nobody did), as the row says.
 pub(crate) fn held_lines(state: &AppState, vault_id: &str) -> Vec<String> {
     let mut out = Vec::new();
+    if state.is_vault_key_changed(vault_id) {
+        out.push(crate::error::VAULT_KEY_CHANGED_STATUS_MSG.to_string());
+    }
     let pv = state
         .vaults
         .per_item_path(vault_id)
@@ -298,6 +306,7 @@ pub async fn sync_now(
             Json(json!({
                 "ok": true,
                 "pulled": out.pulled,
+                "vault_key_changed": state.is_vault_key_changed(&vault_id),
                 "connects": {
                     "completed": c.completed,
                     "failed": c.failed.iter()
@@ -586,6 +595,26 @@ pub fn decrypt_vault_view_peritem_with_key(
     vault.fold_view::<StdPrimitives>(VaultKeys::from_material(k), vault_id)
 }
 
+/// Retained-key fold for cache refresh and unlock confirmation. Unlike the
+/// ordinary item read, a partial view is not usable here because it would
+/// replace a complete older cache.
+pub(crate) fn decrypt_vault_view_peritem_complete_with_key(
+    k: &[u8],
+    vault: &crate::storage::sealed_vault::PerItemVault,
+    vault_id: &str,
+) -> Result<VaultPlaintextView> {
+    let (view, unreadable) = vault
+        .fold_view_counted::<StdPrimitives>(VaultKeys::from_material(k), vault_id)?;
+    if unreadable > 0 {
+        return Err(AppError::Unauthorized(format!(
+            "retained key could not open {} current item{}",
+            unreadable,
+            if unreadable == 1 { "" } else { "s" }
+        )));
+    }
+    Ok(view)
+}
+
 /// THE per-item read seam for the live grant paths (Export / Use / unlock).
 ///
 /// Prefer the per-item store: if `vaults/{vid}/vault.per-item.json` exists,
@@ -780,6 +809,30 @@ mod tests {
         // A signer id is shown bounded.
         let long = "x".repeat(500);
         assert!(held_line("config change", Some(&long), "r").len() < 200);
+    }
+
+    #[test]
+    fn held_lines_explain_a_changed_vault_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        });
+        state.mark_vault_key_changed("v1");
+        assert_eq!(
+            held_lines(&state, "v1").first().map(String::as_str),
+            Some(crate::error::VAULT_KEY_CHANGED_STATUS_MSG)
+        );
     }
 
     /// A held row is said as what it is: a data record's change or a config

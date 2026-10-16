@@ -42,7 +42,7 @@ pub const DEFAULT_BODY_CAP: u64 = 32 * 1024 * 1024;
     // NOT bare `version` (= CARGO_PKG_VERSION): rc builds must self-report
     // their release tag here too, same as `sc status` / the custom prints.
     version = crate::build_version(),
-    about = "SafeClaw — passkey-gated credential broker"
+    about = "SafeClaw: passkey-gated credential broker"
 )]
 pub struct Cli {
     /// Target vault for this invocation (any subcommand, any position): an id, a

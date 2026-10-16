@@ -93,7 +93,7 @@ pub fn register_pending_use(
         (c.id, c.expires_at_unix, c.supersedes)
     };
 
-    if let Ok(audit_store) = state.audits.for_vault(vault_id) {
+    if let Ok(audit_store) = state.audit_for_vault(vault_id) {
         let mut row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
         row.agent_prefix = agent_prefix.clone();
         if let Err(e) = audit_store.insert(&row) {
@@ -177,8 +177,10 @@ pub async fn resolve_auth_value(
     // invalid_grant and the connection false-flags needs-reauth. Serialize the
     // refresh + rotation write-back under the SAME per-vault write lock the
     // connect path uses, then re-check the cache (the winner may have filled it).
-    let write_lock = state.vault_write_lock(vault_id);
-    let _guard = write_lock.lock().await;
+    let _guard = state
+        .vault_write_guard(vault_id)
+        .await
+        .map_err(|error| error.app_error())?;
     if let Some(cached) = state.oauth_access_lookup(vault_id, &refresh_hash) {
         return Ok(cached);
     }
@@ -200,7 +202,7 @@ pub async fn resolve_auth_value(
                         // The stored key itself was refused — reconnect territory.
                         state.oauth_mark_reauth(vault_id, conn_id);
                         AppError::Unauthorized(format!(
-                            "snaplii api key rejected — reconnect {}",
+                            "snaplii api key rejected. Reconnect {}",
                             service_id
                         ))
                     } else {
@@ -262,7 +264,7 @@ pub async fn resolve_auth_value(
         if e.contains("invalid_grant") {
             state.oauth_mark_reauth(vault_id, conn_id);
             AppError::Unauthorized(format!(
-                "oauth2 refresh_token invalid — reconnect {}",
+                "oauth2 refresh_token invalid. Reconnect {}",
                 service_id
             ))
         } else if let Some(transport) = e.strip_prefix("oauth2 refresh request failed: ") {

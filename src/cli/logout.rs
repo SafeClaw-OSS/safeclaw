@@ -33,7 +33,7 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     if !args.keep_remote {
         match revoke_device_cloud(&cfg).await {
             Ok(Some(label)) => eprintln!("✓ revoked this device cloud-side ({label})"),
-            Ok(None) => eprintln!("  (no matching device found cloud-side — nothing to revoke)"),
+            Ok(None) => eprintln!("  (no matching device found cloud-side; nothing to revoke)"),
             Err(e) => eprintln!("  couldn't revoke cloud-side ({e}); continuing with local unpair"),
         }
     }
@@ -74,14 +74,14 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     save(&cleared)?;
 
     if was_paired {
-        eprintln!("Unpaired this machine — daemon stopped, local pairing cleared.");
+        eprintln!("Unpaired this machine: daemon stopped, local pairing cleared.");
     } else {
         eprintln!("Nothing was paired; cleared any stale local config.");
     }
     eprintln!();
     eprintln!("  Your agent's SAFECLAW_* env (BROKER_URL / AGENT_IDENTITY) may");
-    eprintln!("  still be persisted in its .env — it's stale now; remove it. Agents stay");
-    eprintln!("  valid account-wide (logout revokes only this DEVICE) — revoke unused ones");
+    eprintln!("  still be persisted in its .env. It's stale now; remove it. Agents stay");
+    eprintln!("  valid account-wide (logout revokes only this DEVICE). Revoke unused ones");
     eprintln!("  with `sc agent rm`. Re-pair with `sc login`.");
     Ok(())
 }

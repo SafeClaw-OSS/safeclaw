@@ -120,14 +120,30 @@ fn decode_b64_any(s: &str) -> Option<Vec<u8>> {
 
 /// GET the account ledger, authenticated by this device's DIK proof of
 /// possession ALONE (W4: no bearer, so a device whose key the backend dropped on
-/// revoke still receives its own revoke). Any failure is an `Err`, which the
-/// caller treats as hold (I3: a bare 401/403 is never acted on).
+/// revoke still receives its own revoke). The one actionable unsigned response
+/// is the backend's explicit `SC_DEVICE_UNKNOWN`: it parks this process without
+/// changing the persisted signed decision. Every other failure is held.
+#[derive(Debug)]
+enum FetchError {
+    DeviceUnknown,
+    Other(String),
+}
+
+fn is_device_unknown_response(status: reqwest::StatusCode, body: &[u8]) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+            .as_deref()
+            == Some("SC_DEVICE_UNKNOWN")
+}
+
 async fn fetch_ledger(
     client: &reqwest::Client,
     cloud: &str,
     anchor_uik: &str,
     signer: &DeviceRequestSigner,
-) -> Result<LedgerJson, String> {
+) -> Result<LedgerJson, FetchError> {
     // `uik` names the pinned account explicitly (the backend would otherwise
     // pick the account with the newest event naming this device).
     let url = format!(
@@ -135,16 +151,27 @@ async fn fetch_ledger(
         cloud.trim_end_matches('/'),
         urlencoding::encode(anchor_uik)
     );
-    let path = crate::device_auth::path_and_query(&url).ok_or("unparseable cloud URL")?;
+    let path = crate::device_auth::path_and_query(&url)
+        .ok_or_else(|| FetchError::Other("unparseable cloud URL".into()))?;
     let mut rb = client.get(&url);
     for (k, v) in signer.headers("GET", &path, crate::util::now_unix(), &[]) {
         rb = rb.header(k, v);
     }
-    let resp = rb.send().await.map_err(|e| format!("fetch: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+    let resp = rb
+        .send()
+        .await
+        .map_err(|e| FetchError::Other(format!("fetch: {}", e)))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.bytes().await.unwrap_or_default();
+        if is_device_unknown_response(status, &body) {
+            return Err(FetchError::DeviceUnknown);
+        }
+        return Err(FetchError::Other(format!("HTTP {}", status)));
     }
-    resp.json().await.map_err(|e| format!("parse: {}", e))
+    resp.json()
+        .await
+        .map_err(|e| FetchError::Other(format!("parse: {}", e)))
 }
 
 // ── Strict verify + fold ─────────────────────────────────────────────────────
@@ -214,16 +241,28 @@ fn verify_strict(ledger: &LedgerJson, anchor_uik: &str) -> Result<Folded, String
                 .filter(|v| v.len() == 32)
                 .ok_or_else(|| format!("event {} has an undecodable sc_pk", e.seq))?,
         };
-        let sig = decode_sig64(&e.sig).ok_or_else(|| format!("event {} signature undecodable", e.seq))?;
-        let input =
-            identity::principal_event_input(anchor_uik, &e.op, &e.principal_id, e.seq, &e.owner_id, &sc_pk);
+        let sig =
+            decode_sig64(&e.sig).ok_or_else(|| format!("event {} signature undecodable", e.seq))?;
+        let input = identity::principal_event_input(
+            anchor_uik,
+            &e.op,
+            &e.principal_id,
+            e.seq,
+            &e.owner_id,
+            &sc_pk,
+        );
         if !identity::verify(&anchor_pub, &input, &sig) {
             return Err(format!("event {} signature does not verify", e.seq));
         }
         folded.max_seq = e.seq;
-        folded
-            .latest
-            .insert(e.principal_id.clone(), Latest { admit, seq: e.seq, sc_pk });
+        folded.latest.insert(
+            e.principal_id.clone(),
+            Latest {
+                admit,
+                seq: e.seq,
+                sc_pk,
+            },
+        );
     }
     Ok(folded)
 }
@@ -379,6 +418,9 @@ pub enum DeviceGate {
     Open,
     /// Park: not admitted (or no anchor / no DIK). Refuse unlock and broker.
     NotAdmitted,
+    /// The backend completed the lookup and no account names this device.
+    /// Unsigned and process-local: park without deleting local data.
+    AccountMissing,
     /// Lock: the lease ran out. Refuse unlock until a fresh verified pull.
     Stale,
     /// A verified revoke of this device: wipe.
@@ -421,6 +463,9 @@ pub struct LedgerGate {
     pub device: DeviceGate,
     /// The account's admitted agents; `None` = no verified decision.
     pub agents: Option<HashSet<String>>,
+    /// Unix time of the signed ledger pull, or the explicit account-missing
+    /// check, that produced this standing.
+    pub checked_at: Option<u64>,
 }
 
 impl Default for LedgerGate {
@@ -429,6 +474,7 @@ impl Default for LedgerGate {
         Self {
             device: DeviceGate::NotAdmitted,
             agents: None,
+            checked_at: None,
         }
     }
 }
@@ -464,7 +510,8 @@ pub fn verify_pairing_admit(
         return Err("the pairing's admit binds another daemon key than this machine's".into());
     }
     let sig = decode_sig64(&e.sig).ok_or("the admit's signature is undecodable")?;
-    let input = identity::principal_event_input(&owner, "admit", principal_id, e.seq, &owner, sc_pk);
+    let input =
+        identity::principal_event_input(&owner, "admit", principal_id, e.seq, &owner, sc_pk);
     if !identity::verify(uik_pub, &input, &sig) {
         return Err("the pairing's admit signature does not verify".into());
     }
@@ -486,19 +533,21 @@ async fn self_wipe_and_logout(state: &Arc<AppState>) -> ! {
     );
     // 1. Lock + wipe every synced vault, in-process (zeroize retained K + remove the
     //    sealed blob), through the same locked drop the tombstone path uses.
-    let vaults: Vec<String> = crate::cli::active::known_vaults()
+    let mut vaults: std::collections::BTreeSet<String> = crate::cli::active::known_vaults()
         .into_iter()
         .map(|kv| kv.vault)
         .filter(|v| !v.is_empty())
         .collect();
+    vaults.extend(state.runtime_ids());
+    vaults.extend(state.vaults.list().unwrap_or_default());
     // F2: evict retained K from EVERY vault UP-FRONT (synchronous, in-memory) so the
     // serve window closes immediately — no in-flight request can be handed K for a
     // not-yet-dropped vault while the per-vault disk wipe below iterates.
     for vid in &vaults {
-        state.lock_vault(vid);
+        state.mark_vault_closing(vid, crate::vault_runtime::TombstoneReason::DeviceRevoked);
     }
     for vid in &vaults {
-        crate::sync::drop_local_vault_locked(state, vid).await;
+        crate::sync::revoke_vault_access_verified(state, vid).await;
     }
     // 2. Delete the device-key (this host's cloud credential): once gone, the bearer
     //    can never be matched again.
@@ -507,7 +556,10 @@ async fn self_wipe_and_logout(state: &Arc<AppState>) -> ! {
     }
     // 3. Clear the pairing from config + known-vaults (mirrors `sc logout`).
     if let Err(e) = crate::cli::active::clear_pairing() {
-        tracing::warn!("principal ledger: failed to clear pairing config on self-revoke: {}", e);
+        tracing::warn!(
+            "principal ledger: failed to clear pairing config on self-revoke: {}",
+            e
+        );
     }
     // 4. Stop serving. With K evicted, blobs wiped, and the pairing gone, the daemon
     //    must not keep running; process exit is the in-process equivalent of the CLI
@@ -541,9 +593,25 @@ fn context(state: &AppState) -> Option<Ctx> {
 }
 
 /// Publish a standing: not open evicts K from every vault (park / lock / wipe).
-fn publish(state: &AppState, device: DeviceGate, floor: &LedgerFloor) {
+fn publish(
+    state: &AppState,
+    device: DeviceGate,
+    floor: &LedgerFloor,
+    checked_at: Option<u64>,
+) {
     let agents = (device == DeviceGate::Open).then(|| floor.agents.iter().cloned().collect());
-    state.set_ledger(LedgerGate { device, agents });
+    state.set_ledger(LedgerGate {
+        device,
+        agents,
+        checked_at,
+    });
+}
+
+fn held_gate(current: DeviceGate, persisted: DeviceGate) -> DeviceGate {
+    match current {
+        DeviceGate::AccountMissing => current,
+        _ => persisted,
+    }
 }
 
 /// The standing at startup, from the persisted decision alone (no network): a
@@ -557,7 +625,12 @@ pub fn init_gate(state: &AppState) {
     if g != DeviceGate::Open {
         tracing::warn!(standing = ?g, "principal ledger: this device is not serving until a verified pull admits it");
     }
-    publish(state, g, &floor);
+    publish(
+        state,
+        g,
+        &floor,
+        (floor.fresh_at != 0).then_some(floor.fresh_at),
+    );
 }
 
 /// One pull → verify → decide → persist → publish, serialized by
@@ -567,17 +640,25 @@ async fn pull_now(state: &AppState, timeout: Duration) -> DeviceGate {
     let mut floor = load_floor(&state_dir);
     let now = crate::util::now_unix();
     let Some(ctx) = context(state) else {
-        publish(state, DeviceGate::NotAdmitted, &floor);
+        publish(state, DeviceGate::NotAdmitted, &floor, None);
         return DeviceGate::NotAdmitted;
     };
+    let current = state.ledger.lock().unwrap().clone();
     let before = floor.clone();
     floor.max_wall = floor.max_wall.max(now);
     let pulled = match crate::cli::egress_proxy::client(timeout) {
         Ok(client) => fetch_ledger(&client, &ctx.cloud, &ctx.anchor_uik, &ctx.signer).await,
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(FetchError::Other(e.to_string())),
     };
+    let mut accepted = false;
     match pulled {
-        Err(e) => tracing::debug!("principal ledger: fetch failed ({}); holding", e),
+        Err(FetchError::DeviceUnknown) => {
+            publish(state, DeviceGate::AccountMissing, &floor, Some(now));
+            return DeviceGate::AccountMissing;
+        }
+        Err(FetchError::Other(e)) => {
+            tracing::debug!("principal ledger: fetch failed ({}); holding", e)
+        }
         Ok(ledger) => match verify_strict(&ledger, &ctx.anchor_uik) {
             Err(why) => tracing::warn!(
                 code = "ledger_head_invalid",
@@ -585,8 +666,17 @@ async fn pull_now(state: &AppState, timeout: Duration) -> DeviceGate {
                 why
             ),
             Ok(folded) => {
-                match apply_pull(floor.clone(), &folded, ctx.signer.device_id(), &ctx.sc_pk, now) {
-                    Ok(f) => floor = f,
+                match apply_pull(
+                    floor.clone(),
+                    &folded,
+                    ctx.signer.device_id(),
+                    &ctx.sc_pk,
+                    now,
+                ) {
+                    Ok(f) => {
+                        floor = f;
+                        accepted = true;
+                    }
                     Err(why) => tracing::warn!("principal ledger: {}; holding", why),
                 }
             }
@@ -595,8 +685,21 @@ async fn pull_now(state: &AppState, timeout: Duration) -> DeviceGate {
     if floor != before {
         store_floor(&state_dir, &floor);
     }
-    let g = gate(&floor, now, true, true);
-    publish(state, g, &floor);
+    let persisted = gate(&floor, now, true, true);
+    let g = if accepted {
+        persisted
+    } else {
+        held_gate(current.device, persisted)
+    };
+    if g == DeviceGate::AccountMissing {
+        return g;
+    }
+    publish(
+        state,
+        g,
+        &floor,
+        (floor.fresh_at != 0).then_some(floor.fresh_at),
+    );
     g
 }
 
@@ -615,6 +718,10 @@ pub async fn principal_ledger_loop(state: Arc<AppState>) {
                 code = "device_not_admitted",
                 "principal ledger: this device is not admitted to the account; run `sc login`"
             ),
+            DeviceGate::AccountMissing => tracing::warn!(
+                code = "device_not_admitted",
+                "principal ledger: this device is no longer paired with a SafeClaw account; run `sc login`"
+            ),
             DeviceGate::Stale => tracing::warn!(
                 code = "ledger_stale",
                 "principal ledger: no verified pull for 7 days; vaults locked until one succeeds"
@@ -624,6 +731,7 @@ pub async fn principal_ledger_loop(state: Arc<AppState>) {
         tokio::select! {
             _ = tokio::time::sleep(INTERVAL) => {}
             _ = crate::sync_stream::agent_hashes_notified() => {}
+            _ = crate::sync_stream::device_auth_rejected_notified() => {}
         }
     }
 }
@@ -654,6 +762,8 @@ pub async fn agent_not_admitted(state: &Arc<AppState>, agent_id: &str) -> bool {
 pub enum AgentRefusal {
     /// This device itself may not serve (park / lock / revoked).
     Device(crate::error::AppError),
+    /// The vault runtime was closed with a durable in-process reason.
+    Gone(crate::error::AppError),
     /// No verified agent identity (no or invalid AIK proof): an api key alone is
     /// no longer an agent credential (W3).
     NoIdentity,
@@ -678,6 +788,9 @@ pub async fn authorize_agent(
 ) -> Result<String, AgentRefusal> {
     if let Some(e) = state.ledger_refusal() {
         return Err(AgentRefusal::Device(e));
+    }
+    if let Some(error) = vault.and_then(|v| state.vault_gone_error(v)) {
+        return Err(AgentRefusal::Gone(error));
     }
     let ag = agent.ok_or(AgentRefusal::NoIdentity)?;
     if agent_not_admitted(state, ag).await {
@@ -745,14 +858,51 @@ mod tests {
         assert!(matches!(refusal, AgentRefusal::Locked));
     }
 
-    fn ev(o: &SigningIdentity, op: &str, principal: &str, seq: u64, sc_pk: &[u8]) -> PrincipalEventJson {
+    #[tokio::test]
+    async fn revoked_named_vault_precedes_locked_and_agent_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = Arc::new(AppState::new(cfg));
+        state.open_ledger_for_tests(&[]);
+        state.mark_vault_closing("v", crate::vault_runtime::TombstoneReason::Removed);
+        assert!(matches!(
+            authorize_agent(&state, None, Some("v")).await,
+            Err(AgentRefusal::Gone(crate::error::AppError::VaultAccessRevoked))
+        ));
+    }
+
+    fn ev(
+        o: &SigningIdentity,
+        op: &str,
+        principal: &str,
+        seq: u64,
+        sc_pk: &[u8],
+    ) -> PrincipalEventJson {
         let acct = o.user_id();
         let input = identity::principal_event_input(&acct, op, principal, seq, &acct, sc_pk);
         PrincipalEventJson {
             seq,
             op: op.to_string(),
             principal_id: principal.to_string(),
-            principal_kind: if principal.starts_with("dev_") { "device" } else { "agent" }.to_string(),
+            principal_kind: if principal.starts_with("dev_") {
+                "device"
+            } else {
+                "agent"
+            }
+            .to_string(),
             anchor_uik: acct.clone(),
             owner_id: acct,
             sig: STANDARD.encode(o.sign(&input)),
@@ -765,10 +915,17 @@ mod tests {
     fn sign_head(o: &SigningIdentity, events: &[PrincipalEventJson]) -> HeadJson {
         let mut sorted: Vec<&PrincipalEventJson> = events.iter().collect();
         sorted.sort_by_key(|e| e.seq);
-        let sigs: Vec<Vec<u8>> = sorted.iter().map(|e| decode_b64_any(&e.sig).unwrap()).collect();
+        let sigs: Vec<Vec<u8>> = sorted
+            .iter()
+            .map(|e| decode_b64_any(&e.sig).unwrap())
+            .collect();
         let hash = identity::principal_events_hash(&sigs);
         let max_seq = sorted.last().map(|e| e.seq).unwrap_or(0);
-        let sig = o.sign(&identity::principal_head_input(&o.user_id(), max_seq, &hash));
+        let sig = o.sign(&identity::principal_head_input(
+            &o.user_id(),
+            max_seq,
+            &hash,
+        ));
         HeadJson {
             anchor: o.user_id(),
             max_seq,
@@ -810,7 +967,13 @@ mod tests {
     #[test]
     fn a_verified_revoke_of_this_device_wipes() {
         let o = owner();
-        let l = ledger(&o, vec![ev(&o, "admit", MY_DEV, 1, &MY_PK), ev(&o, "revoke", MY_DEV, 2, &[])]);
+        let l = ledger(
+            &o,
+            vec![
+                ev(&o, "admit", MY_DEV, 1, &MY_PK),
+                ev(&o, "revoke", MY_DEV, 2, &[]),
+            ],
+        );
         let f = pull(paired_at(1), &l, T0 + 60).unwrap();
         assert_eq!(f.self_revoke_seq, 2);
         assert_eq!(gate(&f, T0 + 60, true, true), DeviceGate::Revoked);
@@ -828,7 +991,14 @@ mod tests {
         let o = owner();
         let dir = tempfile::tempdir().unwrap();
         // The old decision carried a latched revoke at seq 2.
-        store_floor(dir.path(), &LedgerFloor { admitted_seq: 1, self_revoke_seq: 2, ..paired_at(1) });
+        store_floor(
+            dir.path(),
+            &LedgerFloor {
+                admitted_seq: 1,
+                self_revoke_seq: 2,
+                ..paired_at(1)
+            },
+        );
         // Re-pair: C6 writes revoke(old) at 3 then admit(new) at 4.
         write_pairing_floor(dir.path(), 4, T0).unwrap();
         let f = load_floor(dir.path());
@@ -871,14 +1041,23 @@ mod tests {
         assert_eq!(gate(&f, T0, true, true), DeviceGate::NotAdmitted);
         assert_eq!(f.self_revoke_seq, 0, "no wipe");
         // Never paired: nothing persisted.
-        assert_eq!(gate(&LedgerFloor::default(), T0, true, true), DeviceGate::NotAdmitted);
+        assert_eq!(
+            gate(&LedgerFloor::default(), T0, true, true),
+            DeviceGate::NotAdmitted
+        );
     }
 
     /// No anchor (or no DIK) → park, whatever was persisted.
     #[test]
     fn no_anchor_or_no_dik_parks() {
-        assert_eq!(gate(&paired_at(1), T0, false, true), DeviceGate::NotAdmitted);
-        assert_eq!(gate(&paired_at(1), T0, true, false), DeviceGate::NotAdmitted);
+        assert_eq!(
+            gate(&paired_at(1), T0, false, true),
+            DeviceGate::NotAdmitted
+        );
+        assert_eq!(
+            gate(&paired_at(1), T0, true, false),
+            DeviceGate::NotAdmitted
+        );
     }
 
     /// One bad event, a head mismatch, a foreign anchor, a gap: the whole pull
@@ -887,13 +1066,21 @@ mod tests {
     fn one_bad_event_or_a_head_mismatch_holds() {
         let o = owner();
         let acct = o.user_id();
-        let good = || vec![ev(&o, "admit", MY_DEV, 1, &MY_PK), ev(&o, "revoke", MY_DEV, 2, &[])];
+        let good = || {
+            vec![
+                ev(&o, "admit", MY_DEV, 1, &MY_PK),
+                ev(&o, "revoke", MY_DEV, 2, &[]),
+            ]
+        };
         assert!(verify_strict(&ledger(&o, good()), &acct).is_ok());
 
         // A forged revoke the head even commits to: still refused whole.
         let mut events = good();
         events[1].sig = STANDARD.encode([0u8; 64]);
-        assert!(verify_strict(&ledger(&o, events), &acct).is_err(), "bad event");
+        assert!(
+            verify_strict(&ledger(&o, events), &acct).is_err(),
+            "bad event"
+        );
 
         let mut l = ledger(&o, good());
         l.head = None;
@@ -909,7 +1096,10 @@ mod tests {
 
         let imposter = SigningIdentity::from_seed(&[9u8; 32]);
         let mut l = ledger(&o, good());
-        l.anchor = Some(AnchorJson { uik_id: imposter.user_id(), uik_pub: STANDARD.encode(imposter.public_bytes()) });
+        l.anchor = Some(AnchorJson {
+            uik_id: imposter.user_id(),
+            uik_pub: STANDARD.encode(imposter.public_bytes()),
+        });
         assert!(verify_strict(&l, &acct).is_err(), "swapped anchor");
 
         let mut l = ledger(&o, good());
@@ -918,12 +1108,21 @@ mod tests {
         l.head = Some(h);
         assert!(verify_strict(&l, &acct).is_err(), "head by another key");
 
-        let gap = ledger(&o, vec![ev(&o, "admit", MY_DEV, 1, &MY_PK), ev(&o, "admit", "ag_x", 3, &[])]);
+        let gap = ledger(
+            &o,
+            vec![
+                ev(&o, "admit", MY_DEV, 1, &MY_PK),
+                ev(&o, "admit", "ag_x", 3, &[]),
+            ],
+        );
         assert!(verify_strict(&gap, &acct).is_err(), "seq gap");
 
         let mut foreign = good();
         foreign[0].owner_id = "us_someone_else".into();
-        assert!(verify_strict(&ledger(&o, foreign), &acct).is_err(), "foreign owner");
+        assert!(
+            verify_strict(&ledger(&o, foreign), &acct).is_err(),
+            "foreign owner"
+        );
 
         // The persisted decision is untouched by a refused pull: still serving.
         assert_eq!(gate(&paired_at(1), T0 + 60, true, true), DeviceGate::Open);
@@ -974,7 +1173,10 @@ mod tests {
     #[test]
     fn floor_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let f = LedgerFloor { agents: vec!["ag_a".into()], ..paired_at(2) };
+        let f = LedgerFloor {
+            agents: vec!["ag_a".into()],
+            ..paired_at(2)
+        };
         store_floor(dir.path(), &f);
         assert_eq!(load_floor(dir.path()), f);
     }
@@ -990,7 +1192,10 @@ mod tests {
             proxy_port: 0,
             listen: "127.0.0.1".into(),
             origin: "http://localhost".into(),
-            relying_party: crate::passkey::webauthn::RelyingParty::exact("http://localhost", "localhost"),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
             admin_key: None,
             relay_url: None,
             body_cap: crate::config::DEFAULT_BODY_CAP,
@@ -1009,10 +1214,86 @@ mod tests {
         let f = paired_at(1);
         let g = gate(&f, T0 + LEASE_SECS + 1, true, true);
         assert_eq!(g, DeviceGate::Stale);
-        publish(&state, g, &f);
+        publish(&state, g, &f, Some(f.fresh_at));
         assert!(state.is_vault_locked("v1"), "K evicted");
-        assert!(blob.join("vault.per-item.json").exists(), "data stays on disk");
-        assert_eq!(state.ledger_refusal().unwrap().code().0.as_str(), "ledger_stale");
+        assert!(
+            blob.join("vault.per-item.json").exists(),
+            "data stays on disk"
+        );
+        assert_eq!(
+            state.ledger_refusal().unwrap().code().0.as_str(),
+            "ledger_stale"
+        );
+    }
+
+    #[test]
+    fn only_the_named_401_is_the_account_missing_signal() {
+        use reqwest::StatusCode;
+        let named = br#"{"code":"SC_DEVICE_UNKNOWN","error":"SC_DEVICE_UNKNOWN"}"#;
+        assert!(is_device_unknown_response(StatusCode::UNAUTHORIZED, named));
+        for (status, body) in [
+            (StatusCode::UNAUTHORIZED, br#"{"code":"OTHER"}"#.as_slice()),
+            (StatusCode::UNAUTHORIZED, b"not-json".as_slice()),
+            (StatusCode::FORBIDDEN, named.as_slice()),
+            (StatusCode::INTERNAL_SERVER_ERROR, named.as_slice()),
+        ] {
+            assert!(!is_device_unknown_response(status, body));
+        }
+        assert_eq!(
+            held_gate(DeviceGate::AccountMissing, DeviceGate::Open),
+            DeviceGate::AccountMissing,
+            "an ordinary failure holds the account-missing decision"
+        );
+        assert_eq!(
+            held_gate(DeviceGate::Open, DeviceGate::Open),
+            DeviceGate::Open
+        );
+    }
+
+    #[test]
+    fn an_account_missing_signal_parks_and_keeps_local_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config {
+            state_dir: dir.path().to_path_buf(),
+            port: 0,
+            proxy_port: 0,
+            listen: "127.0.0.1".into(),
+            origin: "http://localhost".into(),
+            relying_party: crate::passkey::webauthn::RelyingParty::exact(
+                "http://localhost",
+                "localhost",
+            ),
+            admin_key: None,
+            relay_url: None,
+            body_cap: crate::config::DEFAULT_BODY_CAP,
+        };
+        let state = AppState::new(cfg);
+        let blob = dir.path().join("vaults").join("v1").join("sentinel");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"keep").unwrap();
+        state.open_ledger_for_tests(&[]);
+        state.unlock_vault(
+            "v1".into(),
+            crate::state::SecretsCache::default(),
+            zeroize::Zeroizing::new(vec![0x42u8; 32]),
+        );
+
+        publish(
+            &state,
+            DeviceGate::AccountMissing,
+            &paired_at(1),
+            Some(T0),
+        );
+
+        assert!(state.is_vault_locked("v1"), "the retained key is evicted");
+        assert!(blob.exists(), "the unsigned signal deletes nothing");
+        let refusal = state.ledger_refusal().unwrap();
+        assert_eq!(refusal.code().0.as_str(), "device_not_admitted");
+        assert_eq!(
+            refusal.code().1,
+            crate::error::DEVICE_ACCOUNT_MISSING_MSG
+        );
+        assert_eq!(state.ledger.lock().unwrap().checked_at, Some(T0));
     }
 
     /// The pull authenticates by DIK proof of possession alone, so a revoked
@@ -1025,7 +1306,10 @@ mod tests {
         let dik = SigningIdentity::from_seed(&[3u8; 32]);
         let dev = identity::derive_id(IdKind::Device, &dik.public_bytes());
         let dik_pub = dik.public_bytes();
-        let events = vec![ev(&o, "admit", &dev, 1, &MY_PK), ev(&o, "revoke", &dev, 2, &[])];
+        let events = vec![
+            ev(&o, "admit", &dev, 1, &MY_PK),
+            ev(&o, "revoke", &dev, 2, &[]),
+        ];
         let head = sign_head(&o, &events);
         let body = serde_json::json!({
             "anchor": { "uik_id": o.user_id(), "uik_pub": STANDARD.encode(o.public_bytes()) },
@@ -1047,7 +1331,10 @@ mod tests {
                 let uik_q = uik_q.clone();
                 async move {
                     // The pinned account rides the query, and the PoP covers it.
-                    let pq = uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default();
+                    let pq = uri
+                        .path_and_query()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_default();
                     if pq != uik_q {
                         return Err(axum::http::StatusCode::BAD_REQUEST);
                     }
@@ -1055,9 +1342,16 @@ mod tests {
                     if h.contains_key("authorization") {
                         return Err(axum::http::StatusCode::UNAUTHORIZED);
                     }
-                    let hv = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    let hv = |k: &str| {
+                        h.get(k)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string()
+                    };
                     let ts: u64 = hv(crate::device_auth::HDR_DEVICE_TS).parse().unwrap_or(0);
-                    let sig = STANDARD.decode(hv(crate::device_auth::HDR_DEVICE_SIG)).unwrap_or_default();
+                    let sig = STANDARD
+                        .decode(hv(crate::device_auth::HDR_DEVICE_SIG))
+                        .unwrap_or_default();
                     let input = identity::device_request_signature_input("GET", &pq, ts, &[], &dev);
                     let ok = hv(crate::device_auth::HDR_DEVICE_ID) == dev
                         && <[u8; 64]>::try_from(sig.as_slice())
@@ -1090,7 +1384,8 @@ mod tests {
         let acct = o.user_id();
         let pk = [5u8; 32];
         let admit = |principal: &str, sc_pk: &[u8], seq: u64| {
-            let input = identity::principal_event_input(&acct, "admit", principal, seq, &acct, sc_pk);
+            let input =
+                identity::principal_event_input(&acct, "admit", principal, seq, &acct, sc_pk);
             let mut v = serde_json::json!({
                 "seq": seq, "op": "admit", "principal_id": principal, "principal_kind": "device",
                 "anchor_uik": acct, "owner_id": acct, "sig": STANDARD.encode(o.sign(&input)),
@@ -1101,8 +1396,14 @@ mod tests {
             v
         };
         let me = o.public_bytes();
-        assert_eq!(verify_pairing_admit(&admit("dev_me", &pk, 3), &me, "dev_me", &pk).unwrap(), acct);
-        assert_eq!(verify_pairing_admit(&admit("ag_me", &[], 4), &me, "ag_me", &[]).unwrap(), acct);
+        assert_eq!(
+            verify_pairing_admit(&admit("dev_me", &pk, 3), &me, "dev_me", &pk).unwrap(),
+            acct
+        );
+        assert_eq!(
+            verify_pairing_admit(&admit("ag_me", &[], 4), &me, "ag_me", &[]).unwrap(),
+            acct
+        );
         assert!(verify_pairing_admit(&admit("dev_other", &pk, 3), &me, "dev_me", &pk).is_err());
         assert!(verify_pairing_admit(&admit("dev_me", &[6u8; 32], 3), &me, "dev_me", &pk).is_err());
         let imposter = SigningIdentity::from_seed(&[9u8; 32]).public_bytes();

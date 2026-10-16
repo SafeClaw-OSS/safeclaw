@@ -21,6 +21,8 @@ pub enum ScCode {
     MethodNotAllowed,
     Conflict,
     VaultLocked,
+    VaultAccessRevoked,
+    VaultDeleted,
     RateLimited,
     Internal,
     CaUnavailable,
@@ -103,6 +105,7 @@ pub enum ScCode {
     RefreshForbidden,
     SecretEncoding,
     StoreUnavailable,
+    VaultKeyChanged,
     UnknownConnection,
     UpstreamBody,
     UpstreamError,
@@ -141,6 +144,14 @@ impl ScCode {
             ),
             Conflict => (409, "conflict", "Conflict", "fix_request", "request"),
             VaultLocked => (423, "vault_locked", "Vault locked", "unlock", "vault"),
+            VaultAccessRevoked => (
+                403,
+                "vault_access_revoked",
+                "Vault access revoked",
+                "configure",
+                "auth",
+            ),
+            VaultDeleted => (410, "vault_deleted", "Vault deleted", "none", "vault"),
             RateLimited => (429, "rate_limited", "Rate limited", "retry", "request"),
             Internal => (500, "internal", "Internal error", "retry", "internal"),
             CaUnavailable => (500, "ca_unavailable", "CA unavailable", "retry", "internal"),
@@ -331,6 +342,13 @@ impl ScCode {
                 "retry",
                 "upstream",
             ),
+            VaultKeyChanged => (
+                409,
+                "vault_key_changed",
+                "Vault key changed",
+                "unlock",
+                "vault",
+            ),
             UnknownConnection => (
                 400,
                 "unknown_connection",
@@ -376,10 +394,19 @@ impl ScCode {
 /// consistent state and relays one consistent fix.
 pub const VAULT_LOCKED_MSG: &str = "vault locked. Run `sc unlock`, then retry";
 
+pub const VAULT_ACCESS_REVOKED_MSG: &str =
+    "This device can no longer use this vault: its account was removed from it.";
+
+pub const VAULT_KEY_CHANGED_MSG: &str = "This connection may have been added after the vault's members changed and its key was replaced. This device doesn't have the new key yet. Run `sc unlock`.";
+
+pub const VAULT_KEY_CHANGED_STATUS_MSG: &str = "key changed: this vault's members changed (someone was removed), so it has a new key. Run `sc unlock` once to see what was added since; existing credentials keep working.";
+
 /// The ONE remediation line for [`ScCode::DeviceNotAdmitted`] (the console
 /// says the same sentence).
-pub const DEVICE_NOT_ADMITTED_MSG: &str =
-    "This device needs to be paired again: run `sc login`.";
+pub const DEVICE_NOT_ADMITTED_MSG: &str = "This device needs to be paired again: run `sc login`.";
+
+pub const DEVICE_ACCOUNT_MISSING_MSG: &str =
+    "This device is no longer paired with a SafeClaw account. Run `sc login` to pair it again.";
 
 /// The ONE remediation line for [`ScCode::AgentNotAdmitted`].
 pub const AGENT_NOT_ADMITTED_MSG: &str = "This agent isn't admitted to the SafeClaw account this machine is signed in to (never approved, or removed). Run `sc agent add` to set it up again.";
@@ -388,7 +415,8 @@ pub const AGENT_NOT_ADMITTED_MSG: &str = "This agent isn't admitted to the SafeC
 pub const LEDGER_STALE_MSG: &str = "locked: SafeClaw could not reach your account for 7 days. Check this machine's network; vaults unlock again once it reconnects (`sc up`).";
 
 /// The ONE remediation line for [`ScCode::LedgerDeviceRevoked`].
-pub const LEDGER_DEVICE_REVOKED_MSG: &str = "This device was removed from your SafeClaw account. Run `sc login` to pair it again.";
+pub const LEDGER_DEVICE_REVOKED_MSG: &str =
+    "This device was removed from your SafeClaw account. Run `sc login` to pair it again.";
 
 /// The remediation line for [`ScCode::AgentNotInAccount`] (raised by the cloud
 /// op relay; the daemon answers [`ScCode::AgentNotAdmitted`]).
@@ -424,6 +452,10 @@ pub enum AppError {
     /// Vault is locked (no in-memory key). Distinct from `Conflict` so the agent
     /// can tell "unlock needed → run `sc unlock`" apart from other 409s. HTTP 423.
     VaultLocked,
+    /// The cloud explicitly reported that this account is no longer a member.
+    VaultAccessRevoked,
+    /// The vault has a verified deletion tombstone.
+    VaultDeleted,
     TooManyRequests,
     Internal(String),
     /// Batch-approve verification failure (recoverable; see
@@ -440,6 +472,8 @@ pub enum AppError {
     GrantIdInvalid(String),
     /// This device has no valid admit (see `ScCode::DeviceNotAdmitted`).
     DeviceNotAdmitted,
+    /// The account lookup completed and no account names this device.
+    DeviceAccountMissing,
     /// The ledger lease ran out (see `ScCode::LedgerStale`).
     LedgerStale,
     /// This device was revoked (see `ScCode::LedgerDeviceRevoked`).
@@ -460,6 +494,11 @@ impl AppError {
             AppError::NotFound => (ScCode::NotFound, "Not found".to_string()),
             AppError::Conflict(msg) => (ScCode::Conflict, msg.clone()),
             AppError::VaultLocked => (ScCode::VaultLocked, VAULT_LOCKED_MSG.to_string()),
+            AppError::VaultAccessRevoked => (
+                ScCode::VaultAccessRevoked,
+                VAULT_ACCESS_REVOKED_MSG.to_string(),
+            ),
+            AppError::VaultDeleted => (ScCode::VaultDeleted, "This vault was deleted.".to_string()),
             AppError::TooManyRequests => (ScCode::RateLimited, "Rate limit exceeded".to_string()),
             AppError::BatchVerify(msg) => (ScCode::BatchVerifyFailed, msg.clone()),
             AppError::ApproverNotAuthorized(msg) => (ScCode::ApproverNotAuthorized, msg.clone()),
@@ -469,15 +508,18 @@ impl AppError {
                 ScCode::DeviceNotAdmitted,
                 DEVICE_NOT_ADMITTED_MSG.to_string(),
             ),
+            AppError::DeviceAccountMissing => (
+                ScCode::DeviceNotAdmitted,
+                DEVICE_ACCOUNT_MISSING_MSG.to_string(),
+            ),
             AppError::LedgerStale => (ScCode::LedgerStale, LEDGER_STALE_MSG.to_string()),
             AppError::LedgerDeviceRevoked => (
                 ScCode::LedgerDeviceRevoked,
                 LEDGER_DEVICE_REVOKED_MSG.to_string(),
             ),
-            AppError::AgentNotAdmitted => (
-                ScCode::AgentNotAdmitted,
-                AGENT_NOT_ADMITTED_MSG.to_string(),
-            ),
+            AppError::AgentNotAdmitted => {
+                (ScCode::AgentNotAdmitted, AGENT_NOT_ADMITTED_MSG.to_string())
+            }
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
                 (ScCode::Internal, "Internal server error".to_string())
@@ -518,6 +560,8 @@ impl std::fmt::Display for AppError {
             AppError::NotFound => write!(f, "Not found"),
             AppError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             AppError::VaultLocked => write!(f, "Vault locked"),
+            AppError::VaultAccessRevoked => write!(f, "{}", VAULT_ACCESS_REVOKED_MSG),
+            AppError::VaultDeleted => write!(f, "This vault was deleted."),
             AppError::TooManyRequests => write!(f, "Rate limit exceeded"),
             AppError::Internal(msg) => write!(f, "Internal error: {}", msg),
             AppError::BatchVerify(msg) => write!(f, "Batch verification failed: {}", msg),
@@ -525,6 +569,7 @@ impl std::fmt::Display for AppError {
             AppError::WkRefused(msg) => write!(f, "Grant refused: {}", msg),
             AppError::GrantIdInvalid(msg) => write!(f, "Approval signature invalid: {}", msg),
             AppError::DeviceNotAdmitted => write!(f, "{}", DEVICE_NOT_ADMITTED_MSG),
+            AppError::DeviceAccountMissing => write!(f, "{}", DEVICE_ACCOUNT_MISSING_MSG),
             AppError::LedgerStale => write!(f, "{}", LEDGER_STALE_MSG),
             AppError::LedgerDeviceRevoked => write!(f, "{}", LEDGER_DEVICE_REVOKED_MSG),
             AppError::AgentNotAdmitted => write!(f, "{}", AGENT_NOT_ADMITTED_MSG),
@@ -556,6 +601,27 @@ impl From<base64::DecodeError> for AppError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn vault_access_revoked_is_an_explicit_agent_refusal() {
+        assert_eq!(ScCode::VaultAccessRevoked.as_str(), "vault_access_revoked");
+        assert_eq!(ScCode::VaultAccessRevoked.status(), 403);
+        let (code, message) = AppError::VaultAccessRevoked.code();
+        assert_eq!(code, ScCode::VaultAccessRevoked);
+        assert_eq!(message, VAULT_ACCESS_REVOKED_MSG);
+        assert!(message.contains("its account was removed from it"));
+    }
+
+    #[test]
+    fn vault_key_changed_is_an_unlockable_conflict() {
+        assert_eq!(ScCode::VaultKeyChanged.as_str(), "vault_key_changed");
+        assert_eq!(ScCode::VaultKeyChanged.status(), 409);
+        assert_eq!(ScCode::VaultKeyChanged.row().3, "unlock");
+        assert_eq!(
+            VAULT_KEY_CHANGED_MSG,
+            "This connection may have been added after the vault's members changed and its key was replaced. This device doesn't have the new key yet. Run `sc unlock`."
+        );
+    }
+
     /// Every registry row must be internally consistent: a real HTTP status,
     /// a snake_case code, and a status that matches what `AppError` variants
     /// project (the two surfaces must never disagree on a code's status).
@@ -570,6 +636,8 @@ mod tests {
             MethodNotAllowed,
             Conflict,
             VaultLocked,
+            VaultAccessRevoked,
+            VaultDeleted,
             RateLimited,
             Internal,
             CaUnavailable,
@@ -592,6 +660,7 @@ mod tests {
             EgressUnreachable,
             ExposesUnsupported,
             HostForbidden,
+            TeamLeaseExpired,
             HostNotAnchored,
             MultiConnection,
             NoVault,
@@ -602,9 +671,12 @@ mod tests {
             RefreshForbidden,
             SecretEncoding,
             StoreUnavailable,
+            VaultKeyChanged,
             UnknownConnection,
             UpstreamBody,
             UpstreamError,
+            UpgradeRequired,
+            MaskNotEnabled,
         ];
         for c in all {
             let (status, code, title, action, cause) = c.row();
@@ -653,7 +725,10 @@ mod tests {
         assert_eq!(code.status(), 403);
         assert_eq!(code.row().3, "configure");
         assert!(detail.contains("`sc agent add`"));
-        assert!(!detail.contains('\n') && !detail.contains('\u{2014}'), "one line, no em dash");
+        assert!(
+            !detail.contains('\n') && !detail.contains('\u{2014}'),
+            "one line, no em dash"
+        );
         let (code, detail) = AppError::LedgerStale.code();
         assert_eq!((code.as_str(), code.status()), ("ledger_stale", 423));
         assert!(detail.starts_with("locked: SafeClaw could not reach your account for 7 days"));

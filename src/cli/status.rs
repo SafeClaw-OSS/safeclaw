@@ -34,6 +34,8 @@ pub struct LocalDaemon {
     pub up: bool,
     pub version: Option<String>,
     pub vault_count: Option<u64>,
+    pub device_standing: Option<String>,
+    pub device_checked_at: Option<u64>,
 }
 
 pub async fn probe_local_daemon(control_root: &str) -> LocalDaemon {
@@ -49,6 +51,8 @@ pub async fn probe_local_daemon(control_root: &str) -> LocalDaemon {
             up: false,
             version: None,
             vault_count: None,
+            device_standing: None,
+            device_checked_at: None,
         };
     }
     // Socket is held ⇒ the daemon IS up. Enrich with version/vault_count via an
@@ -74,10 +78,19 @@ pub async fn probe_local_daemon(control_root: &str) -> LocalDaemon {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     let vault_count = body.get("vault_count").and_then(|v| v.as_u64());
+                    let device_standing = body
+                        .pointer("/device/standing")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let device_checked_at = body
+                        .pointer("/device/checked_at")
+                        .and_then(|v| v.as_u64());
                     return LocalDaemon {
                         up: true,
                         version,
                         vault_count,
+                        device_standing,
+                        device_checked_at,
                     };
                 }
             }
@@ -89,6 +102,8 @@ pub async fn probe_local_daemon(control_root: &str) -> LocalDaemon {
         up: true,
         version: None,
         vault_count: None,
+        device_standing: None,
+        device_checked_at: None,
     }
 }
 
@@ -213,32 +228,38 @@ pub async fn fetch_held(client: &reqwest::Client, custodian: &str, vault: &str) 
         .unwrap_or_default()
 }
 
-/// This device's standing in the account ledger (§15), from the decision the
-/// daemon persisted (`principal_floor.json`) and the pairing in config.
-fn ledger_line(cfg: &crate::cli::active::CliConfig) -> String {
-    use crate::principal_ledger as pl;
-    let floor = pl::load_floor(&crate::config::default_state_dir());
-    let now = crate::util::now_unix();
-    let has_anchor = cfg.account_uik.as_deref().is_some_and(|s| !s.is_empty());
-    let has_dik = crate::device_auth::device_signer().is_some();
-    ledger_text(pl::gate(&floor, now, has_anchor, has_dik), pl::lease_days_left(&floor, now))
+/// This device's live standing as reported by the daemon.
+fn ledger_line(daemon: &LocalDaemon) -> String {
+    if !daemon.up {
+        return "unknown (daemon not reachable)".to_string();
+    }
+    ledger_text(
+        daemon.device_standing.as_deref(),
+        daemon.device_checked_at,
+        crate::util::now_unix(),
+    )
 }
 
 /// The `device:` line for a standing (pure).
-fn ledger_text(gate: crate::principal_ledger::DeviceGate, days_left: Option<u64>) -> String {
-    use crate::principal_ledger::DeviceGate;
-    match gate {
-        DeviceGate::Open => match days_left {
-            Some(d) if d < 2 => format!(
-                "admitted; {} day{} left before SafeClaw locks unless it reaches your account",
-                d,
-                if d == 1 { "" } else { "s" }
-            ),
-            _ => "admitted".to_string(),
-        },
-        DeviceGate::NotAdmitted => "not admitted to your account: run `sc login`".to_string(),
-        DeviceGate::Stale => "locked: SafeClaw could not reach your account for 7 days".to_string(),
-        DeviceGate::Revoked => "removed from your account: run `sc login` to pair it again".to_string(),
+fn ledger_text(standing: Option<&str>, checked_at: Option<u64>, now: u64) -> String {
+    let checked = checked_at
+        .map(|at| format!(" (checked {} ago)", age_text(now.saturating_sub(at))));
+    match standing {
+        Some("admitted") => format!("admitted{}", checked.unwrap_or_default()),
+        Some("not_admitted") => "not admitted to your account: run `sc login`".to_string(),
+        Some("account_missing") => crate::error::DEVICE_ACCOUNT_MISSING_MSG.to_string(),
+        Some("stale") => "locked: SafeClaw could not reach your account for 7 days".to_string(),
+        Some("revoked") => "removed from your account: run `sc login` to pair it again".to_string(),
+        _ => "unknown (daemon did not report its account standing)".to_string(),
+    }
+}
+
+fn age_text(seconds: u64) -> String {
+    match seconds {
+        0..=59 => "less than a minute".to_string(),
+        60..=3599 => format!("{} min", seconds / 60),
+        3600..=86_399 => format!("{} hr", seconds / 3600),
+        _ => format!("{} days", seconds / 86_400),
     }
 }
 
@@ -299,7 +320,7 @@ pub async fn run(json: bool) -> Result<(), String> {
             println!("  vaults:  {}", n);
         }
     } else {
-        println!("  state:   not running — bring it up with `sc up`");
+        println!("  state:   not running. Bring it up with `sc up`");
     }
     println!("  control: {}", control);
     println!("  broker:  {} (agent face; wired by `sc run`)", broker);
@@ -323,9 +344,9 @@ pub async fn run(json: bool) -> Result<(), String> {
             let host = origin_host(&origin);
             println!("  state: logged in");
             println!("  cloud: {} ({})", host, env_label(host));
-            println!("  device: {}", ledger_line(&cfg));
+            println!("  device: {}", ledger_line(&d));
         }
-        None => println!("  state: not logged in — run `sc login`"),
+        None => println!("  state: not logged in. Run `sc login`"),
     }
     println!();
 
@@ -345,7 +366,7 @@ pub async fn run(json: bool) -> Result<(), String> {
                 );
                 println!("  hint:  run `sc vault ls` to pick another, or `sc login` to pair again");
             } else if d.vault_count == Some(0) {
-                println!("  hint:  no vaults yet — seal one on the web, then `sc login`");
+                println!("  hint:  no vaults yet. Seal one on the web, then `sc login`");
             } else if crate::cli::active::known_vaults().is_empty() {
                 println!("  hint:  pick one with `sc vault use`, or `sc vault create`");
             } else {
@@ -422,7 +443,15 @@ fn print_json(
         Some(origin) => {
             let host = origin_host(&origin).to_string();
             let env = env_label(&host);
-            serde_json::json!({ "logged_in": true, "cloud": host, "env": env })
+            serde_json::json!({
+                "logged_in": true,
+                "cloud": host,
+                "env": env,
+                "device": {
+                    "standing": d.device_standing,
+                    "checked_at": d.device_checked_at,
+                }
+            })
         }
         None => serde_json::json!({ "logged_in": false }),
     };
@@ -463,7 +492,7 @@ pub fn print_status(s: &VaultStatus) {
     match &s.state {
         VaultState::Unreachable => {
             if s.url.contains("//localhost") || s.url.contains("//127.0.0.1") {
-                println!("  state:    unreachable — bring the daemon up with `sc up`");
+                println!("  state:    unreachable. Bring the daemon up with `sc up`");
             } else {
                 println!("  state:    unreachable (is the daemon running?)");
             }
@@ -500,14 +529,18 @@ mod env_label_tests {
 
     #[test]
     fn ledger_lines() {
-        use crate::principal_ledger::DeviceGate;
-        assert_eq!(ledger_text(DeviceGate::Open, Some(5)), "admitted");
-        assert!(ledger_text(DeviceGate::Open, Some(1)).contains("1 day left"));
-        assert!(ledger_text(DeviceGate::Open, Some(0)).contains("0 days left"));
         assert_eq!(
-            ledger_text(DeviceGate::Stale, None),
+            ledger_text(Some("admitted"), Some(1_000), 1_120),
+            "admitted (checked 2 min ago)"
+        );
+        assert_eq!(
+            ledger_text(Some("stale"), None, 0),
             "locked: SafeClaw could not reach your account for 7 days"
         );
-        assert!(ledger_text(DeviceGate::NotAdmitted, None).contains("`sc login`"));
+        assert!(ledger_text(Some("not_admitted"), None, 0).contains("`sc login`"));
+        assert_eq!(
+            ledger_text(Some("account_missing"), Some(10), 20),
+            crate::error::DEVICE_ACCOUNT_MISSING_MSG
+        );
     }
 }

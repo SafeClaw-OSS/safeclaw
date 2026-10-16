@@ -158,7 +158,7 @@ fn render(cmd: &clap::Command) -> String {
         + 2;
 
     let mut out = String::new();
-    out.push_str("SafeClaw — passkey-gated credential broker\n\n");
+    out.push_str("SafeClaw: passkey-gated credential broker\n\n");
     out.push_str("Usage: sc <command> [options]\n");
 
     for (heading, rows) in SECTIONS {

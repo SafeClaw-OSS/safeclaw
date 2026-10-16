@@ -2382,7 +2382,7 @@ impl PerItemVault {
             .collect();
         // The base each write is made from, recorded on a keep-both row that
         // goes dirty (see [`StoredItem::base`]). `OwnFold`: our own fold now.
-        let (now, default_kinds) = self.fold_view_and_defaults::<S>(keys, vault_id)?;
+        let (now, default_kinds, _) = self.fold_view_and_defaults::<S>(keys, vault_id)?;
         let own_base = match base {
             ReconcileBase::OwnFold => Some(ViewBase::of(&now)?),
             ReconcileBase::Since(_) => None,
@@ -2923,6 +2923,18 @@ impl PerItemVault {
         Ok(self.fold_view_and_defaults::<S>(keys, vault_id)?.0)
     }
 
+    /// Fold the view and return how many current rows this key could not read.
+    /// Runtime retained-key refreshes use the count to keep serving their old
+    /// complete cache rather than replacing it with a partial fold.
+    pub fn fold_view_counted<S: PrimitiveSuite>(
+        &self,
+        keys: VaultKeys,
+        vault_id: &str,
+    ) -> Result<(crate::storage::plaintext::VaultPlaintextView, usize)> {
+        let (view, _, unreadable) = self.fold_view_and_defaults::<S>(keys, vault_id)?;
+        Ok((view, unreadable))
+    }
+
     /// [`Self::fold_view`], and the owner-config kinds that read their
     /// default ([`OwnerConfigFold::apply`]).
     fn fold_view_and_defaults<S: PrimitiveSuite>(
@@ -2932,6 +2944,7 @@ impl PerItemVault {
     ) -> Result<(
         crate::storage::plaintext::VaultPlaintextView,
         std::collections::BTreeSet<ItemNs>,
+        usize,
     )> {
         use crate::storage::item::rule;
         use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
@@ -3172,6 +3185,7 @@ impl PerItemVault {
                 native_secret_notes,
             },
             defaults,
+            unreadable,
         ))
     }
 

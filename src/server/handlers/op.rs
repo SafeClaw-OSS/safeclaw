@@ -67,6 +67,9 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
     api: Option<&A>,
 ) -> Result<Value> {
     let state = state.clone();
+    if let Some(error) = state.vault_gone_error(&vault_id) {
+        return Err(error);
+    }
     // §15: a device that is not admitted, past its lease, or revoked unlocks
     // nothing and raises no op.
     if let Some(e) = state.ledger_refusal() {
@@ -101,8 +104,12 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
     // only: device A's pending unlock never answers device B, and the
     // ceremony key is per vault.
     if matches!(&op.act.kind, ActType::Custom(name) if name == "vault-unlock") {
-        if let Some(pending) = pending_unlock_response(&state, &vault_id) {
-            return Ok(pending);
+        // A ceremony minted before a detected re-key may deliver the old key.
+        // Skip reuse so this request creates a fresh approval for the new key.
+        if !state.is_vault_key_changed(&vault_id) {
+            if let Some(pending) = pending_unlock_response(&state, &vault_id) {
+                return Ok(pending);
+            }
         }
     }
     // ONE approval window (SSOT, user decision 2026-07-14): ops that arrive
@@ -188,7 +195,7 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if let Ok(store) = state.audits.for_vault(&vault_id) {
+    if let Ok(store) = state.audit_for_vault(&vault_id) {
         // F-22: cap pending ops per vault to prevent SQLite table flooding.
         const MAX_PENDING_PER_VAULT: i64 = 500;
         match store.count_pending() {
@@ -232,8 +239,13 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
     if let ActType::Custom(name) = &op.act.kind {
         if name == "vault-unlock" || name == "vault-lock" {
             let prev = {
-                let mut live = state.live_ceremony_ops.lock().unwrap();
-                live.insert((vault_id.clone(), name.clone()), op_id.clone())
+                state
+                    .runtime(&vault_id)
+                    .map_err(crate::vault_runtime::VaultGone::app_error)?
+                    .live_ceremony_ops
+                    .lock()
+                    .unwrap()
+                    .insert(name.clone(), op_id.clone())
             };
             if let Some(prev_id) = prev {
                 if prev_id != op_id {
@@ -274,10 +286,11 @@ pub(crate) async fn create_op<A: crate::service::source::github::GitHubApi>(
 /// none, or it is terminal or expired: the caller mints fresh.
 fn pending_unlock_response(state: &AppState, vault_id: &str) -> Option<Value> {
     let id = state
+        .runtime_if_present(vault_id)?
         .live_ceremony_ops
         .lock()
         .unwrap()
-        .get(&(vault_id.to_string(), "vault-unlock".to_string()))
+        .get("vault-unlock")
         .cloned()?;
     let store = state.approvals.lock().unwrap();
     let rec = store.get(&id)?;
@@ -342,7 +355,7 @@ fn cancel_superseded(state: &Arc<AppState>, vault_id: &str, op_id: &str, now: i6
         store.reject(op_id, REASON).is_some()
     };
     if was_pending {
-        if let Ok(store) = state.audits.for_vault(vault_id) {
+        if let Ok(store) = state.audit_for_vault(vault_id) {
             if let Err(e) = store.finalize(
                 op_id,
                 audit::STATUS_CANCELLED,
@@ -404,7 +417,7 @@ fn withdraw(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if let Ok(store) = state.audits.for_vault(vault_id) {
+    if let Ok(store) = state.audit_for_vault(vault_id) {
         if let Err(e) = store.finalize(
             op_id,
             audit::STATUS_CANCELLED,
@@ -612,10 +625,12 @@ mod tests {
             s.create("v1".into(), unlock("v1"), "r-one".into())
         };
         state
+            .runtime("v1")
+            .unwrap()
             .live_ceremony_ops
             .lock()
             .unwrap()
-            .insert(("v1".into(), "vault-unlock".into()), first_id.clone());
+            .insert("vault-unlock".into(), first_id.clone());
         let resp = pending_unlock_response(&state, "v1").expect("the pending op is reused");
         assert_eq!(resp["op_id"], json!(first_id), "same /grant link");
         assert_eq!(resp["r"], json!("r-one"), "same challenge");
@@ -626,10 +641,63 @@ mod tests {
         // request then mints fresh (a terminal op is never reused).
         state.approvals.lock().unwrap().approve(&first_id, None);
         assert!(matches!(
-            state.approvals.lock().unwrap().get_any(&first_id).unwrap().status,
+            state
+                .approvals
+                .lock()
+                .unwrap()
+                .get_any(&first_id)
+                .unwrap()
+                .status,
             crate::approval::store::ApprovalStatus::Approved
         ));
         assert!(pending_unlock_response(&state, "v1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_key_change_requires_a_fresh_unlock_approval() {
+        let state = Arc::new(test_state());
+        let unlock: Operation = serde_json::from_value(json!({
+            "act": { "type": { "custom": "vault-unlock" }, "target": "v1", "scope": {} },
+            "bind": { "redeemer": "v1" },
+            "valid": { "iat": 0, "multiplicity": 1 }
+        }))
+        .unwrap();
+        let first_id = state
+            .approvals
+            .lock()
+            .unwrap()
+            .create("v1".into(), unlock.clone(), "r-one".into());
+        state
+            .runtime("v1")
+            .unwrap()
+            .live_ceremony_ops
+            .lock()
+            .unwrap()
+            .insert("vault-unlock".into(), first_id.clone());
+        state.mark_vault_key_changed("v1");
+
+        let next = create_op::<crate::service::source::github::GitHubHttp>(
+            &state,
+            "v1".into(),
+            unlock,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(next["op_id"], json!(first_id));
+        assert!(matches!(
+            state
+                .approvals
+                .lock()
+                .unwrap()
+                .get_any(&first_id)
+                .unwrap()
+                .status,
+            crate::approval::store::ApprovalStatus::Rejected { .. }
+        ));
     }
 
     #[test]
@@ -683,6 +751,37 @@ mod tests {
             s.open_ledger_for_tests(&[]);
             s
         }
+    }
+
+    #[tokio::test]
+    async fn revoked_vault_refuses_unlock_before_creating_an_op() {
+        use crate::protocol::operation::{Act, Bind, Valid};
+
+        let state = Arc::new(test_state());
+        state.mark_vault_closing("v1", crate::vault_runtime::TombstoneReason::Removed);
+        let op = Operation {
+            act: Act {
+                kind: ActType::Custom("vault-unlock".into()),
+                target: "v1".into(),
+                scope: Value::Null,
+            },
+            bind: Bind {
+                redeemer: "v1".into(),
+                recipient: None,
+            },
+            valid: Valid::single_use(0, None),
+        };
+        let err = create_op::<crate::service::source::github::GitHubHttp>(
+            &state,
+            "v1".into(),
+            op,
+            None,
+            "127.0.0.1".parse().unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::VaultAccessRevoked));
     }
 
     /// RED LINE (verified invariant — see the export/allow discussion): an
@@ -918,9 +1017,14 @@ mod tests {
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         for (device, code) in [
             (DeviceGate::NotAdmitted, "device_not_admitted"),
+            (DeviceGate::AccountMissing, "device_not_admitted"),
             (DeviceGate::Stale, "ledger_stale"),
         ] {
-            state.set_ledger(LedgerGate { device, agents: None });
+            state.set_ledger(LedgerGate {
+                device,
+                agents: None,
+                checked_at: None,
+            });
             let err = create(
                 State(state.clone()),
                 ConnectInfo(addr),

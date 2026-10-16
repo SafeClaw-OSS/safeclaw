@@ -41,6 +41,6 @@ async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), Str
         return Ok(());
     }
 
-    eprintln!("safeclaw {} — ok", label.to_lowercase());
+    eprintln!("safeclaw {}: ok", label.to_lowercase());
     Ok(())
 }

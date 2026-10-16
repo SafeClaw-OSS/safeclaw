@@ -166,6 +166,7 @@ pub enum StreamHealth {
 /// AppState plumbing: the producers (`dispatch_record` / `run_stream`) are
 /// free functions with no AppState handle.
 static AGENT_HASH_EVENTS: Notify = Notify::const_new();
+static DEVICE_AUTH_REJECTED: Notify = Notify::const_new();
 
 /// Arm a wake on the agent-hash signal. `notify_one` semantics: a fire with
 /// no waiter parks a permit, so an event landing while the consumer is
@@ -176,6 +177,14 @@ pub fn agent_hashes_notified() -> tokio::sync::futures::Notified<'static> {
 
 fn notify_agent_hashes() {
     AGENT_HASH_EVENTS.notify_one();
+}
+
+pub(crate) fn notify_device_auth_rejected() {
+    DEVICE_AUTH_REJECTED.notify_one();
+}
+
+pub(crate) fn device_auth_rejected_notified() -> tokio::sync::futures::Notified<'static> {
+    DEVICE_AUTH_REJECTED.notified()
 }
 
 /// Live op-relay pollers, keyed by op_id. A relay client registers before
@@ -322,7 +331,8 @@ pub async fn stream_health_edge() {
 /// so a vault outside the streamed set (born after daemon start, over the
 /// 32-vid cap, hello-rejected) never hears them either. Cleared on every
 /// go_down; kept across a rotation (the gap is one re-dial budget, inside
-/// the poll floors).
+/// the poll floors). The vid set stays here because it is one atomic snapshot
+/// of the shared SSE connection's negotiated routing, not vault-owned state.
 #[derive(Default)]
 struct StreamCaps {
     vids: std::collections::HashSet<String>,
@@ -690,6 +700,7 @@ enum ConnectFail {
 ///    ★★ 5 consecutive never-healthy attempts → 600s parks. 404 → 600s,
 ///    401/403 → 600s, 429 → 300s.
 pub async fn dispatcher(
+    state: Arc<crate::state::AppState>,
     cloud: String,
     dk: String,
     cells: Vec<(String, Weak<WakeCell>)>,
@@ -732,7 +743,9 @@ pub async fn dispatcher(
         }
         announced_off = false; // re-entering off later announces again
 
-        // This attempt's vid set (see MAX_STREAM_VIDS for why we filter).
+        // This attempt's vid-to-cell table is connection-local routing for one
+        // shared SSE request. The cells themselves remain owned by runtimes.
+        // See MAX_STREAM_VIDS for why we filter.
         let mut stream_cells: HashMap<String, Arc<WakeCell>> = HashMap::new();
         for (vid, cell) in &live {
             if stream_cells.len() >= MAX_STREAM_VIDS {
@@ -754,7 +767,17 @@ pub async fn dispatcher(
         vids.sort_unstable(); // stable param across reconnects
         let vids_param = vids.join(",");
 
-        match run_stream(&cloud, &dk, &stream_cells, &vids_param, &health, rotating).await {
+        match run_stream(
+            &state,
+            &cloud,
+            &dk,
+            &stream_cells,
+            &vids_param,
+            &health,
+            rotating,
+        )
+        .await
+        {
             StreamEnd::Died { healthy_for, why } => {
                 announced_old_backend = false; // hello proved the route exists
                 if healthy_for >= PROVEN_HEALTHY {
@@ -869,6 +892,7 @@ pub async fn dispatcher(
 /// dispatcher loop). `rotating` selects the tighter one-shot budget and the
 /// debug-level reconnect log.
 async fn run_stream(
+    state: &Arc<crate::state::AppState>,
     cloud: &str,
     dk: &str,
     cells: &HashMap<String, Arc<WakeCell>>,
@@ -913,7 +937,11 @@ async fn run_stream(
     match resp.status().as_u16() {
         200 => {}
         404 => return StreamEnd::Failed(ConnectFail::OldBackend),
-        code @ (401 | 403) => return StreamEnd::Failed(ConnectFail::Auth(code)),
+        401 => {
+            notify_device_auth_rejected();
+            return StreamEnd::Failed(ConnectFail::Auth(401));
+        }
+        403 => return StreamEnd::Failed(ConnectFail::Auth(403)),
         429 => return StreamEnd::Failed(ConnectFail::Cap),
         other => return StreamEnd::Failed(ConnectFail::Transient(format!("HTTP {}", other))),
     }
@@ -928,7 +956,7 @@ async fn run_stream(
     };
     let hello = match tokio::time::timeout(
         hello_wait,
-        read_until_hello(&mut stream, &mut parser, cells),
+        read_until_hello(&mut stream, &mut parser, cells, state, cloud, dk),
     )
     .await
     {
@@ -995,7 +1023,7 @@ async fn run_stream(
             }
             Ok(Some(Ok(chunk))) => {
                 for rec in parser.push(chunk.as_ref()) {
-                    dispatch_record(cells, &rec);
+                    dispatch_record_with_context(cells, &rec, Some((state, cloud, dk)));
                 }
             }
         }
@@ -1013,6 +1041,9 @@ async fn read_until_hello<S, B>(
     stream: &mut S,
     parser: &mut SseParser,
     cells: &HashMap<String, Arc<WakeCell>>,
+    state: &Arc<crate::state::AppState>,
+    cloud: &str,
+    dk: &str,
 ) -> Result<serde_json::Value, String>
 where
     S: futures_util::Stream<Item = Result<B, reqwest::Error>> + Unpin,
@@ -1033,7 +1064,7 @@ where
                         .map_err(|e| format!("undecodable hello: {}", e))?,
                 );
             } else {
-                dispatch_record(cells, &rec);
+                dispatch_record_with_context(cells, &rec, Some((state, cloud, dk)));
             }
         }
         if let Some(h) = hello {
@@ -1082,7 +1113,16 @@ fn apply_hello(cells: &HashMap<String, Arc<WakeCell>>, hello: &serde_json::Value
 /// hint means "just pull"; the pull's own cursor decides what is new. Same
 /// rule for the v1.1 payloads: nothing beyond ROUTING is trusted — the
 /// consumers re-fetch/re-poll and their responses are the truth.
+#[cfg(test)]
 fn dispatch_record(cells: &HashMap<String, Arc<WakeCell>>, rec: &SseRecord) {
+    dispatch_record_with_context(cells, rec, None);
+}
+
+fn dispatch_record_with_context(
+    cells: &HashMap<String, Arc<WakeCell>>,
+    rec: &SseRecord,
+    context: Option<(&Arc<crate::state::AppState>, &str, &str)>,
+) {
     // Account-scoped, payload-free: `data` is `{}` today and deliberately
     // not parsed (the consumer re-fetches the WHOLE hash-set regardless), so
     // this routes before the JSON gate — a garbled body must still wake it.
@@ -1094,6 +1134,44 @@ fn dispatch_record(cells: &HashMap<String, Arc<WakeCell>>, rec: &SseRecord) {
         tracing::debug!(event = %rec.event, "sync stream: undecodable event data; ignoring");
         return;
     };
+    if rec.event == "access" {
+        let Some((state, cloud, dk)) = context else {
+            return;
+        };
+        let Some(vid) = data.get("vid").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if state.is_vault_revoked(vid) {
+            return;
+        }
+        let held = state.runtime_if_present(vid).is_some()
+            || state.vaults.dir_for(vid).is_ok_and(|p| p.exists());
+        if !held {
+            return;
+        }
+        let Ok(runtime) = state.runtime(vid) else {
+            return;
+        };
+        if runtime
+            .access_probe
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let (state, cloud, dk, vid) = (
+            state.clone(),
+            cloud.to_string(),
+            dk.to_string(),
+            vid.to_string(),
+        );
+        tokio::spawn(async move {
+            crate::sync::probe_vault_access(&state, &cloud, &dk, &vid).await;
+            runtime
+                .access_probe
+                .store(false, std::sync::atomic::Ordering::Release);
+        });
+        return;
+    }
     if rec.event == "hello" {
         // Not expected mid-stream, but folding it like a fresh snapshot is
         // strictly harmless (merges are monotone) — and it counts as a

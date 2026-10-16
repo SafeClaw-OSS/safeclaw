@@ -14,6 +14,6 @@ use crate::error::{AppError, Result};
 /// `/export/{key}` is DISABLED on the agent surface.
 pub async fn disabled() -> Result<(StatusCode, Json<Value>)> {
     Err(AppError::Forbidden(
-        "raw secret export is disabled on the agent surface — reveal a secret with a passkey via `sc secret get`; put a phantom (see `sc status`) where the credential goes for brokered calls".into(),
+        "raw secret export is disabled on the agent surface. Reveal a secret with a passkey via `sc secret get`; put a phantom (see `sc status`) where the credential goes for brokered calls".into(),
     ))
 }

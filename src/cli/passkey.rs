@@ -101,14 +101,14 @@ async fn run_ls(json: bool) -> Result<(), String> {
     }
     if !body.vault_exists {
         println!(
-            "(vault {} is not yet enrolled — run `safeclaw setup`)",
+            "(vault {} is not yet enrolled; run `safeclaw setup`)",
             vault
         );
         return Ok(());
     }
     if body.passkeys.is_empty() {
         println!(
-            "(vault {} has no passkeys — re-enroll via `safeclaw setup`)",
+            "(vault {} has no passkeys; re-enroll via `safeclaw setup`)",
             vault
         );
         return Ok(());

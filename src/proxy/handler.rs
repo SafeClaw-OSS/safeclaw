@@ -340,7 +340,7 @@ impl BrokerHandler {
             return err_response(
                 ScCode::MultiConnection,
                 &format!(
-                    "one connection per request — this request names {}",
+                    "one connection per request: this request names {}",
                     conns.join(", ")
                 ),
             )
@@ -368,6 +368,10 @@ impl BrokerHandler {
                     let (code, msg) = e.code();
                     return err_response(code, &msg).into();
                 }
+                Err(AgentRefusal::Gone(error)) => {
+                    let (code, message) = error.code();
+                    return err_response(code, &message).into();
+                }
                 Err(AgentRefusal::NoIdentity) => {
                     return err_response(
                         ScCode::AgentKey,
@@ -383,7 +387,8 @@ impl BrokerHandler {
                     .into();
                 }
                 Err(AgentRefusal::Locked) => {
-                    return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG).into();
+                    return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG)
+                        .into();
                 }
                 Err(AgentRefusal::NotAuthorized) => {
                     // Deep-link straight to THIS vault's Agent access page so the
@@ -407,18 +412,22 @@ impl BrokerHandler {
             None => {
                 return err_response(
                     ScCode::NoVault,
-                    "no vault bound — route credential traffic with `sc run`",
+                    "no vault bound. Route credential traffic with `sc run`",
                 )
                 .into()
             }
         };
+        if let Some(error) = self.state.vault_gone_error(&vault_id) {
+            let (code, message) = error.code();
+            return err_response(code, &message).into();
+        }
         // Daemon too old for this vault's format (cloud returned SC_UPGRADE_REQUIRED
         // for its sync, design 甲) → fail LOUDLY so the agent runs `sc upgrade`,
         // instead of a silent parked-sync mystery the agent works around or calls a bug.
         if self.state.is_vault_upgrade_required(&vault_id) {
             return err_response(
                 ScCode::UpgradeRequired,
-                "SafeClaw needs an update to use this vault — run `sc upgrade`",
+                "SafeClaw needs an update to use this vault. Run `sc upgrade`",
             )
             .into();
         }
@@ -499,11 +508,11 @@ impl BrokerHandler {
                         written: None,
                     }
                 } else {
-                    return err_response(
-                        ScCode::UnknownConnection,
-                        &format!("unknown connection '{}'", conn),
-                    )
-                    .into();
+                    let (code, message) = unknown_connection_refusal(
+                        self.state.is_vault_key_changed(&vault_id),
+                        &conn,
+                    );
+                    return err_response(code, &message).into();
                 }
             }
         };
@@ -570,7 +579,13 @@ impl BrokerHandler {
         // the client's URL parser reads it must be a canonical, public host
         // (`core::egress`), anchored or not.
         if !crate::core::egress::host_egress_allowed(&dest_host) {
-            write_forward_audit(&self.state, &refused, 0, Some(&dest_host), Some(ScCode::HostForbidden));
+            write_forward_audit(
+                &self.state,
+                &refused,
+                0,
+                Some(&dest_host),
+                Some(ScCode::HostForbidden),
+            );
             return err_response(
                 ScCode::HostForbidden,
                 &format!(
@@ -582,7 +597,13 @@ impl BrokerHandler {
         }
         if !crate::core::host::host_allowed(&dest_host, &resolved_hosts) {
             // Refused whether or not the widen request below registers.
-            write_forward_audit(&self.state, &refused, 0, Some(&dest_host), Some(ScCode::HostNotAnchored));
+            write_forward_audit(
+                &self.state,
+                &refused,
+                0,
+                Some(&dest_host),
+                Some(ScCode::HostNotAnchored),
+            );
             return self.widen_deny(&vault_id, &conn, &dest_host, ip).await;
         }
 
@@ -729,7 +750,7 @@ impl BrokerHandler {
                                     ScCode::StoreUnavailable,
                                     &format!(
                                         "external store '{}' failed while resolving this \
-                                         connection's secret — check the store's credentials \
+                                         connection's secret. Check the store's credentials \
                                          and permissions (daemon logs have the full error)",
                                         store_id
                                     ),
@@ -761,7 +782,7 @@ impl BrokerHandler {
                     return err_response(
                         ScCode::AmbiguousPhantom,
                         &format!(
-                            "'{}' exposes several secrets — use a role phantom: {}",
+                            "'{}' exposes several secrets. Use a role phantom: {}",
                             conn, roles
                         ),
                     )
@@ -841,7 +862,7 @@ impl BrokerHandler {
             return err_response(
                 ScCode::PhantomUnresolved,
                 "a SafeClaw phantom in this request could not be resolved, so the request was \
-                 blocked before the placeholder could reach upstream — check the connection/role \
+                 blocked before the placeholder could reach upstream. Check the connection/role \
                  name (`sc registry`), or run `sc unlock` if the vault is locked",
             )
             .into();
@@ -1215,6 +1236,20 @@ impl BrokerHandler {
     }
 }
 
+fn unknown_connection_refusal(key_changed: bool, conn: &str) -> (ScCode, String) {
+    if key_changed {
+        (
+            ScCode::VaultKeyChanged,
+            crate::error::VAULT_KEY_CHANGED_MSG.to_string(),
+        )
+    } else {
+        (
+            ScCode::UnknownConnection,
+            format!("unknown connection '{}'", conn),
+        )
+    }
+}
+
 /// Stamp what approving a Use op grants into its (signed) scope, so what the
 /// approver reads is what apply does (design/approvals-inbox.md D1): `level`,
 /// then the reuse fields and `window_s` from [`crate::approval::Reuse`] (the
@@ -1543,7 +1578,7 @@ fn body_over_cap(declared: u64, cap: u64) -> Response<Body> {
         ScCode::BrokerBodyLimit,
         &format!(
             "this request names a phantom but its {} exceeds the broker's inspectable \
-             cap ({} bytes) — the proxy will not forward a credential alongside a body \
+             cap ({} bytes). The proxy will not forward a credential alongside a body \
              policy cannot see. If the request is legitimate, raise the daemon's \
              --body-cap / SAFECLAW_BODY_CAP.",
             what, cap
@@ -1585,10 +1620,10 @@ fn egress_error_parts(is_connect: bool, cause: &str, has_proxy: bool) -> (ScCode
         );
     }
     let hint = if has_proxy {
-        "Egress goes through your configured proxy — make sure it's up and can reach \
+        "Egress goes through your configured proxy. Make sure it's up and can reach \
          that host (`sc proxy show`), or change it with `sc proxy set <url>` / `sc proxy clear`."
     } else {
-        "No egress proxy is set — if this machine reaches the internet only through a \
+        "No egress proxy is set. If this machine reaches the internet only through a \
          proxy, run `sc proxy set <url>`."
     };
     (
@@ -1669,7 +1704,7 @@ fn write_forward_audit(
     target: Option<&str>,
     code: Option<ScCode>,
 ) {
-    let Ok(store) = state.audits.for_vault(&p.vault_id) else {
+    let Ok(store) = state.audit_for_vault(&p.vault_id) else {
         return;
     };
     let now = now_secs() as i64;
@@ -1707,6 +1742,17 @@ fn write_forward_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_connection_names_a_changed_key_only_when_flagged() {
+        let (code, message) = unknown_connection_refusal(false, "future");
+        assert_eq!(code, ScCode::UnknownConnection);
+        assert_eq!(message, "unknown connection 'future'");
+
+        let (code, message) = unknown_connection_refusal(true, "future");
+        assert_eq!(code, ScCode::VaultKeyChanged);
+        assert_eq!(message, crate::error::VAULT_KEY_CHANGED_MSG);
+    }
 
     fn b64(s: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(s)

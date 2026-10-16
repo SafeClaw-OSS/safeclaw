@@ -66,7 +66,7 @@ impl VaultDir {
     /// Recursively delete the vault's directory (vault.dat + any files/
     /// blobs alongside). Idempotent: no error if the directory is already
     /// missing. Caller is responsible for any in-memory state cleanup
-    /// (e.g. flushing the vault_states cache).
+    /// (e.g. closing the vault runtime).
     pub fn remove(&self, vault_id: &str) -> Result<()> {
         let d = self.dir_for(vault_id)?;
         if d.exists() {

@@ -294,10 +294,12 @@ pub async fn fetch_passkeys_json(custodian: &str, vault: &str) -> Result<Vec<Val
             .and_then(|b| serde_json::from_str::<Value>(&b).ok())
             .and_then(|v| v["message"].as_str().map(str::to_string))
             .unwrap_or_default();
+        // The daemon's own sentence is the message (e.g. a vault this device can no
+        // longer use); the status line only when it gave none.
         return Err(if msg.is_empty() {
             format!("passkeys HTTP {}", status)
         } else {
-            format!("passkeys HTTP {}: {}", status, msg)
+            msg
         });
     }
     let body: Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
@@ -306,7 +308,7 @@ pub async fn fetch_passkeys_json(custodian: &str, vault: &str) -> Result<Vec<Val
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if !vault_exists {
-        return Err("vault not found on this custodian — run `safeclaw vault create`".into());
+        return Err("this device holds no such vault. Run `sc vault ls`".into());
     }
     let passkeys = body["passkeys"]
         .as_array()
@@ -356,7 +358,7 @@ async fn handle_done(
     if let Some(tx) = state.tx.lock().await.take() {
         let _ = tx.send(params);
     }
-    (StatusCode::OK, "OK — you can close this tab.\n")
+    (StatusCode::OK, "OK. You can close this tab.\n")
 }
 
 /// True if the shell looks like an SSH session — set by sshd in any
@@ -413,7 +415,7 @@ fn print_ssh_tunnel_hint(custodian: &str, cb_port: Option<u16>) {
             };
             eprintln!();
             eprintln!("note: looks like you're SSH'd in. The browser callback runs on this");
-            eprintln!("      server but your browser lives on your laptop — you need a tunnel.");
+            eprintln!("      server but your browser lives on your laptop. You need a tunnel.");
             eprintln!();
             eprintln!("Do both, once:");
             eprintln!();

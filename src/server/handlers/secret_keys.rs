@@ -52,9 +52,12 @@ pub async fn secret_keys(
     // network work — list() is async and we don't want to hold the
     // vault-states mutex across an await.
     let (mut native_keys, external_stores, init_errors) = {
-        let states = state.vault_states.lock().unwrap();
-        let cache = match states.get(&vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache,
+        let runtime = state
+            .runtime_if_present(&vault_id)
+            .ok_or(AppError::VaultLocked)?;
+        let runtime_state = runtime.state.lock().unwrap();
+        let cache = match &*runtime_state {
+            VaultState::Unlocked { cache, .. } => cache,
             _ => return Err(AppError::VaultLocked),
         };
         let native: Vec<String> = cache.native_keys.iter().cloned().collect();

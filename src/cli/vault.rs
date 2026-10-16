@@ -67,7 +67,7 @@ async fn run_ls(json: bool) -> Result<(), String> {
         return Ok(());
     }
     if known.is_empty() {
-        println!("(no vaults yet — `safeclaw vault create` or `safeclaw vault use`)");
+        println!("(no vaults yet; `safeclaw vault create` or `safeclaw vault use`)");
         return Ok(());
     }
     for (i, kv) in known.iter().enumerate() {
@@ -134,7 +134,7 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
         VaultState::Unreachable => {
             if is_localhost(&custodian) {
                 eprintln!(
-                    "warning: no local daemon at {} — start one with `safeclaw c start`",
+                    "warning: no local daemon at {}. Start one with `safeclaw c start`",
                     custodian
                 );
                 eprintln!(
@@ -158,7 +158,7 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
                 pin
             );
             eprintln!(
-                "      the new default applies everywhere else — `unset SAFECLAW_VAULT_ID` to follow it here"
+                "      the new default applies everywhere else; `unset SAFECLAW_VAULT_ID` to follow it here"
             );
         }
     }
@@ -170,7 +170,7 @@ async fn run_forget(args: VaultForgetArgs) -> Result<(), String> {
         resolve_url_or_idx(&arg)?
     } else {
         if known_vaults().is_empty() {
-            return Err("no vaults in known list — nothing to forget".into());
+            return Err("no vaults in known list. Nothing to forget".into());
         }
         let url = interactive_pick(OnEmpty::Abort)?.ok_or("cancelled")?;
         split_vault_url(&url).ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL: {}", url))?
@@ -286,7 +286,7 @@ async fn run_rm(args: VaultDeleteArgs) -> Result<(), String> {
         let mut buf = String::new();
         io::stdin().read_line(&mut buf).map_err(|e| e.to_string())?;
         if buf.trim() != vault {
-            return Err("confirmation mismatch — aborted".into());
+            return Err("confirmation mismatch. Aborted".into());
         }
     }
 
@@ -313,7 +313,7 @@ async fn run_rm(args: VaultDeleteArgs) -> Result<(), String> {
         &opts,
     )
     .await?;
-    eprintln!("safeclaw vault rm — ok (vault {} wiped)", vault);
+    eprintln!("safeclaw vault rm: ok (vault {} wiped)", vault);
     Ok(())
 }
 

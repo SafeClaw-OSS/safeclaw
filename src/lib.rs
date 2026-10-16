@@ -45,3 +45,4 @@ pub mod sync;
 pub mod sync_stream;
 pub mod team_hooks;
 pub mod util;
+pub mod vault_runtime;

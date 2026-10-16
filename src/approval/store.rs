@@ -206,6 +206,21 @@ impl ApprovalStore {
         Self::default()
     }
 
+    /// Reject every pending operation for `vault_id`, returning the ids whose
+    /// waiters must be notified.
+    pub fn reject_vault(&mut self, vault_id: &str, reason: &str) -> Vec<String> {
+        let mut rejected = Vec::new();
+        for rec in self.inner.values_mut() {
+            if rec.vault_id == vault_id && rec.is_live() {
+                rec.status = ApprovalStatus::Rejected {
+                    reason: reason.to_string(),
+                };
+                rejected.push(rec.id.clone());
+            }
+        }
+        rejected
+    }
+
     /// Create a new pending approval. Returns the new approval id.
     pub fn create(&mut self, vault_id: String, op: Operation, r: String) -> String {
         self.create_bound(vault_id, op, r, None, None)

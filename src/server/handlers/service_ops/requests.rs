@@ -54,9 +54,10 @@ pub(crate) enum Step {
 /// Whether request `body` carries its answer (`prepared`, `up_to_date` or
 /// `error`).
 fn answered(body: &Value) -> bool {
-    ["prepared", "up_to_date", "error"]
-        .iter()
-        .any(|k| body.get(*k).is_some_and(|v| !v.is_null() && *v != json!(false)))
+    ["prepared", "up_to_date", "error"].iter().any(|k| {
+        body.get(*k)
+            .is_some_and(|v| !v.is_null() && *v != json!(false))
+    })
 }
 
 /// The step for request `body` on the device `me`, paired to the account
@@ -109,8 +110,10 @@ impl ItemPush for Cloud {
         let cloud = cfg.cloud_backend.filter(|s| !s.is_empty())?;
         let dk = crate::sync::device_key()?;
         Some(
-            crate::sync::push_item(&cloud, vault, &dk, item_id, base, version, ct_b64, generation)
-                .await,
+            crate::sync::push_item(
+                &cloud, vault, &dk, item_id, base, version, ct_b64, generation,
+            )
+            .await,
         )
     }
 }
@@ -133,17 +136,23 @@ pub(crate) async fn write<P: ItemPush>(
     push: &P,
 ) -> Result<Written, String> {
     type S = sudp::primitives::StdPrimitives;
-    let lock = state.vault_write_lock(vault);
-    let _guard = lock.lock().await;
+    let _guard = state
+        .vault_write_guard(vault)
+        .await
+        .map_err(|e| e.to_string())?;
     let k = state
         .cloned_state_key(vault)
         .ok_or_else(|| crate::error::VAULT_LOCKED_MSG.to_string())?;
     let keys = VaultKeys::from_material(&k);
-    let path = state.vaults.per_item_path(vault).map_err(|e| e.to_string())?;
+    let path = state
+        .vaults
+        .per_item_path(vault)
+        .map_err(|e| e.to_string())?;
     let mut pv = crate::storage::sealed_vault::read_per_item(&path)
         .map_err(|e| e.to_string())?
         .ok_or("this vault has no item store")?;
-    let id = wire_id_for::<S>(keys.id_seed, ItemNs::ServiceRequest, name).map_err(|e| e.to_string())?;
+    let id =
+        wire_id_for::<S>(keys.id_seed, ItemNs::ServiceRequest, name).map_err(|e| e.to_string())?;
     let (version, synced) = pv
         .items
         .get(&id)
@@ -153,8 +162,15 @@ pub(crate) async fn write<P: ItemPush>(
         Some(b) => ItemPayload::live(ItemNs::ServiceRequest, name, b),
         None => ItemPayload::tombstone(ItemNs::ServiceRequest, name),
     };
-    pv.seal_and_upsert::<S>(keys, vault, ItemNs::ServiceRequest, name, version + 1, &payload)
-        .map_err(|e| e.to_string())?;
+    pv.seal_and_upsert::<S>(
+        keys,
+        vault,
+        ItemNs::ServiceRequest,
+        name,
+        version + 1,
+        &payload,
+    )
+    .map_err(|e| e.to_string())?;
     let row = pv.items[&id].clone();
     let ct = URL_SAFE_NO_PAD.encode(&row.ct);
     let base = (synced > 0).then_some(synced);
@@ -171,10 +187,17 @@ pub(crate) async fn write<P: ItemPush>(
         }
         Some(Ok(PushOutcome::Conflict { .. })) => return Ok(Written::Taken),
         Some(Ok(PushOutcome::Rejected { status, error })) => {
-            return Err(format!("the cloud refused the write ({}: {})", status, error))
+            return Err(format!(
+                "the cloud refused the write ({}: {})",
+                status, error
+            ))
         }
         Some(Ok(PushOutcome::KeysetChanged)) => {
             return Err("the vault key changed; the request waits for the next sync".into())
+        }
+        Some(Ok(PushOutcome::Revoked(membership))) => {
+            crate::sync::schedule_revoke_vault_access(state, vault, membership);
+            return Err(crate::error::VAULT_ACCESS_REVOKED_MSG.into());
         }
         Some(Err(e)) => return Err(e),
     }
@@ -221,8 +244,7 @@ pub(crate) async fn prepare<A: GitHubApi>(
         [id] if files.single => Some(id.as_str()),
         _ => None,
     };
-    let admitted =
-        source::admit_files(&files, keep).map_err(|p| source::problems_text(src, &p))?;
+    let admitted = source::admit_files(&files, keep).map_err(|p| source::problems_text(src, &p))?;
     let digest = |svc: &str, pol: Option<&str>| source::definition_digest(svc, pol);
     let unchanged = !mine.is_empty()
         && mine.len() == admitted.len()
@@ -251,8 +273,10 @@ pub(crate) async fn prepare<A: GitHubApi>(
     if !built_in.is_empty() {
         return Err(source::problems_text(src, &built_in));
     }
-    let snapshot: BTreeMap<String, crate::service::ServiceDef> =
-        admitted.iter().map(|a| (a.id.clone(), a.def.clone())).collect();
+    let snapshot: BTreeMap<String, crate::service::ServiceDef> = admitted
+        .iter()
+        .map(|a| (a.id.clone(), a.def.clone()))
+        .collect();
     let texts: BTreeMap<String, (String, Option<String>)> = admitted
         .iter()
         .map(|a| (a.id.clone(), (a.service.clone(), a.policy.clone())))
@@ -269,10 +293,15 @@ pub(crate) async fn prepare<A: GitHubApi>(
                 stated.clone(),
                 &a.def,
             );
-            Ok((a.id.clone(), serde_json::to_value(e).map_err(|e| e.to_string())?))
+            Ok((
+                a.id.clone(),
+                serde_json::to_value(e).map_err(|e| e.to_string())?,
+            ))
         })
         .collect::<Result<_, String>>()?;
-    Ok(Some(json!({ "card": card, "store": store, "remove": c.removes })))
+    Ok(Some(
+        json!({ "card": card, "store": store, "remove": c.removes }),
+    ))
 }
 
 /// Request `name` as this device's store holds it now (`None`: removed or
@@ -283,7 +312,12 @@ fn current(state: &AppState, vault: &str, name: &str) -> Option<Value> {
     let path = state.vaults.per_item_path(vault).ok()?;
     let pv = crate::storage::sealed_vault::read_per_item(&path).ok()??;
     let payload = pv
-        .open_item::<S>(VaultKeys::from_material(&k), vault, ItemNs::ServiceRequest, name)
+        .open_item::<S>(
+            VaultKeys::from_material(&k),
+            vault,
+            ItemNs::ServiceRequest,
+            name,
+        )
         .ok()??;
     (!payload.is_tombstone()).then_some(payload.body)
 }

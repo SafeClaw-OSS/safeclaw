@@ -68,12 +68,12 @@ fn resolve_conn_id(args: &mut ConnectArgs) -> Result<String, String> {
         let id = slugify_conn_id(&raw);
         if id.is_empty() {
             return Err(format!(
-                "'{}' has no usable id characters — choose a handle with letters or digits",
+                "'{}' has no usable id characters. Choose a handle with letters or digits",
                 raw
             ));
         }
         if id != raw {
-            eprintln!("safeclaw connect — using id '{}' (from '{}')", id, raw);
+            eprintln!("safeclaw connect: using id '{}' (from '{}')", id, raw);
         }
         return Ok(id);
     }
@@ -278,7 +278,7 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     if !args.yes {
         if !std::io::stdin().is_terminal() {
             return Err(format!(
-                "refusing to remove connection '{}' without confirmation — pass `--yes` (non-interactive)",
+                "refusing to remove connection '{}' without confirmation. Pass `--yes` (non-interactive)",
                 id
             ));
         }
@@ -393,7 +393,7 @@ async fn run_raw(
         prompt_hosts(name)?
     } else {
         return Err(
-            "a raw connection needs at least one host — pass `--host <domain>` (repeatable), or `--service <id>` to bind a catalog service".into(),
+            "a raw connection needs at least one host. Pass `--host <domain>` (repeatable), or `--service <id>` to bind a catalog service".into(),
         );
     };
     for h in &hosts {
@@ -486,7 +486,7 @@ async fn run_service_backed(
     let reg = ServiceRegistry::load();
     let def = reg.get(service).ok_or_else(|| {
         format!(
-            "unknown service '{}' — see `sc registry`; per-vault custom services are connected in the console",
+            "unknown service '{}'. See `sc registry`; per-vault custom services are connected in the console",
             service
         )
     })?;
@@ -510,7 +510,7 @@ async fn run_service_backed(
                 .any(|e| crate::core::host::wildcard_matches(e, h));
             if !ok {
                 return Err(format!(
-                    "host '{}' is not within service '{}' hosts ({}) — a --service pin must be ⊆ the service's hosts",
+                    "host '{}' is not within service '{}' hosts ({}). A --service pin must be ⊆ the service's hosts",
                     h,
                     service,
                     service_hosts.join(", ")
@@ -618,7 +618,7 @@ async fn run_service_backed(
         .map(|p| p.join(", "))
         .unwrap_or_else(|| service_hosts.join(", "));
     eprintln!(
-        "safeclaw connect — '{}' → {} ({})",
+        "safeclaw connect: '{}' → {} ({})",
         name, service, host_line
     );
     for ph in &phantoms {
@@ -1045,7 +1045,7 @@ pub(crate) fn prompt_line(prompt: &str) -> Result<String, String> {
 /// Report the advertised phantom(s) for a raw connection: sole → short form,
 /// several → role-qualified (matches the resolver's form-A grammar).
 fn report_phantoms(name: &str, hosts: &[String], secret_keys: &[String]) {
-    eprintln!("safeclaw connect — '{}' → {}", name, hosts.join(", "));
+    eprintln!("safeclaw connect: '{}' → {}", name, hosts.join(", "));
     let phantoms = crate::core::host::phantoms_for_raw(name, secret_keys);
     for ph in phantoms.values() {
         eprintln!("  phantom: {}", ph);
