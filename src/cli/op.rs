@@ -70,7 +70,7 @@ fn verdict(status: &str) -> Verdict {
 
 fn not_answering(root: &str, op_id: &str) -> String {
     format!(
-        "daemon not answering at {} — the op survives; re-run `sc op wait {}` once it's back",
+        "daemon not answering at {}. The op survives; re-run `sc op wait {}` once it's back",
         root, op_id
     )
 }
@@ -126,7 +126,7 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
                 eprintln!(
-                    "expired or unknown — re-run the original command to mint a fresh approval"
+                    "expired or unknown. Re-run the original command to mint a fresh approval"
                 );
                 std::process::exit(3);
             }
@@ -145,7 +145,7 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                         match verdict(status) {
                             Verdict::Approved => {
                                 println!("{}", body);
-                                eprintln!("approved ✓ — re-run the original command");
+                                eprintln!("approved ✓. Re-run the original command");
                                 std::process::exit(0);
                             }
                             Verdict::Rejected => {
@@ -155,15 +155,15 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                                 match not_approved(reason) {
                                     NotApproved::Superseded => {
                                         eprintln!(
-                                            "superseded by a newer approval request — \
-                                             re-run the original command"
+                                            "superseded by a newer approval request. \
+                                             Re-run the original command"
                                         );
                                         std::process::exit(6);
                                     }
                                     NotApproved::Withdrawn => {
                                         eprintln!(
-                                            "withdrawn by the requester, not rejected — \
-                                             re-run the original command to ask again"
+                                            "withdrawn by the requester, not rejected. \
+                                             Re-run the original command to ask again"
                                         );
                                         std::process::exit(6);
                                     }
@@ -174,7 +174,7 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                                         eprintln!("not approved ✗ ({}); fix the cause, then re-run", r);
                                     }
                                     NotApproved::Rejected => {
-                                        eprintln!("rejected ✗ by the approver — do not retry");
+                                        eprintln!("rejected ✗ by the approver. Do not retry");
                                     }
                                 }
                                 std::process::exit(5);
@@ -196,7 +196,7 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
         }
         if Instant::now() >= deadline {
             eprintln!(
-                "timed out after {}s — if the op is still pending, `sc op wait {}` re-attaches",
+                "timed out after {}s. If the op is still pending, `sc op wait {}` re-attaches",
                 args.timeout, args.op_id
             );
             std::process::exit(4);

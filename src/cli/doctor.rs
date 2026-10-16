@@ -135,7 +135,7 @@ pub async fn run(json: bool) -> Result<(), String> {
         Ok(p) => report.push(
             Mark::Warn,
             format!(
-                "config: {} (missing — run `safeclaw vault create`)",
+                "config: {} (missing; run `safeclaw vault create`)",
                 p.display()
             ),
         ),
@@ -202,7 +202,7 @@ pub async fn run(json: bool) -> Result<(), String> {
                 );
             }
         }
-        Err(e) => report.push(Mark::Fail, format!("custodian: unreachable — {}", e)),
+        Err(e) => report.push(Mark::Fail, format!("custodian: unreachable: {}", e)),
     }
 
     // Vault dir exists?
@@ -310,7 +310,7 @@ pub async fn run(json: bool) -> Result<(), String> {
             }
             None => report.push(
                 Mark::Warn,
-                "cloud backend: not paired — run `sc login`",
+                "cloud backend: not paired. Run `sc login`",
             ),
         },
         // A config-load failure already surfaced as a `fail` row above.

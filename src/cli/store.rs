@@ -57,7 +57,7 @@ async fn ls(custodian: &str, vault: &str, json: bool) -> Result<(), String> {
         .await
         .map_err(|e| format!("reach custodian: {}", e))?;
     if resp.status().as_u16() == 409 {
-        return Err("vault locked — run `safeclaw unlock` first".into());
+        return Err("vault locked. Run `safeclaw unlock` first".into());
     }
     if !resp.status().is_success() {
         return Err(format!(
@@ -132,7 +132,7 @@ async fn ls(custodian: &str, vault: &str, json: bool) -> Result<(), String> {
         );
     }
     for e in &body.store_errors {
-        eprintln!("note: store {} list failed — {}", e.store_id, e.error);
+        eprintln!("note: store {} list failed: {}", e.store_id, e.error);
     }
     Ok(())
 }

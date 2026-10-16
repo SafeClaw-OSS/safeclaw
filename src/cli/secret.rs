@@ -39,7 +39,7 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
     let key = args.key.trim().to_ascii_uppercase();
     if !valid_role(&key) {
         return Err(format!(
-            "'{}' is not a valid secret key — use UPPERCASE letters, digits and '_' (e.g. STRIPE_KEY)",
+            "'{}' is not a valid secret key. Use UPPERCASE letters, digits and '_' (e.g. STRIPE_KEY)",
             args.key.trim()
         ));
     }
@@ -148,7 +148,7 @@ fn print_set_result(key: &str, conn: &str, intent: &BrokerIntent, result: &serde
                 .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
                 .unwrap_or_default();
             if hosts.is_empty() {
-                eprintln!("  stored · host binding unchanged (none anchored — the agent can't use it until you set a host)");
+                eprintln!("  stored · host binding unchanged (none anchored; the agent can't use it until you set a host)");
             } else {
                 eprintln!(
                     "  connection '{}' → {} (unchanged) · phantom __sc__{}__",
@@ -168,7 +168,7 @@ fn print_set_result(key: &str, conn: &str, intent: &BrokerIntent, result: &serde
             {
                 eprintln!("  removed the prior host anchor for '{}'", conn);
             }
-            eprintln!("  stored · no host anchored — agent cannot use this item (`sc secret get` reveals it for a human)");
+            eprintln!("  stored · no host anchored. Agent cannot use this item (`sc secret get` reveals it for a human)");
         }
         BrokerIntent::Host(hosts) => {
             eprintln!(
@@ -179,7 +179,7 @@ fn print_set_result(key: &str, conn: &str, intent: &BrokerIntent, result: &serde
             );
         }
     }
-    eprintln!("safeclaw set — {} written", key);
+    eprintln!("safeclaw set: {} written", key);
 }
 
 /// Decide the broker binding for `sc set`. Host is a REQUIRED answer (spec §11):
@@ -217,7 +217,7 @@ fn resolve_broker_intent(
         Ok(BrokerIntent::Host(vec![entered]))
     } else {
         Err(format!(
-            "'{}' needs a host so the agent can use it — pass `--host <domain>` (the API's domain, e.g. api.stripe.com), or `--no-broker` to store it for humans only",
+            "'{}' needs a host so the agent can use it. Pass `--host <domain>` (the API's domain, e.g. api.stripe.com), or `--no-broker` to store it for humans only",
             key
         ))
     }
@@ -227,7 +227,7 @@ fn resolve_broker_intent(
 fn prompt_secret_value(key: &str) -> Result<String, String> {
     if !std::io::stdin().is_terminal() {
         return Err(format!(
-            "no value given for '{}' — pass it as an argument (non-interactive input isn't a terminal)",
+            "no value given for '{}'. Pass it as an argument (non-interactive input isn't a terminal)",
             key
         ));
     }
@@ -304,7 +304,7 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
         .unwrap_or_default();
     if !refs.is_empty() {
         eprintln!(
-            "note: {} is referenced by connection(s): {} — they turn unconfigured until the key is re-added",
+            "note: {} is referenced by connection(s): {}. They turn unconfigured until the key is re-added",
             key,
             refs.join(", ")
         );
@@ -342,7 +342,7 @@ pub async fn run_get(args: GetArgs) -> Result<(), String> {
     let value = body
         .get("value")
         .and_then(|v| v.as_str())
-        .ok_or("no value in response — op may have been consumed")?;
+        .ok_or("no value in response. Op may have been consumed")?;
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
     out.write_all(value.as_bytes())

@@ -340,7 +340,7 @@ impl BrokerHandler {
             return err_response(
                 ScCode::MultiConnection,
                 &format!(
-                    "one connection per request — this request names {}",
+                    "one connection per request: this request names {}",
                     conns.join(", ")
                 ),
             )
@@ -407,7 +407,7 @@ impl BrokerHandler {
             None => {
                 return err_response(
                     ScCode::NoVault,
-                    "no vault bound — route credential traffic with `sc run`",
+                    "no vault bound. Route credential traffic with `sc run`",
                 )
                 .into()
             }
@@ -418,7 +418,7 @@ impl BrokerHandler {
         if self.state.is_vault_upgrade_required(&vault_id) {
             return err_response(
                 ScCode::UpgradeRequired,
-                "SafeClaw needs an update to use this vault — run `sc upgrade`",
+                "SafeClaw needs an update to use this vault. Run `sc upgrade`",
             )
             .into();
         }
@@ -729,7 +729,7 @@ impl BrokerHandler {
                                     ScCode::StoreUnavailable,
                                     &format!(
                                         "external store '{}' failed while resolving this \
-                                         connection's secret — check the store's credentials \
+                                         connection's secret. Check the store's credentials \
                                          and permissions (daemon logs have the full error)",
                                         store_id
                                     ),
@@ -761,7 +761,7 @@ impl BrokerHandler {
                     return err_response(
                         ScCode::AmbiguousPhantom,
                         &format!(
-                            "'{}' exposes several secrets — use a role phantom: {}",
+                            "'{}' exposes several secrets. Use a role phantom: {}",
                             conn, roles
                         ),
                     )
@@ -841,7 +841,7 @@ impl BrokerHandler {
             return err_response(
                 ScCode::PhantomUnresolved,
                 "a SafeClaw phantom in this request could not be resolved, so the request was \
-                 blocked before the placeholder could reach upstream — check the connection/role \
+                 blocked before the placeholder could reach upstream. Check the connection/role \
                  name (`sc registry`), or run `sc unlock` if the vault is locked",
             )
             .into();
@@ -1543,7 +1543,7 @@ fn body_over_cap(declared: u64, cap: u64) -> Response<Body> {
         ScCode::BrokerBodyLimit,
         &format!(
             "this request names a phantom but its {} exceeds the broker's inspectable \
-             cap ({} bytes) — the proxy will not forward a credential alongside a body \
+             cap ({} bytes). The proxy will not forward a credential alongside a body \
              policy cannot see. If the request is legitimate, raise the daemon's \
              --body-cap / SAFECLAW_BODY_CAP.",
             what, cap
@@ -1585,10 +1585,10 @@ fn egress_error_parts(is_connect: bool, cause: &str, has_proxy: bool) -> (ScCode
         );
     }
     let hint = if has_proxy {
-        "Egress goes through your configured proxy — make sure it's up and can reach \
+        "Egress goes through your configured proxy. Make sure it's up and can reach \
          that host (`sc proxy show`), or change it with `sc proxy set <url>` / `sc proxy clear`."
     } else {
-        "No egress proxy is set — if this machine reaches the internet only through a \
+        "No egress proxy is set. If this machine reaches the internet only through a \
          proxy, run `sc proxy set <url>`."
     };
     (

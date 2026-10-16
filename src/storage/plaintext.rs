@@ -656,7 +656,7 @@ impl VaultPlaintextView {
             .map_err(|e| AppError::Internal(format!("vault aux parse: {}", e)))?;
         if aux.version != PLAINTEXT_VERSION {
             return Err(AppError::Internal(format!(
-                "vault plaintext version {} (expected {}) — vault is from an older binary; re-enroll required",
+                "vault plaintext version {} (expected {}). Vault is from an older binary; re-enroll required",
                 aux.version, PLAINTEXT_VERSION
             )));
         }

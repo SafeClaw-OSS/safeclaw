@@ -32,7 +32,7 @@ fn normalize(url: &str) -> String {
 async fn set(url: String) -> Result<(), String> {
     let url = normalize(&url);
     if egress_proxy::load().as_deref() == Some(url.as_str()) {
-        eprintln!("Egress proxy already set to {url} — nothing to do.");
+        eprintln!("Egress proxy already set to {url}. Nothing to do.");
         return Ok(());
     }
     egress_proxy::store(&url)?;
@@ -78,7 +78,7 @@ fn get() -> Result<(), String> {
 /// already persisted); we just tell the user how it'll take effect.
 async fn apply_live() -> Result<(), String> {
     if !service::unit_installed() {
-        eprintln!("  (no daemon installed yet — it'll take effect on `sc up`.)");
+        eprintln!("  (no daemon installed yet; it'll take effect on `sc up`.)");
         return Ok(());
     }
     let cfg = active::load().unwrap_or_default();
@@ -100,13 +100,13 @@ async fn apply_live() -> Result<(), String> {
         }
         Ok(r) => {
             eprintln!(
-                "  (daemon returned HTTP {} — restart to apply: `sc restart`)",
+                "  (daemon returned HTTP {}; restart to apply: `sc restart`)",
                 r.status()
             );
             Ok(())
         }
         Err(_) => {
-            eprintln!("  (daemon not reachable — it'll take effect on next `sc up`.)");
+            eprintln!("  (daemon not reachable; it'll take effect on next `sc up`.)");
             Ok(())
         }
     }

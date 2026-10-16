@@ -200,7 +200,7 @@ pub async fn resolve_auth_value(
                         // The stored key itself was refused — reconnect territory.
                         state.oauth_mark_reauth(vault_id, conn_id);
                         AppError::Unauthorized(format!(
-                            "snaplii api key rejected — reconnect {}",
+                            "snaplii api key rejected. Reconnect {}",
                             service_id
                         ))
                     } else {
@@ -262,7 +262,7 @@ pub async fn resolve_auth_value(
         if e.contains("invalid_grant") {
             state.oauth_mark_reauth(vault_id, conn_id);
             AppError::Unauthorized(format!(
-                "oauth2 refresh_token invalid — reconnect {}",
+                "oauth2 refresh_token invalid. Reconnect {}",
                 service_id
             ))
         } else if let Some(transport) = e.strip_prefix("oauth2 refresh request failed: ") {
