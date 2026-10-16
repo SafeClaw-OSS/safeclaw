@@ -99,19 +99,42 @@ fn http_detail(status: reqwest::StatusCode, body: &str) -> String {
     }
 }
 
+/// A principal's pairing name: trimmed, at most 200 UTF-16 units (the backend's
+/// limit), and a default when empty.
+fn pairing_name(raw: &str, kind: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return if kind == "agent" { "agent" } else { "agent-device" }.to_string();
+    }
+    let mut out = String::new();
+    let mut units = 0;
+    for c in trimmed.chars() {
+        units += c.len_utf16();
+        if units > 200 {
+            break;
+        }
+        out.push(c);
+    }
+    out.trim_end().to_string()
+}
+
 /// Run the pairing to approval. Every failure after the code is shown ends the
 /// code; the user starts again with `req.restart`.
 pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Paired, String> {
     validate_request(req)?;
     let cloud = req.cloud.trim_end_matches('/');
+    // The name is on the approval card and inside keys_mac, so the one sent is the
+    // one MAC'd: normalized here, once, never by the server.
+    let names: Vec<String> = req.entries.iter().map(|e| pairing_name(e.name, e.kind)).collect();
     let principals: Vec<Value> = req
         .entries
         .iter()
-        .map(|entry| {
+        .zip(&names)
+        .map(|(entry, name)| {
             let mut value = json!({
                 "kind": entry.kind,
                 "id": entry.id,
-                "name": entry.name,
+                "name": name,
                 // Standard base64, as the backend's self-certification check expects.
                 "id_pub": STANDARD.encode(entry.signer.public_bytes()),
             });
@@ -268,10 +291,11 @@ pub async fn pair(client: &reqwest::Client, req: &PairRequest<'_>) -> Result<Pai
                     .entries
                     .iter()
                     .zip(&id_pubs)
-                    .map(|(entry, id_pub)| pairing::PairEntry {
+                    .zip(&names)
+                    .map(|((entry, id_pub), name)| pairing::PairEntry {
                         kind: entry.kind,
                         id: entry.id,
-                        name: entry.name,
+                        name,
                         id_pub,
                         sc_pk: entry.sc_pk.as_ref().map(|pk| &pk[..]).unwrap_or(&[]),
                     })
@@ -420,6 +444,22 @@ fn validate_request(req: &PairRequest<'_>) -> Result<(), String> {
         return Err("pairing entry ids must be unique".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::pairing_name;
+
+    #[test]
+    fn the_pairing_name_is_trimmed_bounded_and_never_empty() {
+        assert_eq!(pairing_name("  codex ", "agent"), "codex");
+        assert_eq!(pairing_name("   ", "agent"), "agent");
+        assert_eq!(pairing_name("", "device"), "agent-device");
+        let long = "x".repeat(250);
+        assert_eq!(pairing_name(&long, "device").encode_utf16().count(), 200);
+        let emoji = "😀".repeat(150);
+        assert!(pairing_name(&emoji, "agent").encode_utf16().count() <= 200);
+    }
 }
 
 #[cfg(test)]
