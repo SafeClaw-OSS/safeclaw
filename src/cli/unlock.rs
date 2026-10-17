@@ -32,9 +32,21 @@ async fn drive(custom_op: &str, verb: &str, args: UnlockArgs) -> Result<(), Stri
 
     // Already in the asked-for state: say so instead of minting an approval, so
     // re-running after an approval (what `sc op wait` says to do) ends here.
+    // An unlocked vault whose key was replaced (a member was removed) still needs
+    // this approval: the device holds only the old key, so it is not done.
     let state = crate::cli::status::fetch_status(&custodian, &vault).await.state;
+    let key_changed = match (custom_op, &state) {
+        ("vault-unlock", VaultState::Unlocked { .. }) => {
+            let client = crate::cli::webauthn::http_client()?;
+            crate::cli::status::fetch_held(&client, &custodian, &vault)
+                .await
+                .iter()
+                .any(|line| line == crate::error::VAULT_KEY_CHANGED_STATUS_MSG)
+        }
+        _ => false,
+    };
     let done = match (custom_op, &state) {
-        ("vault-unlock", VaultState::Unlocked { .. }) => Some("unlocked"),
+        ("vault-unlock", VaultState::Unlocked { .. }) if !key_changed => Some("unlocked"),
         ("vault-lock", VaultState::Locked { .. }) => Some("locked"),
         _ => None,
     };
