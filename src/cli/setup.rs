@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::cli::human_action::{self, SetupStatus};
-use crate::config::{LoginArgs, SetupArgs, SetupPhase};
+use crate::cli::human_action::{self, SetupEntry, SetupStatus};
+use crate::config::{SetupArgs, SetupPhase};
 
 struct Context {
     name: String,
@@ -67,14 +67,22 @@ pub async fn run(args: SetupArgs, json_output: bool) -> Result<(), i32> {
             Progress::Emitted => return Ok(()),
         }
 
+        let identity_path = match crate::identity_file::agent_identity_path(&context.name) {
+            Ok(path) => path,
+            Err(e) => {
+                emit_error(json_output, &e, &base_command(&context));
+                return Err(1);
+            }
+        };
         let cfg = crate::cli::active::load().unwrap_or_default();
-        if !device_paired(&cfg) {
-            match spawn_and_report(&context, SetupPhase::Device, json_output).await? {
+        if !device_paired(&cfg) || !identity_path.is_file() {
+            match spawn_and_report(&context, SetupPhase::Pairing, json_output).await? {
                 Progress::Continue => continue,
                 Progress::Emitted => return Ok(()),
             }
         }
 
+        let cfg = crate::cli::active::load().unwrap_or_default();
         let control = crate::cli::active::control_root(&cfg);
         if !crate::cli::status::probe_local_daemon(&control).await.up {
             if let Err(e) = crate::cli::service::ensure_running_with_fallback().await {
@@ -87,21 +95,6 @@ pub async fn run(args: SetupArgs, json_output: bool) -> Result<(), i32> {
             }
         }
 
-        let identity_path = match crate::identity_file::agent_identity_path(&context.name) {
-            Ok(path) => path,
-            Err(e) => {
-                emit_error(json_output, &e, &base_command(&context));
-                return Err(1);
-            }
-        };
-        if !identity_path.is_file() {
-            match spawn_and_report(&context, SetupPhase::Agent, json_output).await? {
-                Progress::Continue => continue,
-                Progress::Emitted => return Ok(()),
-            }
-        }
-
-        let cfg = crate::cli::active::load().unwrap_or_default();
         let broker_url = format!(
             "{}:{}",
             crate::cli::active::device_daemon_host(&cfg),
@@ -135,7 +128,9 @@ pub async fn run(args: SetupArgs, json_output: bool) -> Result<(), i32> {
 
         let mut notes = Vec::new();
         if skill.modified {
-            notes.push("The existing SafeClaw skill was modified, so it was left unchanged.".to_string());
+            notes.push(
+                "The existing SafeClaw skill was modified, so it was left unchanged.".to_string(),
+            );
         }
         notes.extend(skill.notes.clone());
         let vault_guidance = setup_vault_guidance(crate::cli::active::known_vaults().len());
@@ -183,7 +178,7 @@ async fn preconditions(
         .is_some_and(|backend| !backend.is_empty());
     if has_pairing {
         if let (Some(selected), Some(paired)) = (profile.as_deref(), cfg.cloud_backend.as_deref()) {
-            if paired.trim_end_matches('/') != cloud {
+            if !same_environment(paired, &cloud) {
                 return Err((
                     format!(
                         "This machine is already paired to {}, not the {} profile.",
@@ -194,18 +189,6 @@ async fn preconditions(
                     1,
                 ));
             }
-        }
-        if crate::sync::device_key().is_none() {
-            let fix = match profile.as_deref() {
-                Some(profile) => format!("sc login --profile {}", profile),
-                None => "sc login".to_string(),
-            };
-            return Err((
-                "This machine has pairing configuration but its device credential is missing."
-                    .to_string(),
-                fix,
-                1,
-            ));
         }
     }
 
@@ -277,11 +260,7 @@ async fn handle_prior_background(
     Ok(Progress::Continue)
 }
 
-async fn status_now(
-    context: &Context,
-    pid: u32,
-    json_output: bool,
-) -> Result<Progress, i32> {
+async fn status_now(context: &Context, pid: u32, json_output: bool) -> Result<Progress, i32> {
     let status_path = context.setup_dir.join("status.json");
     match human_action::read(&status_path) {
         Ok(status) => {
@@ -305,7 +284,10 @@ async fn status_now(
             }
         }
         _ => {
-            emit_waiting(json_output, &next_command(context, context.profile.as_deref()));
+            emit_waiting(
+                json_output,
+                &next_command(context, context.profile.as_deref()),
+            );
             Ok(Progress::Emitted)
         }
     }
@@ -446,11 +428,21 @@ async fn spawn_and_report(
             return consume_dead_status(context, &status_path, json_output);
         }
         if Instant::now() >= deadline {
-            emit_waiting(json_output, &next_command(context, context.profile.as_deref()));
+            emit_waiting(
+                json_output,
+                &next_command(context, context.profile.as_deref()),
+            );
             return Ok(Progress::Emitted);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Is the machine's paired backend (`https://api.dev.safeclaw.pro`, as the server
+/// returned it) the environment a `--profile` names (`https://dev.safeclaw.pro`)?
+fn same_environment(paired_backend: &str, profile_url: &str) -> bool {
+    crate::cli::active::derive_frontend_from_backend(paired_backend)
+        == profile_url.trim_end_matches('/')
 }
 
 fn spawn_background(context: &Context, phase: SetupPhase) -> Result<u32, String> {
@@ -465,7 +457,8 @@ fn spawn_background(context: &Context, phase: SetupPhase) -> Result<u32, String>
     }
     let mut lock = lock_options.open(&lock_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
-            "another setup background process is starting; re-run the same setup command".to_string()
+            "another setup background process is starting; re-run the same setup command"
+                .to_string()
         } else {
             format!("create {}: {}", lock_path.display(), e)
         }
@@ -526,6 +519,166 @@ fn spawn_background(context: &Context, phase: SetupPhase) -> Result<u32, String>
     Ok(child.id())
 }
 
+fn setup_entries(name: &str) -> Result<Vec<SetupEntry>, String> {
+    let cfg = crate::cli::active::load().unwrap_or_default();
+    let mut entries = Vec::new();
+    if !device_paired(&cfg) {
+        entries.push(SetupEntry {
+            kind: "device".into(),
+            name: crate::cli::login::device_name(None),
+        });
+    }
+    if !crate::identity_file::agent_identity_path(name)?.is_file() {
+        entries.push(SetupEntry {
+            kind: "agent".into(),
+            name: name.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+struct PreparedAgent {
+    path: PathBuf,
+    seed: zeroize::Zeroizing<[u8; 32]>,
+    id: String,
+    signer: crate::identity::SigningIdentity,
+}
+
+/// Pair every missing setup principal with one code, verify the complete set,
+/// then persist the device and agent material.
+async fn pair_missing_and_persist(name: &str, profile: Option<&str>) -> Result<(), String> {
+    let cfg = crate::cli::active::load().unwrap_or_default();
+    let need_device = !device_paired(&cfg);
+    let agent_path = crate::identity_file::agent_identity_path(name)?;
+    let need_agent = !agent_path.is_file();
+    if !need_device && !need_agent {
+        return Ok(());
+    }
+
+    let cloud = if need_device {
+        match profile {
+            Some(profile) => crate::cli::login::resolve_custodian(Some(profile))?,
+            None => cfg
+                .cloud_backend
+                .clone()
+                .filter(|value| !value.is_empty())
+                .map(Ok)
+                .unwrap_or_else(|| crate::cli::login::resolve_custodian(None))?,
+        }
+    } else {
+        cfg.cloud_backend
+            .clone()
+            .filter(|value| !value.is_empty())
+            .ok_or("this device isn't paired. Run sc login first")?
+    };
+    let cloud = cloud.trim_end_matches('/').to_string();
+    let origin = if need_device {
+        crate::cli::active::console_origin_for_backend(&cloud)
+    } else {
+        crate::cli::active::console_origin()
+            .ok_or("this machine isn't paired to SafeClaw yet. Run sc login first")?
+    };
+    let pinned = if need_device {
+        None
+    } else {
+        Some(
+            crate::cli::active::account_uik_pub()
+                .ok_or("this machine's pairing predates verified pairing. Run sc login first")?,
+        )
+    };
+
+    let device_name = crate::cli::login::device_name(None);
+    let device = need_device
+        .then(crate::cli::login::prepare_device)
+        .transpose()?;
+    let agent = if need_agent {
+        let (seed, id) = crate::identity_file::mint(crate::identity::IdKind::Agent);
+        let (signer, _) = crate::identity_file::resolve(crate::identity::IdKind::Agent, &seed);
+        Some(PreparedAgent {
+            path: agent_path,
+            seed,
+            id,
+            signer,
+        })
+    } else {
+        None
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client init: {}", e))?;
+    let entries = match (&device, &agent) {
+        (Some(device), Some(agent)) => vec![
+            crate::cli::pair_flow::PairPrincipal {
+                kind: "device",
+                name: &device_name,
+                id: &device.id,
+                signer: &device.signer,
+                sc_pk: Some(device.sc_pk),
+            },
+            crate::cli::pair_flow::PairPrincipal {
+                kind: "agent",
+                name,
+                id: &agent.id,
+                signer: &agent.signer,
+                sc_pk: None,
+            },
+        ],
+        (Some(device), None) => vec![crate::cli::pair_flow::PairPrincipal {
+            kind: "device",
+            name: &device_name,
+            id: &device.id,
+            signer: &device.signer,
+            sc_pk: Some(device.sc_pk),
+        }],
+        (None, Some(agent)) => vec![crate::cli::pair_flow::PairPrincipal {
+            kind: "agent",
+            name,
+            id: &agent.id,
+            signer: &agent.signer,
+            sc_pk: None,
+        }],
+        (None, None) => unreachable!("missing set checked above"),
+    };
+    let paired = crate::cli::pair_flow::pair(
+        &client,
+        &crate::cli::pair_flow::PairRequest {
+            entries,
+            cloud: &cloud,
+            origin: &origin,
+            restart: "sc setup",
+        },
+    )
+    .await?;
+
+    if let Some(pinned) = pinned {
+        if paired.uik_pub != pinned {
+            return Err(format!(
+                "the agent was approved by another account ({}) than the one this machine is paired to; it was not set up",
+                paired.uik_id
+            ));
+        }
+    }
+
+    if let Some(device) = &device {
+        let agents = paired
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == "agent")
+            .map(|entry| entry.id.clone())
+            .collect();
+        crate::cli::login::persist_device_approval(&paired, device, &cloud, true, agents)?;
+    }
+    if let Some(agent) = &agent {
+        crate::identity_file::write(&agent.path, crate::identity::IdKind::Agent, &agent.seed)?;
+    }
+    if device.is_some() {
+        crate::cli::login::bring_up(false).await?;
+    }
+    Ok(())
+}
+
 async fn run_background(args: SetupArgs) -> Result<(), i32> {
     let phase = match args.phase {
         Some(phase) => phase,
@@ -541,11 +694,16 @@ async fn run_background(args: SetupArgs) -> Result<(), i32> {
     };
     let pid = std::process::id();
     let phase_text = phase_name(phase);
+    let entries = match setup_entries(&name) {
+        Ok(entries) if !entries.is_empty() => entries,
+        Ok(_) => return Ok(()),
+        Err(_) => return Err(1),
+    };
     let starting = SetupStatus::new(
         phase_text,
         "starting",
         pid,
-        name.clone(),
+        entries.clone(),
         args.profile.clone(),
     );
     if human_action::write(&status_path, &starting).is_err() {
@@ -553,22 +711,7 @@ async fn run_background(args: SetupArgs) -> Result<(), i32> {
     }
 
     let result = match phase {
-        SetupPhase::Device => {
-            let paired = crate::cli::login::pair_and_persist(
-                LoginArgs {
-                    device_name: None,
-                    profile: args.profile.clone(),
-                    insecure: false,
-                },
-                false,
-            )
-            .await;
-            match paired {
-                Ok(()) => crate::cli::login::bring_up(false).await,
-                Err(e) => Err(e),
-            }
-        }
-        SetupPhase::Agent => crate::cli::agent::add_and_persist(&name).await.map(|_| ()),
+        SetupPhase::Pairing => pair_missing_and_persist(&name, args.profile.as_deref()).await,
     };
 
     let (state, message, exit) = match result {
@@ -603,8 +746,9 @@ async fn run_background(args: SetupArgs) -> Result<(), i32> {
             }
         }
     };
-    let mut final_status = human_action::read(&status_path)
-        .unwrap_or_else(|_| SetupStatus::new(phase_text, state, pid, name.clone(), args.profile.clone()));
+    let mut final_status = human_action::read(&status_path).unwrap_or_else(|_| {
+        SetupStatus::new(phase_text, state, pid, entries, args.profile.clone())
+    });
     final_status.state = state.to_string();
     final_status.message = message;
     final_status.updated_at = crate::util::now_unix();
@@ -629,8 +773,7 @@ fn remove_own_lock(status_path: &Path, pid: u32) {
 
 fn phase_name(phase: SetupPhase) -> &'static str {
     match phase {
-        SetupPhase::Device => "device",
-        SetupPhase::Agent => "agent",
+        SetupPhase::Pairing => "pairing",
     }
 }
 
@@ -652,10 +795,16 @@ fn name_mismatch(
 }
 
 fn name_mismatch_details(current_name: &str, status: &SetupStatus) -> Option<(String, String)> {
-    if !status.name.is_empty() && status.name != current_name {
+    let paired_name = status
+        .entries
+        .iter()
+        .find(|entry| entry.kind == "agent")
+        .map(|entry| entry.name.as_str());
+    if paired_name.is_some_and(|name| name != current_name) {
+        let paired_name = paired_name.unwrap_or_default();
         Some((
-            format!("Setup for agent '{}' is in progress.", status.name),
-            setup_wait_command(&status.name, status.profile.as_deref()),
+            format!("Setup for agent '{}' is in progress.", paired_name),
+            setup_wait_command(paired_name, status.profile.as_deref()),
         ))
     } else {
         None
@@ -691,10 +840,7 @@ fn setup_command(name: &str, profile: Option<&str>) -> String {
 fn setup_vault_guidance(known_vault_count: usize) -> Option<(String, String)> {
     match known_vault_count {
         0 => None,
-        1 => Some((
-            "The vault is locked.".to_string(),
-            "sc unlock".to_string(),
-        )),
+        1 => Some(("The vault is locked.".to_string(), "sc unlock".to_string())),
         _ => Some((
             "The vaults are locked. List them with sc vault ls, then run sc unlock --vault <name>."
                 .to_string(),
@@ -707,7 +853,7 @@ fn shell_word(value: &str) -> String {
     if !value.is_empty()
         && value
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
     {
         value.to_string()
     } else {
@@ -718,12 +864,14 @@ fn shell_word(value: &str) -> String {
 fn emit_action(json_output: bool, context: &Context, status: &SetupStatus) {
     let url = status.url.as_deref().unwrap_or("");
     let code = status.code.as_deref();
-    let instruction = pairing_instruction(status.phase == "device", code.is_some());
-    let next = if status.name.is_empty() {
-        next_command(context, effective_profile(context, status))
-    } else {
-        setup_wait_command(&status.name, effective_profile(context, status))
-    };
+    let instruction = pairing_instruction(&status.entries, code.is_some());
+    let setup_name = status
+        .entries
+        .iter()
+        .find(|entry| entry.kind == "agent")
+        .map(|entry| entry.name.as_str())
+        .unwrap_or(&context.name);
+    let next = setup_wait_command(setup_name, effective_profile(context, status));
     if json_output {
         let mut object = Map::new();
         object.insert("status".into(), json!("action_required"));
@@ -750,8 +898,15 @@ fn emit_action(json_output: bool, context: &Context, status: &SetupStatus) {
     }
 }
 
-fn pairing_instruction(device: bool, has_code: bool) -> String {
-    let subject = if device { "this machine" } else { "this agent" };
+fn pairing_instruction(entries: &[SetupEntry], has_code: bool) -> String {
+    let device = entries.iter().any(|entry| entry.kind == "device");
+    let agent = entries.iter().find(|entry| entry.kind == "agent");
+    let subject = match (device, agent) {
+        (true, Some(agent)) => format!("this machine and agent {}", agent.name),
+        (true, None) => "this machine".to_string(),
+        (false, Some(agent)) => format!("agent {}", agent.name),
+        (false, None) => "the selected principals".to_string(),
+    };
     let action = if has_code {
         "enter the code"
     } else {
@@ -886,23 +1041,68 @@ mod setup_tests {
 
     #[test]
     fn pairing_wording_names_the_step_and_expiry() {
+        let device = SetupEntry {
+            kind: "device".into(),
+            name: "workstation".into(),
+        };
+        let agent = SetupEntry {
+            kind: "agent".into(),
+            name: "codex".into(),
+        };
         assert_eq!(
-            pairing_instruction(true, true),
+            pairing_instruction(std::slice::from_ref(&device), true),
             "To pair this machine, open this link and enter the code"
         );
         assert_eq!(
-            pairing_instruction(false, false),
-            "To pair this agent, open this link and tap your passkey"
+            pairing_instruction(std::slice::from_ref(&agent), false),
+            "To pair agent codex, open this link and tap your passkey"
         );
-        assert_eq!(expiry_phrase(Some(601)).as_deref(), Some("expires in about 11 minutes"));
-        assert_eq!(expiry_phrase(Some(60)).as_deref(), Some("expires in about 1 minute"));
+        assert_eq!(
+            pairing_instruction(&[device, agent], true),
+            "To pair this machine and agent codex, open this link and enter the code"
+        );
+        assert_eq!(
+            expiry_phrase(Some(601)).as_deref(),
+            Some("expires in about 11 minutes")
+        );
+        assert_eq!(
+            expiry_phrase(Some(60)).as_deref(),
+            Some("expires in about 1 minute")
+        );
         assert_eq!(expiry_phrase(Some(59)).as_deref(), Some("expires soon"));
         assert_eq!(expiry_phrase(None), None);
     }
 
     #[test]
+    fn same_environment_matches_the_paired_backend_to_its_profile() {
+        assert!(same_environment("https://api.dev.safeclaw.pro", "https://dev.safeclaw.pro"));
+        assert!(same_environment("https://api.safeclaw.pro/", "https://safeclaw.pro"));
+        assert!(!same_environment("https://api.safeclaw.pro", "https://dev.safeclaw.pro"));
+        assert!(!same_environment("https://api.dev.safeclaw.pro", "https://safeclaw.pro"));
+    }
+
+    #[test]
+    fn shell_word_quotes_only_when_needed() {
+        assert_eq!(
+            shell_word("/home/me/.safeclaw/agents/codex/agent.env"),
+            "/home/me/.safeclaw/agents/codex/agent.env"
+        );
+        assert_eq!(shell_word("/Users/Mia Li/agent.env"), "'/Users/Mia Li/agent.env'");
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
+    }
+
+    #[test]
     fn status_name_mismatch_waits_for_stored_agent() {
-        let status = SetupStatus::new("agent", "needs_user", 42, "other", Some("dev".into()));
+        let status = SetupStatus::new(
+            "pairing",
+            "needs_user",
+            42,
+            vec![SetupEntry {
+                kind: "agent".into(),
+                name: "other".into(),
+            }],
+            Some("dev".into()),
+        );
         let (message, fix) = name_mismatch_details("codex", &status).unwrap();
         assert_eq!(message, "Setup for agent 'other' is in progress.");
         assert_eq!(fix, "sc setup --name other --profile dev --wait");
@@ -915,7 +1115,16 @@ mod setup_tests {
             profile: None,
             setup_dir: PathBuf::from("/tmp/setup"),
         };
-        let status = SetupStatus::new("agent", "needs_user", 42, "codex", Some("dev".into()));
+        let status = SetupStatus::new(
+            "pairing",
+            "needs_user",
+            42,
+            vec![SetupEntry {
+                kind: "agent".into(),
+                name: "codex".into(),
+            }],
+            Some("dev".into()),
+        );
         assert_eq!(effective_profile(&context, &status), Some("dev"));
 
         let explicit = Context {

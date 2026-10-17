@@ -30,8 +30,8 @@ fn cloud_and_key() -> Result<(String, String), String> {
     let cloud = cfg
         .cloud_backend
         .filter(|s| !s.is_empty())
-        .ok_or("this device isn't paired. Run `sc login` first")?;
-    let key = crate::sync::device_key().ok_or("no device-key. Run `sc login` first")?;
+        .ok_or("this device isn't paired. Run sc login first")?;
+    let key = crate::sync::device_key().ok_or("no device-key. Run sc login first")?;
     Ok((cloud.trim_end_matches('/').to_string(), key))
 }
 
@@ -95,18 +95,20 @@ pub async fn add_and_persist(name: &str) -> Result<AddedAgent, String> {
     // by the account this machine is paired to (its pinned owner UIK): an agent
     // acts as that one account.
     let pinned = crate::cli::active::account_uik_pub()
-        .ok_or("this machine's pairing predates verified pairing: run `sc login` first")?;
+        .ok_or("this machine's pairing predates verified pairing. Run sc login first")?;
     let origin = crate::cli::active::console_origin()
-        .ok_or("this machine isn't paired to SafeClaw yet: run `sc login` first")?;
+        .ok_or("this machine isn't paired to SafeClaw yet. Run sc login first")?;
     let client = client()?;
     let paired = crate::cli::pair_flow::pair(
         &client,
         &crate::cli::pair_flow::PairRequest {
-            principal: "agent",
-            name,
-            principal_id: &ag_id,
-            signer: &aik,
-            sc_pk: None,
+            entries: vec![crate::cli::pair_flow::PairPrincipal {
+                kind: "agent",
+                name,
+                id: &ag_id,
+                signer: &aik,
+                sc_pk: None,
+            }],
             cloud: &cloud,
             origin: &origin,
             restart: "sc agent add",
@@ -205,7 +207,7 @@ async fn ls(json: bool) -> Result<(), String> {
         return Ok(());
     }
     if agents.is_empty() {
-        println!("(no agents yet, `sc agent add <name>`)");
+        println!("(no agents yet, run sc agent add <name>)");
         return Ok(());
     }
     for k in &agents {
@@ -232,7 +234,7 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
         .collect();
     if matches.len() > 1 {
         return Err(format!(
-            "'{}' matches multiple agents; remove it by id or prefix from `sc agent ls`",
+            "'{}' matches multiple agents; remove it by id or prefix from sc agent ls",
             args.name
         ));
     }
@@ -264,7 +266,7 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
-                    "the cloud removal is not finished; complete it at {} and re-run `sc agent rm {}`",
+                    "the cloud removal is not finished; complete it at {} and re-run sc agent rm {}",
                     url, args.name
                 ));
             }

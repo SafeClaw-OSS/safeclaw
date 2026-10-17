@@ -311,6 +311,16 @@ async fn cancel_op(custodian: &str, op_id: &str, waiter: Option<&str>) -> bool {
     )
 }
 
+/// "Unlock Personal Vault" → "unlock Personal Vault": only the verb is lowercased,
+/// so names (a vault, a secret key, a service) keep their case.
+fn lower_first(label: &str) -> String {
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(c) => c.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// Remote arm: surface the cloud `/grant/{op_id}` link and poll the local
 /// daemon until the op resolves (its relay poller applies the browser-deposited
 /// grant via loopback approve). Ctrl-C, SIGTERM or giving up withdraws the op
@@ -326,7 +336,7 @@ async fn remote_approve(
     eprintln!();
     eprintln!(
         "To {}, open this link and tap your passkey:",
-        label.to_lowercase()
+        lower_first(label)
     );
     eprintln!("  {}", url);
     if return_after_link && (!std::io::stdin().is_terminal() || !std::io::stderr().is_terminal()) {
@@ -497,7 +507,7 @@ async fn local_ceremony(
     }
     let sc_pk = fetch_sc_pk(custodian).await?;
 
-    eprintln!("safeclaw {}: touch passkey…", label.to_lowercase());
+    eprintln!("safeclaw {}: touch passkey…", lower_first(label));
     let result = do_browser_gesture(
         custodian,
         op_id,
@@ -686,6 +696,13 @@ async fn fetch_sc_pk(custodian: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lower_first_keeps_names_cased() {
+        assert_eq!(super::lower_first("Unlock Personal Vault"), "unlock Personal Vault");
+        assert_eq!(super::lower_first("Reveal STRIPE_KEY"), "reveal STRIPE_KEY");
+        assert_eq!(super::lower_first(""), "");
+    }
+
     use super::*;
 
     /// The local ceremony's grant carries only the sealed K and the identity

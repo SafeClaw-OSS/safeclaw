@@ -357,17 +357,26 @@ fn store_floor(state_dir: &Path, floor: &LedgerFloor) {
     }
 }
 
-/// Pairing success writes the decision fresh from the admit the CLI just
-/// verified (W2): admitted at that seq, no revoke, lease starting now.
-pub fn write_pairing_floor(state_dir: &Path, admit_seq: u64, now: u64) -> Result<(), String> {
+/// Pairing success writes the decision fresh from the complete set the CLI just
+/// verified (W2): the device is admitted at its seq, the signed head fixes the
+/// rollback floor, and agents admitted by the same ceremony are recorded.
+pub fn write_pairing_floor(
+    state_dir: &Path,
+    admit_seq: u64,
+    head_max_seq: u64,
+    mut agents: Vec<String>,
+    now: u64,
+) -> Result<(), String> {
+    agents.sort();
+    agents.dedup();
     let floor = LedgerFloor {
         admitted_seq: admit_seq,
         admitted: true,
         self_revoke_seq: 0,
         fresh_at: now,
-        max_seq: admit_seq,
+        max_seq: head_max_seq,
         max_wall: now,
-        agents: Vec::new(),
+        agents,
     };
     std::fs::create_dir_all(state_dir).map_err(|e| e.to_string())?;
     let json = serde_json::to_string(&floor).map_err(|e| e.to_string())?;
@@ -497,7 +506,7 @@ pub fn verify_pairing_admit(
         .map_err(|e| format!("the pairing returned a malformed admit: {}", e))?;
     let owner = identity::derive_id(IdKind::User, uik_pub);
     if e.op != "admit" || e.principal_id != principal_id {
-        return Err("the pairing's admit is not an admit of this machine".into());
+        return Err("the pairing's admit is not for the requested principal".into());
     }
     if e.owner_id != owner || (!e.anchor_uik.is_empty() && e.anchor_uik != owner) {
         return Err("the pairing's admit is not signed by the approving account".into());
@@ -507,7 +516,7 @@ pub fn verify_pairing_admit(
         Some(b) => decode_b64_any(b).ok_or("the admit's sc_pk is undecodable")?,
     };
     if served_pk != sc_pk {
-        return Err("the pairing's admit binds another daemon key than this machine's".into());
+        return Err("the pairing's admit binds another daemon key".into());
     }
     let sig = decode_sig64(&e.sig).ok_or("the admit's signature is undecodable")?;
     let input =
@@ -516,6 +525,29 @@ pub fn verify_pairing_admit(
         return Err("the pairing's admit signature does not verify".into());
     }
     Ok(owner)
+}
+
+/// Verify the owner-signed ledger head returned with a pairing approval and
+/// return its authenticated `max_seq`. The approval carries only the new admits,
+/// not the complete event list, so this verifies the head signature and owner
+/// binding; normal ledger pulls additionally verify the full events hash.
+pub fn verify_pairing_head(head: &serde_json::Value, uik_pub: &[u8; 32]) -> Result<u64, String> {
+    let head: HeadJson = serde_json::from_value(head.clone())
+        .map_err(|e| format!("the pairing returned a malformed ledger head: {}", e))?;
+    let owner = identity::derive_id(IdKind::User, uik_pub);
+    if head.anchor != owner {
+        return Err("the pairing's ledger head names another account".into());
+    }
+    let hash = decode_b64_any(&head.events_hash)
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .ok_or("the pairing's ledger head hash is undecodable")?;
+    let sig =
+        decode_sig64(&head.sig).ok_or("the pairing's ledger head signature is undecodable")?;
+    let input = identity::principal_head_input(&owner, head.max_seq, &hash);
+    if !identity::verify(uik_pub, &input, &sig) {
+        return Err("the pairing's ledger head signature does not verify".into());
+    }
+    Ok(head.max_seq)
 }
 
 // ── Enforcement ──────────────────────────────────────────────────────────────
@@ -593,12 +625,7 @@ fn context(state: &AppState) -> Option<Ctx> {
 }
 
 /// Publish a standing: not open evicts K from every vault (park / lock / wipe).
-fn publish(
-    state: &AppState,
-    device: DeviceGate,
-    floor: &LedgerFloor,
-    checked_at: Option<u64>,
-) {
+fn publish(state: &AppState, device: DeviceGate, floor: &LedgerFloor, checked_at: Option<u64>) {
     let agents = (device == DeviceGate::Open).then(|| floor.agents.iter().cloned().collect());
     state.set_ledger(LedgerGate {
         device,
@@ -880,7 +907,9 @@ mod tests {
         state.mark_vault_closing("v", crate::vault_runtime::TombstoneReason::Removed);
         assert!(matches!(
             authorize_agent(&state, None, Some("v")).await,
-            Err(AgentRefusal::Gone(crate::error::AppError::VaultAccessRevoked))
+            Err(AgentRefusal::Gone(
+                crate::error::AppError::VaultAccessRevoked
+            ))
         ));
     }
 
@@ -963,6 +992,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pairing_floor_uses_signed_head_and_set_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pairing_floor(
+            dir.path(),
+            7,
+            9,
+            vec!["ag_b".into(), "ag_a".into(), "ag_a".into()],
+            T0,
+        )
+        .unwrap();
+        let floor = load_floor(dir.path());
+        assert_eq!(floor.admitted_seq, 7);
+        assert_eq!(floor.max_seq, 9);
+        assert_eq!(floor.agents, vec!["ag_a", "ag_b"]);
+    }
+
     /// Revoked self → wipe: a verified revoke above the paired admit latches.
     #[test]
     fn a_verified_revoke_of_this_device_wipes() {
@@ -1000,7 +1046,7 @@ mod tests {
             },
         );
         // Re-pair: C6 writes revoke(old) at 3 then admit(new) at 4.
-        write_pairing_floor(dir.path(), 4, T0).unwrap();
+        write_pairing_floor(dir.path(), 4, 4, Vec::new(), T0).unwrap();
         let f = load_floor(dir.path());
         assert_eq!(gate(&f, T0 + 1, true, true), DeviceGate::Open);
         let l = ledger(
@@ -1278,21 +1324,13 @@ mod tests {
             zeroize::Zeroizing::new(vec![0x42u8; 32]),
         );
 
-        publish(
-            &state,
-            DeviceGate::AccountMissing,
-            &paired_at(1),
-            Some(T0),
-        );
+        publish(&state, DeviceGate::AccountMissing, &paired_at(1), Some(T0));
 
         assert!(state.is_vault_locked("v1"), "the retained key is evicted");
         assert!(blob.exists(), "the unsigned signal deletes nothing");
         let refusal = state.ledger_refusal().unwrap();
         assert_eq!(refusal.code().0.as_str(), "device_not_admitted");
-        assert_eq!(
-            refusal.code().1,
-            crate::error::DEVICE_ACCOUNT_MISSING_MSG
-        );
+        assert_eq!(refusal.code().1, crate::error::DEVICE_ACCOUNT_MISSING_MSG);
         assert_eq!(state.ledger.lock().unwrap().checked_at, Some(T0));
     }
 
