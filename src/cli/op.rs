@@ -168,7 +168,10 @@ pub async fn run_wait(args: OpWaitArgs, json: bool) -> Result<(), String> {
                                     // applying it failed: …"): retrying after the
                                     // cause is fixed is legitimate.
                                     NotApproved::Other(r) => {
-                                        eprintln!("Not approved: {}. Fix the cause, then re-run.", r);
+                                        eprintln!(
+                                            "Not approved: {}. Fix the cause, then re-run.",
+                                            r.trim_end_matches('.')
+                                        );
                                     }
                                     NotApproved::Rejected => {
                                         eprintln!("Rejected by the approver. Do not retry.");
