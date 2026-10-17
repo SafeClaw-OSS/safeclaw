@@ -584,7 +584,7 @@ pub fn grant_url(op_id: &str) -> String {
 /// leading `api.` on the host; everything else (scheme, port, path) is kept.
 /// A backend host without an `api.` prefix is returned unchanged (self-host
 /// where frontend == backend).
-fn derive_frontend_from_backend(backend: &str) -> String {
+pub(crate) fn derive_frontend_from_backend(backend: &str) -> String {
     let trimmed = backend.trim_end_matches('/');
     let (scheme, rest) = match trimmed.split_once("://") {
         Some((s, r)) => (s, r),

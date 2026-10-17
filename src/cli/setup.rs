@@ -178,7 +178,7 @@ async fn preconditions(
         .is_some_and(|backend| !backend.is_empty());
     if has_pairing {
         if let (Some(selected), Some(paired)) = (profile.as_deref(), cfg.cloud_backend.as_deref()) {
-            if paired.trim_end_matches('/') != cloud {
+            if !same_environment(paired, &cloud) {
                 return Err((
                     format!(
                         "This machine is already paired to {}, not the {} profile.",
@@ -436,6 +436,13 @@ async fn spawn_and_report(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Is the machine's paired backend (`https://api.dev.safeclaw.pro`, as the server
+/// returned it) the environment a `--profile` names (`https://dev.safeclaw.pro`)?
+fn same_environment(paired_backend: &str, profile_url: &str) -> bool {
+    crate::cli::active::derive_frontend_from_backend(paired_backend)
+        == profile_url.trim_end_matches('/')
 }
 
 fn spawn_background(context: &Context, phase: SetupPhase) -> Result<u32, String> {
@@ -1064,6 +1071,14 @@ mod setup_tests {
         );
         assert_eq!(expiry_phrase(Some(59)).as_deref(), Some("expires soon"));
         assert_eq!(expiry_phrase(None), None);
+    }
+
+    #[test]
+    fn same_environment_matches_the_paired_backend_to_its_profile() {
+        assert!(same_environment("https://api.dev.safeclaw.pro", "https://dev.safeclaw.pro"));
+        assert!(same_environment("https://api.safeclaw.pro/", "https://safeclaw.pro"));
+        assert!(!same_environment("https://api.safeclaw.pro", "https://dev.safeclaw.pro"));
+        assert!(!same_environment("https://api.dev.safeclaw.pro", "https://safeclaw.pro"));
     }
 
     #[test]
