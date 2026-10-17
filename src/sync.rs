@@ -214,8 +214,8 @@ pub async fn pull_on_start(state_dir: &Path) {
     // ids into the known-vaults catalog BEFORE computing the pull set below, so
     // the daemon serves a console-created vault with no `sc vault use`. Blobs are
     // passkey-sealed, so syncing every account vault leaks nothing; unlock stays
-    // passkey-gated. Best-effort: an old backend or a network blip just leaves
-    // the locally-known set as it was.
+    // passkey-gated. Best-effort: a network or service failure leaves the
+    // locally-known set as it was.
     let discovered = discover_account_vault_ids(cloud, &dk).await;
     let fresh = remember_discovered(&cfg, &discovered);
     if !fresh.is_empty() {
@@ -753,9 +753,7 @@ async fn discover_account_vault_ids(cloud: &str, dk: &str) -> Vec<DiscoveredVaul
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             crate::sync_stream::notify_device_auth_rejected();
         }
-        // 404 = a backend that predates device-key vault listing; anything else
-        // is transient. Either way, keep what we already know.
-        tracing::debug!(status = %resp.status(), "vault discovery: non-success (old backend?)");
+        tracing::debug!(status = %resp.status(), "vault discovery: non-success");
         return Vec::new();
     }
     let body: serde_json::Value = match resp.json().await {
@@ -8447,7 +8445,7 @@ mod peritem_tests {
             ],
         });
         let mut pv = empty_keyset_store();
-        // A seat an older adoption keyed under the admin's cid.
+        // Start with a misplaced seat keyed under the admin's cid.
         pv.set_uik_cred(
             "YWRtaW4".into(),
             "us_admin".into(),
@@ -8459,10 +8457,7 @@ mod peritem_tests {
             Vec::new(),
         );
         pv.set_registry_pubkey("YWRtaW4", "ax", "ay", "").unwrap();
-        assert!(
-            pv.own_identities().contains("us_admin"),
-            "the stale seat read as own"
-        );
+        assert!(pv.uik_cred("YWRtaW4").is_some());
 
         adopt_membership_triple(&mut pv, "v", &enc(&[7; 32]), &body).unwrap();
         let pk =
@@ -8479,7 +8474,6 @@ mod peritem_tests {
         );
         assert_eq!(pv.uik_cred("us_admin").unwrap().user_id, "us_admin");
         assert_eq!(pv.uik_cred("Yw").unwrap().user_id, "us_me");
-        assert_eq!(pv.own_identities(), ["us_me".to_string()].into());
         // No pubkey: nothing to verify with, not adopted.
         assert!(pv.credential_identity("YmFk").is_none());
         assert!(

@@ -14,9 +14,9 @@ use crate::protocol::operation::{
 
 /// Grant submitted to `POST /grant` (or to `/approve/{id}/confirm`).
 ///
-/// Matches the SUDP paper §5.5 wire shape `G := (o, r, cid_{c*}, W*, σ*, opt)`
-/// — `wrapping_key` is `W*` (= `W_c` for the acting credential), derived on
-/// the client from `userKey` and shipped over the confidential TLS leg.
+/// Matches the SUDP paper §5.5 wire shape `G := (o, r, cid_{c*}, W*, σ*, opt)`.
+/// Retired unlock-secret fields remain in the wire type only so the approval
+/// handler can recognize and refuse them with `wk_refused_v2`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grant {
     /// Operation contract.
@@ -25,17 +25,12 @@ pub struct Grant {
     pub r: String,
     /// Acting credential id (base64).
     pub credential_id: String,
-    /// `W*` — wrapping key for the acting credential (base64 STANDARD, 32B raw),
-    /// in **plaintext**. Transitional: the legacy local op-page (served over
-    /// localhost, no intermediary) ships W* here. When `wk_enc`/`wk_ct` are
-    /// present, W* is HPKE-sealed instead and the approve handler populates
-    /// this field after opening the seal. Exactly one form must be present.
+    /// Retired plaintext `W*` wrapping key. Deserialized only so the approval
+    /// handler can refuse it with `wk_refused_v2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrapping_key: Option<String>,
-    /// HPKE-sealed `W*` encapped key (base64url-no-pad). Paired with `wk_ct`.
-    /// Sealed by the browser to the daemon's `sc_pk` with
-    /// `info = grant_seal_info(op_id)`, so a cloud op-relay carrying the grant
-    /// never sees `W*`. The approve handler opens it before validation.
+    /// Retired HPKE-sealed `W*` encapped key. Paired with `wk_ct` and retained
+    /// only so the approval handler can refuse it with `wk_refused_v2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wk_enc: Option<String>,
     /// HPKE-sealed `W*` ciphertext + tag (base64url-no-pad). Paired with `wk_enc`.
@@ -134,7 +129,7 @@ impl std::fmt::Debug for DeliveredVaultKey {
 /// How a grant delivers what opens the vault. A grant carries EXACTLY ONE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryForm {
-    /// Plaintext `wrapping_key` (the legacy local op-page).
+    /// Retired plaintext `wrapping_key`, recognized for explicit refusal.
     Plain,
     /// `wk_enc`/`wk_ct`: the approver's own unlock secret, HPKE-sealed
     /// (`W_c` on a v1 keyset, the approver's UIK root on a v2 keyset).
@@ -349,7 +344,7 @@ pub fn validate_batch_grant(
         .ok_or_else(|| AppError::Unauthorized("unknown credential".into()))?;
 
     // EVERY core failure on a batch grant — challenge peek, credential-id
-    // mismatch, ASSERTION/ROOT verification, malformed r/wk — must surface
+    // mismatch, ASSERTION/ROOT verification, malformed r/delivery must surface
     // as `batch_verify_failed` (design §Daemon verify 7): the relay client
     // recovers by re-registering the op, and a tampered or cross-language-
     // divergent root must never re-open Rev 1's mass-reject through the
@@ -368,8 +363,8 @@ pub fn validate_batch_grant(
     })
 }
 
-/// Shared validation tail for both arms: challenge peek → assertion verify
-/// against `expected_challenge` → wrapping-key decode → challenge consume.
+/// Shared validation tail for both arms: challenge peek, assertion verify
+/// against `expected_challenge`, vault-key extraction, challenge consume.
 /// Every check here runs identically for plain and batch grants.
 fn validate_grant_core(
     grant: &Grant,
@@ -406,41 +401,24 @@ fn validate_grant_core(
     }
     verify_assertion(assertion, &entry.x, &entry.y, rp, expected_challenge)?;
 
-    // 7. Decode the delivered secret + credential_id raw bytes.
-    //
-    // Exactly one form, already opened by the approve handler: W* as
-    // plaintext base64 in `wrapping_key` (the legacy local op-page shipped it,
-    // or the handler HPKE-opened `wk_enc`/`wk_ct` into it), or the vault key
-    // an admin delivered (`k_enc`/`k_ct`, opened into `vault_key`). Both or
-    // neither is malformed.
+    // 7. Take the vault key already opened by the approve handler and decode
+    // the credential id. Unlock-secret delivery was refused before validation.
     let credential_id_bytes = decode_credential_id(&grant.credential_id)?;
     let (secret, delivery) = match (grant.wrapping_key.as_deref(), grant.vault_key.as_ref()) {
-        (Some(wrapping_key_b64), None) => {
-            let wrapping_key = STANDARD
-                .decode(wrapping_key_b64)
-                .map_err(|_| AppError::BadRequest("wrapping_key not base64".into()))?;
-            if wrapping_key.len() != 32 {
-                return Err(AppError::BadRequest("wrapping_key must be 32 bytes".into()));
-            }
-            // F-04: zeroize the source base64 String so W* doesn't linger on the heap.
-            // We can't mutate grant (it's `&Grant`) — clone a local copy, zeroize it,
-            // then drop it.
-            // SAFETY: zeroing valid UTF-8 bytes with 0x00; the String is immediately
-            // dropped after this block and never used as a &str again.
-            let mut wk_str = wrapping_key_b64.to_string();
-            unsafe { wk_str.as_bytes_mut().zeroize() };
-            drop(wk_str);
-            (wrapping_key, Delivery::Custody)
-        }
         (None, Some(k)) => (k.as_bytes().to_vec(), Delivery::VaultKey),
         (Some(_), Some(_)) => {
             return Err(AppError::BadRequest(
                 "grant carries both a wrapping key and a vault key".into(),
             ))
         }
+        (Some(_), None) => {
+            return Err(AppError::BadRequest(
+                "grant carries a wrapping key instead of a vault key".into(),
+            ))
+        }
         (None, None) => {
             return Err(AppError::BadRequest(
-                "grant carries no wrapping_key or vault key (and no opened seal)".into(),
+                "grant carries no vault key (and no opened seal)".into(),
             ))
         }
     };

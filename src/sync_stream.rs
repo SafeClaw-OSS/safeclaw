@@ -2,8 +2,8 @@
 //!
 //! ONE `text/event-stream` connection per daemon replaces the per-vault PAIR
 //! of ~25s long-polls as the wake TRANSPORT. Long-poll stays intact as the
-//! per-vault fallback (stream down, vid not in hello, old backend, or
-//! `sync_stream = "off"`). Events are hints, not data: nothing in this module
+//! per-vault fallback (stream down, vid not in hello, or `sync_stream = "off"`).
+//! Events are hints, not data: nothing in this module
 //! pulls or persists vault state — the dispatcher merges wake hints into
 //! per-vault [`WakeCell`]s, and the vault watch tasks (`sync::watch_loop`)
 //! react by running their existing cursor-gated pull paths, so a duplicated,
@@ -64,8 +64,6 @@ const LIVENESS: Duration = Duration::from_secs(45);
 const PROVEN_HEALTHY: Duration = Duration::from_secs(60);
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
-/// 404 = backend without the route (version skew; the backend ships first).
-const PARK_OLD_BACKEND: Duration = Duration::from_secs(600);
 /// 401/403 — THE long-poll watcher's AUTH_RETRY, shared by construction so
 /// the two shapes can never recover from an auth blip at different speeds:
 /// park, never die; a transient blip (deploy, migration) must not end SSE
@@ -676,8 +674,6 @@ enum StreamEnd {
 }
 
 enum ConnectFail {
-    /// 404 — backend without the route (version skew).
-    OldBackend,
     /// 401 | 403.
     Auth(u16),
     /// 429 — stream cap.
@@ -697,8 +693,8 @@ enum ConnectFail {
 ///    immediate re-dial, no backoff, health STAYS Up; Down only if that one
 ///    re-dial misses hello in ~5s. The hello reconcile covers the gap.
 ///  - failures: backoff 2s→60s ±20% jitter, reset only after healthy ≥60s;
-///    ★★ 5 consecutive never-healthy attempts → 600s parks. 404 → 600s,
-///    401/403 → 600s, 429 → 300s.
+///    ★★ 5 consecutive never-healthy attempts → 600s parks. 401/403 → 600s,
+///    429 → 300s.
 pub async fn dispatcher(
     state: Arc<crate::state::AppState>,
     cloud: String,
@@ -710,7 +706,6 @@ pub async fn dispatcher(
     let mut backoff = BACKOFF_MIN;
     let mut never_healthy: u32 = 0;
     let mut rotating = false;
-    let mut announced_old_backend = false;
     let mut announced_off = false;
     tracing::debug!(vaults = cells.len(), "sync stream: dispatcher started");
     loop {
@@ -779,7 +774,6 @@ pub async fn dispatcher(
         .await
         {
             StreamEnd::Died { healthy_for, why } => {
-                announced_old_backend = false; // hello proved the route exists
                 if healthy_for >= PROVEN_HEALTHY {
                     // ★★ ROTATION, not failure: Railway caps any request at
                     // ~15 min, so a proven-healthy stream ending is ROUTINE.
@@ -836,16 +830,6 @@ pub async fn dispatcher(
                 rotating = false;
                 let flipped = go_down(&health, stream_cells.values());
                 match fail {
-                    ConnectFail::OldBackend => {
-                        if !announced_old_backend {
-                            tracing::info!(
-                                retry_secs = PARK_OLD_BACKEND.as_secs(),
-                                "sync stream: backend has no stream route (404); long-poll only for now"
-                            );
-                            announced_old_backend = true;
-                        }
-                        tokio::time::sleep(PARK_OLD_BACKEND).await;
-                    }
                     ConnectFail::Auth(code) => {
                         // Park, don't die — the long-poll AUTH_RETRY rule.
                         tracing::warn!(
@@ -936,7 +920,6 @@ async fn run_stream(
     };
     match resp.status().as_u16() {
         200 => {}
-        404 => return StreamEnd::Failed(ConnectFail::OldBackend),
         401 => {
             notify_device_auth_rejected();
             return StreamEnd::Failed(ConnectFail::Auth(401));

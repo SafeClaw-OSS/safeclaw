@@ -107,7 +107,6 @@ mod tests {
 /// What a completed pairing hands back (the approval body of `/api/pair/poll`).
 #[derive(Debug, Deserialize)]
 struct ExchangeResp {
-    #[serde(default)]
     account_id: String,
     device_key: String,
     pro_backend_url: Option<String>,
@@ -245,6 +244,9 @@ pub(crate) fn persist_device_approval(
 ) -> Result<(), String> {
     let parsed: ExchangeResp = serde_json::from_value(paired.body.clone())
         .map_err(|e| format!("approved, but the server's response is incomplete: {}", e))?;
+    if parsed.account_id.is_empty() {
+        return Err("approved, but the server's response is incomplete: no account_id".into());
+    }
     // The VERIFIED owner (admit signer, owner_mac), never the poll's label.
     let account_uik = paired.uik_id.clone();
 
@@ -256,8 +258,8 @@ pub(crate) fn persist_device_approval(
     // the new pairing; `put_cloud_coords` drops the old account id / pinned UIK.
     // Re-pairing the same account skips all of this.
     if crate::cli::active::paired_to_other_account(
-        Some(parsed.account_id.as_str()),
-        Some(account_uik.as_str()),
+        parsed.account_id.as_str(),
+        account_uik.as_str(),
     ) {
         if !allow_account_switch {
             return Err(
@@ -318,8 +320,8 @@ pub(crate) fn persist_device_approval(
         parsed.console_url.as_deref(),
         // §15: persist the account UUID (for reference) AND the owner-UIK us_ (the
         // real principal-ledger anchor). Both pairing paths converge here.
-        (!parsed.account_id.is_empty()).then_some(parsed.account_id.as_str()),
-        Some(account_uik.as_str()),
+        parsed.account_id.as_str(),
+        account_uik.as_str(),
     )
     .map_err(|e| format!("save active config: {}", e))?;
     crate::cli::active::put_account_uik_key(&paired.uik_pub)
@@ -350,9 +352,7 @@ pub(crate) fn persist_device_approval(
     // Show the user's IDENTITY (the us_ UIK) as the account line; the Supabase UUID rides
     // as a secondary `id:` for support / console matching (debug only, never an anchor).
     eprintln!("  account: {}", account_uik);
-    if !parsed.account_id.is_empty() {
-        eprintln!("  id:      {}", parsed.account_id);
-    }
+    eprintln!("  id:      {}", parsed.account_id);
 
     Ok(())
 }

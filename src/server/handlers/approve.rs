@@ -597,20 +597,15 @@ fn batch_expected_challenge(
 /// Who raised the ops this daemon holds: the account it is paired to, its
 /// pinned account UIK (`account`, from [`crate::cli::active::account_uik`]). The
 /// daemon acts for that one account, so that is the requester, whatever else
-/// the keyset seats. Membership data is not consulted when the pin exists: it
+/// the keyset seats. Membership data is not consulted: it
 /// is server-served, and since an admin's passkeys now ride the membership
 /// (`approver: true`, adopted into the registry, which is never pruned) a
 /// registry-derived set could name an admin, or a demoted one, as a requester.
-///
-/// Fallback for a daemon paired without an account UIK (an older backend):
-/// the identities the vault seats under this device's own passkeys
-/// ([`PerItemVault::own_identities`]), which excludes every credential the
-/// membership served as another member's approval material.
-fn requester_identities(pv: &PerItemVault, account: Option<String>) -> BTreeSet<String> {
-    match account {
-        Some(us) => [us].into(),
-        None => pv.own_identities(),
-    }
+fn requester_identities(account: Option<String>) -> Result<BTreeSet<String>> {
+    let account = account.ok_or_else(|| {
+        AppError::ApproverNotAuthorized("this daemon has no paired account identity".into())
+    })?;
+    Ok([account].into())
 }
 
 /// The paired account's UIK (`us_…`) this daemon acts for.
@@ -754,10 +749,7 @@ fn verify_grant_identity(
 /// ([`verify_grant_identity`]) must be the requester (the paired account) or
 /// an admin of the vault per its verified role fold.
 fn check_approval_authority(pv: Option<&PerItemVault>, vault_id: &str, signer: &str) -> Result<()> {
-    let requester = match pv {
-        Some(pv) => requester_identities(pv, paired_account()),
-        None => paired_account().into_iter().collect(),
-    };
+    let requester = requester_identities(paired_account())?;
     authorize_approver(pv, vault_id, &requester, signer)
 }
 
@@ -5581,10 +5573,8 @@ mod tests {
     }
 
     /// The requester is the paired account (`account_uik`) alone: an admin's
-    /// passkey in the registry, or a seat an older adoption keyed under an
-    /// admin's passkey, never makes them a requester. Without a pinned account
-    /// the fallback is this device's own passkeys, minus every credential the
-    /// membership served as another member's approval material.
+    /// passkey in the registry, or a stale seat keyed under an admin's passkey,
+    /// never makes them a requester. A missing paired account fails closed.
     #[test]
     fn the_requester_is_the_paired_account() {
         use crate::crypto::vault_key::UikRoot;
@@ -5615,25 +5605,20 @@ mod tests {
         );
         pv.set_registry_pubkey(ADMIN_CID, "x", "y", "").unwrap();
         let only = |id: &str| -> BTreeSet<String> { [id.to_string()].into() };
-        assert_eq!(requester_identities(&pv, Some(b_id.clone())), only(&b_id));
+        assert_eq!(requester_identities(Some(b_id.clone())).unwrap(), only(&b_id));
         assert_eq!(
-            requester_identities(&pv, Some("us_other".into())),
+            requester_identities(Some("us_other".into())).unwrap(),
             only("us_other")
         );
-        // The approver label (as the membership serves it) takes the admin out
-        // of the fallback too.
-        pv.keyset
-            .uik
-            .as_mut()
-            .unwrap()
-            .approver_cids
-            .insert(ADMIN_CID.into(), admin_id.clone());
-        assert_eq!(requester_identities(&pv, None), only(&b_id));
+        assert!(matches!(
+            requester_identities(None),
+            Err(AppError::ApproverNotAuthorized(_))
+        ));
         // So the admin approving B's op is an admin, never "the requester".
         assert_eq!(
             pv.approval_authority(
                 vault,
-                &requester_identities(&pv, Some(b_id.clone())),
+                &requester_identities(Some(b_id.clone())).unwrap(),
                 &admin_id
             ),
             ApprovalAuthority::Admin

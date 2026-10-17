@@ -176,10 +176,6 @@ mod tests {
             path_and_query("https://api.example.com/v/abc/blob?since=5").as_deref(),
             Some("/v/abc/blob?since=5")
         );
-        assert_eq!(
-            path_and_query("https://api.example.com/api/vault/agents/hashes").as_deref(),
-            Some("/api/vault/agents/hashes")
-        );
         assert_eq!(path_and_query("not a url"), None);
     }
 
