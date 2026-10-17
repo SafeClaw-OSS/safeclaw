@@ -12,14 +12,15 @@
 //! or superseded by a newer request), 3 expired/unknown, 4 timed out waiting,
 //! 1 local failure. 2 is clap's usage-error code — a malformed invocation must
 //! stay distinguishable from a human rejection.
-//! Stdout gets the final poll body (JSON); progress prose goes to stderr.
+//! Progress and the outcome are one line each on stderr; `--json` puts the final
+//! poll body on stdout.
 
 use std::time::{Duration, Instant};
 
 use reqwest::header::RETRY_AFTER;
 use serde_json::Value;
 
-use crate::cli::active::{control_root, grant_url, load};
+use crate::cli::active::{control_root, load};
 use crate::config::OpWaitArgs;
 
 /// Give up after this many CONSECUTIVE transport failures (~30s dark with the
@@ -70,7 +71,7 @@ fn verdict(status: &str) -> Verdict {
 
 fn not_answering(root: &str, op_id: &str) -> String {
     format!(
-        "daemon not answering at {}. The op survives; re-run `sc op wait {}` once it's back",
+        "daemon not answering at {}. The approval survives; once it is back, re-run: sc op wait {}",
         root, op_id
     )
 }
@@ -85,7 +86,7 @@ fn next_delay(retry_after: Option<&str>) -> Duration {
         .unwrap_or(DEFAULT_POLL_INTERVAL)
 }
 
-pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
+pub async fn run_wait(args: OpWaitArgs, json: bool) -> Result<(), String> {
     // Corrupt config degrades to defaults, NOT a hardcoded localhost that
     // would ignore an agent's $SAFECLAW_BROKER_URL (same rule as custodian.rs).
     let root = control_root(&load().unwrap_or_default());
@@ -95,14 +96,8 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
         urlencoding::encode(&args.op_id)
     );
 
-    // Re-print the approve link when it's absolute (cloud-paired). A
-    // local-only daemon's grant_url is relative — useless as prose; the
-    // captive-portal body already carried whatever link there is.
-    let link = grant_url(&args.op_id);
-    if link.starts_with("http") {
-        eprintln!("Approve with your passkey: {}", link);
-    }
-    eprintln!("Waiting for approval {}…", args.op_id);
+    // The command that minted the op already printed its link.
+    eprintln!("Waiting for approval in the browser.");
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -125,9 +120,7 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                 }
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
-                eprintln!(
-                    "expired or unknown. Re-run the original command to mint a fresh approval"
-                );
+                eprintln!("Expired or unknown. Re-run the original command for a new approval.");
                 std::process::exit(3);
             }
             Ok(resp) => {
@@ -144,26 +137,30 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                         let status = body.get("status").and_then(|s| s.as_str()).unwrap_or("");
                         match verdict(status) {
                             Verdict::Approved => {
-                                println!("{}", body);
-                                eprintln!("approved ✓. Re-run the original command");
+                                if json {
+                                    println!("{}", body);
+                                }
+                                eprintln!("Approved. Re-run the original command.");
                                 std::process::exit(0);
                             }
                             Verdict::Rejected => {
-                                println!("{}", body);
+                                if json {
+                                    println!("{}", body);
+                                }
                                 let reason =
                                     body.get("reason").and_then(|s| s.as_str()).unwrap_or("");
                                 match not_approved(reason) {
                                     NotApproved::Superseded => {
                                         eprintln!(
-                                            "superseded by a newer approval request. \
-                                             Re-run the original command"
+                                            "Superseded by a newer approval request. \
+                                             Re-run the original command."
                                         );
                                         std::process::exit(6);
                                     }
                                     NotApproved::Withdrawn => {
                                         eprintln!(
-                                            "withdrawn by the requester, not rejected. \
-                                             Re-run the original command to ask again"
+                                            "Withdrawn by the requester, not rejected. \
+                                             Re-run the original command to ask again."
                                         );
                                         std::process::exit(6);
                                     }
@@ -171,10 +168,10 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
                                     // applying it failed: …"): retrying after the
                                     // cause is fixed is legitimate.
                                     NotApproved::Other(r) => {
-                                        eprintln!("not approved ✗ ({}); fix the cause, then re-run", r);
+                                        eprintln!("Not approved: {}. Fix the cause, then re-run.", r);
                                     }
                                     NotApproved::Rejected => {
-                                        eprintln!("rejected ✗ by the approver. Do not retry");
+                                        eprintln!("Rejected by the approver. Do not retry.");
                                     }
                                 }
                                 std::process::exit(5);
@@ -196,7 +193,7 @@ pub async fn run_wait(args: OpWaitArgs) -> Result<(), String> {
         }
         if Instant::now() >= deadline {
             eprintln!(
-                "timed out after {}s. If the op is still pending, `sc op wait {}` re-attaches",
+                "Timed out after {}s. If it is still pending, re-attach with: sc op wait {}",
                 args.timeout, args.op_id
             );
             std::process::exit(4);

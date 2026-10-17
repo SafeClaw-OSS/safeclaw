@@ -309,7 +309,7 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
         Command::Op(args) => {
             use crate::config::OpSubcommand;
             let r = match args.sub {
-                OpSubcommand::Wait(a) => cli::op::run_wait(a).await,
+                OpSubcommand::Wait(a) => cli::op::run_wait(a, json).await,
             };
             r.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw op: {}", e);
