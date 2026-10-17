@@ -8,18 +8,40 @@ use std::io::IsTerminal;
 
 use crate::cli::active::resolve_active;
 use crate::cli::approve::{approve_op, ApproveOpts};
+use crate::cli::status::VaultState;
 use crate::cli::webauthn::now_unix;
 use crate::config::UnlockArgs;
 
 pub async fn run_unlock(args: UnlockArgs) -> Result<(), String> {
-    drive("vault-unlock", "Unlock vault", args).await
+    drive("vault-unlock", "Unlock", args).await
 }
 pub async fn run_lock(args: UnlockArgs) -> Result<(), String> {
-    drive("vault-lock", "Lock vault", args).await
+    drive("vault-lock", "Lock", args).await
 }
 
-async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), String> {
+async fn drive(custom_op: &str, verb: &str, args: UnlockArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(None)?;
+    let name = crate::cli::active::known_vaults()
+        .into_iter()
+        .find(|k| k.vault == vault)
+        .and_then(|k| k.label)
+        .filter(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| "the vault".to_string());
+    let label = format!("{} {}", verb, name);
+    let label = label.as_str();
+
+    // Already in the asked-for state: say so instead of minting an approval, so
+    // re-running after an approval (what `sc op wait` says to do) ends here.
+    let state = crate::cli::status::fetch_status(&custodian, &vault).await.state;
+    let done = match (custom_op, &state) {
+        ("vault-unlock", VaultState::Unlocked { .. }) => Some("unlocked"),
+        ("vault-lock", VaultState::Locked { .. }) => Some("locked"),
+        _ => None,
+    };
+    if let Some(done) = done {
+        println!("{} is {}.", upper_first(&name), done);
+        return Ok(());
+    }
 
     let op = json!({
         "act": { "type": { "custom": custom_op }, "target": "", "scope": null },
@@ -41,6 +63,15 @@ async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), Str
         return Ok(());
     }
 
-    eprintln!("safeclaw {}: ok", label.to_lowercase());
+    let done = if custom_op == "vault-unlock" { "unlocked" } else { "locked" };
+    println!("{} is {}.", upper_first(&name), done);
     Ok(())
+}
+
+fn upper_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
